@@ -22,6 +22,8 @@ pub struct Tree {
     comm: HashMap<u32, String>,
     /// ppid -> children.
     children: HashMap<u32, Vec<u32>>,
+    /// pid -> full command line, populated only by `capture_with_args`.
+    args: HashMap<u32, String>,
 }
 
 impl Tree {
@@ -31,11 +33,49 @@ impl Tree {
         Ok(Self::parse(&raw))
     }
 
+    /// Snapshot every process *with its full command line*.
+    ///
+    /// Saving needs the arguments, not just the program name. One bulk `ps`
+    /// costs the same as the plain one; asking per pid — which is what
+    /// `tmux.sh` does — costs ~0.05s each and is most of why its save takes
+    /// 10s. `-ww` disables the terminal-width truncation that would otherwise
+    /// silently cut long command lines.
+    pub fn capture_with_args() -> Result<Self> {
+        let mut tree = Self::capture()?;
+        let raw = cmd::run("ps", &["-axww", "-o", "pid=,args="], cmd::FAST)?;
+        for line in raw.lines() {
+            let Some((pid, rest)) = split_field(line.trim_start()) else {
+                continue;
+            };
+            let Ok(pid) = pid.parse::<u32>() else {
+                continue;
+            };
+            tree.args.insert(pid, rest.trim().to_string());
+        }
+        Ok(tree)
+    }
+
+    /// Full command line for a pid, when this tree was captured with args.
+    pub fn args(&self, pid: u32) -> Option<&str> {
+        self.args.get(&pid).map(String::as_str)
+    }
+
     /// Build a tree from raw `ps` text. Exposed for tests in sibling modules
     /// that need a tree shaped like a specific machine state.
     #[cfg(test)]
     pub fn parse_for_test(raw: &str) -> Self {
         Self::parse(raw)
+    }
+
+    /// As `parse_for_test`, with command lines attached for the pids that need
+    /// them.
+    #[cfg(test)]
+    pub fn parse_for_test_with_args(raw: &str, args: &[(u32, &str)]) -> Self {
+        let mut tree = Self::parse(raw);
+        for (pid, line) in args {
+            tree.args.insert(*pid, (*line).to_string());
+        }
+        tree
     }
 
     fn parse(raw: &str) -> Self {
@@ -59,7 +99,11 @@ impl Tree {
             comm.insert(pid, basename(comm_str.trim()).to_string());
             children.entry(ppid).or_default().push(pid);
         }
-        Self { comm, children }
+        Self {
+            comm,
+            children,
+            args: HashMap::new(),
+        }
     }
 
     /// Find the first descendant of `root` whose command matches `pred`,

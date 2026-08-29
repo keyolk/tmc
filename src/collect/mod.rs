@@ -4,5 +4,6 @@
 //! enforces that with a timeout on every child.
 
 pub mod cmd;
+pub mod command;
 pub mod proc;
 pub mod tmux;

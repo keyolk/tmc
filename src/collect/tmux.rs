@@ -66,13 +66,6 @@ pub struct Pane {
     pub cc_state: String,
 }
 
-impl Pane {
-    /// Addresses this pane for `send-keys`, `select-pane` and friends.
-    pub fn target(&self) -> String {
-        format!("{}:{}.{}", self.session, self.window_index, self.pane_index)
-    }
-}
-
 /// How much to trust a pane's `cc_session`.
 ///
 /// `tmux.sh` collapsed this distinction: it guessed a per-pane id from file
@@ -210,7 +203,6 @@ mod tests {
         assert_eq!(p.pane_id, "%251");
         assert_eq!(p.cc_session, "12f17a65-a326-4f2f-88a9-47a53e61de7f");
         assert_eq!(p.cc_state, "working");
-        assert_eq!(p.target(), "projects:1.2");
     }
 
     #[test]
