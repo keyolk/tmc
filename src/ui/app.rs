@@ -102,7 +102,36 @@ fn event_loop(terminal: &mut Term, model: &mut Model) -> Result<()> {
 
 fn handle_key(model: &mut Model, code: KeyCode, mods: KeyModifiers) -> Result<()> {
     model.status.clear();
+
+    // While searching, letters type. Everything else in the tree is one
+    // keystroke away again as soon as the search is dismissed — searching is
+    // a mode because 27 windows cannot be reached any other way, but it is a
+    // shallow one.
+    if model.searching {
+        match code {
+            KeyCode::Esc => model.search_clear(),
+            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => model.search_clear(),
+            KeyCode::Backspace => model.search_pop(),
+            KeyCode::Char(c) => model.search_push(c),
+            // Enter leaves the search in place and hands the keys back, so the
+            // filtered list stays while you act on it.
+            KeyCode::Enter => {
+                model.searching = false;
+                if let Some(w) = model.current_window()
+                    && !w.gone
+                {
+                    model.switch_to = Some(w.target());
+                }
+            }
+            KeyCode::Down => model.move_cursor(1),
+            KeyCode::Up => model.move_cursor(-1),
+            _ => {}
+        }
+        return Ok(());
+    }
+
     match code {
+        KeyCode::Char('/') => model.searching = true,
         KeyCode::Char('q') | KeyCode::Esc => model.quit = true,
         KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => model.quit = true,
 

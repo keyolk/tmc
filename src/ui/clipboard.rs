@@ -41,18 +41,13 @@ impl Picker {
         }
     }
 
-    /// Indices of the buffers matching the current filter.
+    /// Indices of the buffers matching the current filter, best first.
+    ///
+    /// Fuzzy rather than substring: with 100 buffers you remember roughly what
+    /// you copied, not its exact wording. `gcm` should find
+    /// `git commit --amend`.
     pub fn visible(&self) -> Vec<usize> {
-        if self.filter.is_empty() {
-            return (0..self.buffers.len()).collect();
-        }
-        let needle = self.filter.to_lowercase();
-        self.buffers
-            .iter()
-            .enumerate()
-            .filter(|(_, b)| b.preview.to_lowercase().contains(&needle))
-            .map(|(i, _)| i)
-            .collect()
+        crate::fuzzy::rank(&self.filter, &self.buffers, |b| b.preview.as_str())
     }
 
     pub fn move_cursor(&mut self, delta: isize) {
@@ -228,17 +223,38 @@ mod tests {
         for c in "cargo".chars() {
             p.key(KeyCode::Char(c), KeyModifiers::NONE);
         }
-        assert_eq!(p.visible().len(), 1);
         assert_eq!(p.current().unwrap().name, "buffer2");
     }
 
     #[test]
-    fn filtering_is_case_insensitive() {
+    fn a_fuzzy_query_finds_what_you_half_remember() {
+        // The realistic case with 100 buffers: initials, not exact wording.
         let mut p = picker();
-        for c in "KUBECTL".chars() {
+        for c in "gcm".chars() {
             p.key(KeyCode::Char(c), KeyModifiers::NONE);
         }
-        assert_eq!(p.current().unwrap().name, "buffer1");
+        assert_eq!(
+            p.current().unwrap().preview,
+            "git commit --amend",
+            "gcm should reach it",
+        );
+    }
+
+    #[test]
+    fn filtering_is_case_insensitive_until_you_type_a_capital() {
+        // Smart case, as everywhere else here: a lowercase query ignores case,
+        // an uppercase one means it.
+        let mut lower = picker();
+        for c in "kubectl".chars() {
+            lower.key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(lower.current().unwrap().name, "buffer1");
+
+        let mut upper = picker();
+        for c in "KUBECTL".chars() {
+            upper.key(KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert!(upper.visible().is_empty(), "an uppercase query is exact");
     }
 
     #[test]

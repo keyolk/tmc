@@ -138,6 +138,29 @@ mod tests {
     }
 
     #[test]
+    fn an_active_search_shows_the_query_and_narrows_the_tree() {
+        let mut m = model();
+        for c in "bnp".chars() {
+            m.search_push(c);
+        }
+        let out = render(&m, 100, 14, 0);
+
+        assert!(out.contains("/bnp"), "the query is visible:\n{out}");
+        assert!(out.contains("binpack"), "the match is shown:\n{out}");
+        assert!(!out.contains("firewall"), "non-matches are gone:\n{out}");
+    }
+
+    #[test]
+    fn a_search_matching_nothing_says_so() {
+        let mut m = model();
+        for c in "zzz".chars() {
+            m.search_push(c);
+        }
+        let out = render(&m, 100, 14, 0);
+        assert!(out.contains("no window matches"), "{out}");
+    }
+
+    #[test]
     fn the_key_hint_always_shows_the_way_out() {
         // Truncating mid-word would hide `q quit`, which is the one thing the
         // hint line must never do.

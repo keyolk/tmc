@@ -51,6 +51,7 @@ marked.
 
 | | |
 |---|---|
+| `/` | fuzzy search — type `bnp` to reach `binpack` |
 | `j`/`k`, arrows | move |
 | `g`/`G` | first / last |
 | `Enter` | switch to the window and exit |
@@ -159,6 +160,11 @@ bind-key F display-popup -w 70% -h 60% -E "tmc clipboard"
 make check       # fmt + clippy + test
 tmc snapshot --width 100 --height 24
 ```
+
+Search is fuzzy everywhere — the tree and the buffer picker share one matcher.
+With 27 windows and 100 paste buffers, a picker that wants the exact letters
+in order is a filter, not a search. Smart case: a lowercase query ignores
+case, an uppercase one means it.
 
 `snapshot` renders one frame without an interactive terminal, which is how the
 layout is reviewed. It has already caught a real bug: every window rendering

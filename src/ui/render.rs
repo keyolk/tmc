@@ -68,6 +68,18 @@ fn render_header(frame: &mut Frame, area: Rect, model: &Model, now_secs: u64) {
         Span::styled("tmc", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw(format!("  {windows} windows")),
     ];
+    // The search sits in the header rather than a separate line: it is the
+    // most important thing on screen while typing, and a mode line that
+    // appears and disappears makes the tree jump.
+    if model.searching || !model.search.is_empty() {
+        summary.push(Span::styled(
+            format!("  /{}", model.search),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+        summary.push(Span::styled("▌", Style::default().fg(Color::Yellow)));
+    }
     if model.waiting > 0 {
         summary.push(Span::styled(
             format!("  {} waiting", model.waiting),
@@ -92,17 +104,24 @@ fn render_header(frame: &mut Frame, area: Rect, model: &Model, now_secs: u64) {
 }
 
 fn render_tree(frame: &mut Frame, area: Rect, model: &Model) {
+    let visible = model.visible();
     let height = area.height.saturating_sub(2) as usize;
-    let offset = scroll_offset(model.cursor, model.rows.len(), height);
+    let offset = scroll_offset(model.cursor, visible.len(), height);
 
-    let lines: Vec<Line> = model
-        .rows
+    let mut lines: Vec<Line> = visible
         .iter()
         .enumerate()
         .skip(offset)
         .take(height)
-        .map(|(i, row)| render_row(row, i == model.cursor, model))
+        .map(|(pos, &i)| render_row(&model.rows[i], pos == model.cursor, model))
         .collect();
+
+    if visible.is_empty() && !model.search.is_empty() {
+        lines.push(Line::styled(
+            format!("  no window matches \"{}\"", model.search),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
 
     frame.render_widget(
         Paragraph::new(lines).block(Block::default().borders(Borders::RIGHT)),
@@ -251,7 +270,7 @@ fn render_keys(frame: &mut Frame, area: Rect, model: &Model) {
     // worse than a short one — it cuts mid-word and hides `q quit` — so the
     // tail is dropped group by group until it fits.
     let groups = [
-        "j/k move  ⏎ switch".to_string(),
+        "/ search  j/k move  ⏎ switch".to_string(),
         format!("space mark  a all  {restore}"),
         "s save  p/P point  n waiting".to_string(),
         "m move  b break  J join  x kill".to_string(),

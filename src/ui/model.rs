@@ -72,6 +72,10 @@ pub struct Model {
     pub switch_to: Option<String>,
     pub quit: bool,
     pub status: String,
+    /// Typed search. Empty means the whole tree is shown.
+    pub search: String,
+    /// True while the search line is accepting keys.
+    pub searching: bool,
 }
 
 impl Model {
@@ -87,7 +91,39 @@ impl Model {
             switch_to: None,
             quit: false,
             status: String::new(),
+            search: String::new(),
+            searching: false,
         }
+    }
+
+    /// Row indices to display, in display order.
+    ///
+    /// With no search this is every row. With one, the matching windows ranked
+    /// best-first — session headers drop out, since a header for a session
+    /// whose windows all filtered away is noise, and the ranking is across the
+    /// whole server anyway.
+    pub fn visible(&self) -> Vec<usize> {
+        if self.search.is_empty() {
+            return (0..self.rows.len()).collect();
+        }
+        let windows: Vec<(usize, &WindowRow)> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| match r {
+                Row::Window(w) => Some((i, w)),
+                Row::Session { .. } => None,
+            })
+            .collect();
+        crate::fuzzy::rank(&self.search, &windows, |(_, w)| w.name.as_str())
+            .into_iter()
+            .map(|pos| windows[pos].0)
+            .collect()
+    }
+
+    /// The row the cursor points at, accounting for the search.
+    fn cursor_row(&self) -> Option<usize> {
+        self.visible().get(self.cursor).copied()
     }
 
     pub fn current_point(&self) -> Option<&point::Point> {
@@ -141,23 +177,48 @@ impl Model {
     }
 
     pub fn move_cursor(&mut self, delta: isize) {
-        if self.rows.is_empty() {
+        let visible = self.visible();
+        if visible.is_empty() {
             return;
         }
         let next = self.cursor as isize + delta;
-        self.cursor = next.clamp(0, self.rows.len() as isize - 1) as usize;
+        self.cursor = next.clamp(0, visible.len() as isize - 1) as usize;
         self.skip_header(delta.signum());
+    }
+
+    /// Type into the search, keeping the cursor on something real.
+    pub fn search_push(&mut self, c: char) {
+        self.search.push(c);
+        self.cursor = 0;
+        self.skip_header(1);
+    }
+
+    pub fn search_pop(&mut self) {
+        self.search.pop();
+        self.cursor = 0;
+        self.skip_header(1);
+    }
+
+    pub fn search_clear(&mut self) {
+        self.search.clear();
+        self.searching = false;
+        self.cursor = 0;
+        self.skip_header(1);
     }
 
     /// Session headers are labels, not destinations.
     fn skip_header(&mut self, direction: isize) {
-        while matches!(self.rows.get(self.cursor), Some(Row::Session { .. })) {
+        let visible = self.visible();
+        while matches!(
+            self.cursor_row().and_then(|i| self.rows.get(i)),
+            Some(Row::Session { .. })
+        ) {
             let next = self.cursor as isize + if direction >= 0 { 1 } else { -1 };
-            if next < 0 || next >= self.rows.len() as isize {
+            if next < 0 || next >= visible.len() as isize {
                 // At an edge with a header under the cursor: turn around
                 // rather than sit on an unselectable row.
                 let back = self.cursor as isize - if direction >= 0 { 1 } else { -1 };
-                if back >= 0 && back < self.rows.len() as isize {
+                if back >= 0 && back < visible.len() as isize {
                     self.cursor = back as usize;
                 }
                 return;
@@ -167,12 +228,13 @@ impl Model {
     }
 
     fn clamp_cursor(&mut self) {
-        if self.rows.is_empty() {
+        let visible = self.visible().len();
+        if visible == 0 {
             self.cursor = 0;
             return;
         }
-        if self.cursor >= self.rows.len() {
-            self.cursor = self.rows.len() - 1;
+        if self.cursor >= visible {
+            self.cursor = visible - 1;
         }
         self.skip_header(1);
     }
@@ -183,14 +245,15 @@ impl Model {
     /// open, "which one is waiting on me" is the question that costs the most
     /// time.
     pub fn jump_waiting(&mut self) {
-        let n = self.rows.len();
+        let visible = self.visible();
+        let n = visible.len();
         if n == 0 {
             return;
         }
         for step in 1..=n {
-            let idx = (self.cursor + step) % n;
-            if matches!(&self.rows[idx], Row::Window(w) if w.waiting) {
-                self.cursor = idx;
+            let pos = (self.cursor + step) % n;
+            if matches!(&self.rows[visible[pos]], Row::Window(w) if w.waiting) {
+                self.cursor = pos;
                 return;
             }
         }
@@ -198,7 +261,7 @@ impl Model {
     }
 
     pub fn current_window(&self) -> Option<&WindowRow> {
-        match self.rows.get(self.cursor) {
+        match self.cursor_row().and_then(|i| self.rows.get(i)) {
             Some(Row::Window(w)) => Some(w),
             _ => None,
         }
@@ -534,6 +597,104 @@ mod tests {
 
         assert_eq!(a.fingerprint(), same.fingerprint());
         assert_ne!(a.fingerprint(), changed.fingerprint());
+    }
+
+    #[test]
+    fn searching_ranks_windows_and_drops_the_headers() {
+        let mk = |name: &str| {
+            Row::Window(WindowRow {
+                session: "projects".into(),
+                index: 1,
+                name: name.into(),
+                panes: 1,
+                state: String::new(),
+                cc_session: String::new(),
+                waiting: false,
+                change: Change::Same,
+                reasons: Vec::new(),
+                gone: false,
+            })
+        };
+        let mut m = model_with(vec![
+            Row::Session {
+                name: "projects".into(),
+                windows: 3,
+            },
+            mk("cohome"),
+            mk("right-sizing"),
+            mk("binpack"),
+        ]);
+
+        // Initials, which is how a 27-window list is actually navigated.
+        for c in "bnp".chars() {
+            m.search_push(c);
+        }
+        let visible = m.visible();
+        assert_eq!(visible.len(), 1, "only binpack matches bnp");
+        assert!(matches!(&m.rows[visible[0]], Row::Window(w) if w.name == "binpack"));
+        assert_eq!(
+            m.current_window().map(|w| w.name.clone()),
+            Some("binpack".into())
+        );
+    }
+
+    #[test]
+    fn the_cursor_follows_the_filtered_list_not_the_full_one() {
+        // The cursor indexes visible rows; treating it as an index into `rows`
+        // would select whatever happens to sit at that position instead.
+        let mk = |name: &str| {
+            Row::Window(WindowRow {
+                session: "projects".into(),
+                index: 1,
+                name: name.into(),
+                panes: 1,
+                state: String::new(),
+                cc_session: String::new(),
+                waiting: false,
+                change: Change::Same,
+                reasons: Vec::new(),
+                gone: false,
+            })
+        };
+        let mut m = model_with(vec![mk("alpha"), mk("beta"), mk("gamma")]);
+        m.cursor = 2;
+
+        for c in "be".chars() {
+            m.search_push(c);
+        }
+        assert_eq!(
+            m.current_window().map(|w| w.name.clone()),
+            Some("beta".into()),
+            "the cursor reset onto the one match",
+        );
+    }
+
+    #[test]
+    fn clearing_the_search_restores_the_whole_tree() {
+        let mut m = model_with(vec![
+            Row::Session {
+                name: "projects".into(),
+                windows: 1,
+            },
+            Row::Window(WindowRow {
+                session: "projects".into(),
+                index: 1,
+                name: "cohome".into(),
+                panes: 1,
+                state: String::new(),
+                cc_session: String::new(),
+                waiting: false,
+                change: Change::Same,
+                reasons: Vec::new(),
+                gone: false,
+            }),
+        ]);
+        m.search_push('z');
+        assert!(m.visible().is_empty());
+
+        m.search_clear();
+        assert_eq!(m.visible().len(), 2, "headers come back too");
+        assert!(!m.searching);
     }
 
     #[test]

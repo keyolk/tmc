@@ -1,1 +1,6 @@
 /target
+
+# Local migration backups: personal tmux.conf, launchd plist, and the
+# tmux.sh this replaced. Kept outside the repo — they are this machine's
+# configuration, not part of the tool. See ~/.config/tmux/tmc-baseline/.
+/baseline

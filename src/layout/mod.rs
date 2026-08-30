@@ -132,9 +132,7 @@ mod tests {
         let text = serde_json::to_string(&s).unwrap();
 
         assert!(
-            text.contains(
-                r#"{"index":4,"path":"/home/u/exp/cohome","command":""}"#
-            ),
+            text.contains(r#"{"index":4,"path":"/home/u/exp/cohome","command":""}"#),
             "an empty pane must serialize with exactly the keys tmux.sh writes, got: {text}",
         );
         assert!(
