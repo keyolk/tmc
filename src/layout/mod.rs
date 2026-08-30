@@ -8,6 +8,7 @@
 
 pub mod autosave;
 pub mod diff;
+pub mod doctor;
 pub mod point;
 pub mod restore;
 pub mod save;

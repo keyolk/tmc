@@ -247,9 +247,32 @@ fn render_keys(frame: &mut Frame, area: Rect, model: &Model) {
     } else {
         "r restore marked"
     };
-    let text = format!(
-        "j/k move  space mark  a all  {restore}  s save  p/P point  n next waiting  ⏎ switch  q quit",
-    );
+    // Ordered by how often each is reached for. A truncated hint line is
+    // worse than a short one — it cuts mid-word and hides `q quit` — so the
+    // tail is dropped group by group until it fits.
+    let groups = [
+        "j/k move  ⏎ switch".to_string(),
+        format!("space mark  a all  {restore}"),
+        "s save  p/P point  n waiting".to_string(),
+        "m move  b break  J join  x kill".to_string(),
+    ];
+
+    let mut text = String::new();
+    for group in &groups {
+        let candidate = if text.is_empty() {
+            group.clone()
+        } else {
+            format!("{text}   {group}")
+        };
+        // Leave room for `q quit`, which is always shown: leaving without a
+        // visible way out is the one thing the hint line must never do.
+        if candidate.chars().count() + 9 > area.width as usize {
+            break;
+        }
+        text = candidate;
+    }
+    text.push_str("   q quit");
+
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
         area,

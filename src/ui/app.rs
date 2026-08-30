@@ -148,6 +148,14 @@ fn handle_key(model: &mut Model, code: KeyCode, mods: KeyModifiers) -> Result<()
                 }
             }
         }
+        // Window-level surgery, replacing `tmux.sh move/join/break`. These
+        // act on the window under the cursor, which is what the tree is for —
+        // tmux.sh made you pick from a second fzf list first.
+        KeyCode::Char('m') => move_window(model)?,
+        KeyCode::Char('b') => break_pane(model)?,
+        KeyCode::Char('J') => join_pane(model)?,
+        KeyCode::Char('x') => kill_window(model)?,
+
         KeyCode::Char('R') => reload(model)?,
         _ => {}
     }
@@ -255,9 +263,217 @@ fn restore_marked(model: &mut Model) -> Result<()> {
     Ok(())
 }
 
+/// Move the selected window to the other session.
+///
+/// With two sessions the destination is unambiguous, which is the whole reason
+/// this is one keystroke here and a prompt in tmux.sh. With more, the status
+/// line says what to do instead of guessing.
+fn move_window(model: &mut Model) -> Result<()> {
+    let Some(w) = model.current_window() else {
+        return Ok(());
+    };
+    if w.gone {
+        model.status = "that window is not running".into();
+        return Ok(());
+    }
+    let target = w.target();
+    let here = w.session.clone();
+
+    let others: Vec<String> = sessions()?.into_iter().filter(|s| *s != here).collect();
+    match others.as_slice() {
+        [] => model.status = "no other session to move to".into(),
+        [dest] => {
+            crate::collect::cmd::run(
+                "tmux",
+                &["move-window", "-s", &target, "-t", &format!("{dest}:")],
+                crate::collect::cmd::FAST,
+            )?;
+            // move-window leaves a hole; tmux only renumbers on close.
+            let _ = crate::collect::cmd::run(
+                "tmux",
+                &["move-window", "-r", "-t", &here],
+                crate::collect::cmd::FAST,
+            );
+            reload(model)?;
+            model.status = format!("moved {target} to {dest}");
+        }
+        many => {
+            model.status = format!("several destinations ({}); use tmux directly", many.len());
+        }
+    }
+    Ok(())
+}
+
+/// Break the selected window's active pane into a window of its own.
+fn break_pane(model: &mut Model) -> Result<()> {
+    let Some(w) = model.current_window() else {
+        return Ok(());
+    };
+    if w.gone {
+        model.status = "that window is not running".into();
+        return Ok(());
+    }
+    if w.panes < 2 {
+        // Breaking the only pane just renames the window.
+        model.status = "window has a single pane; nothing to break out".into();
+        return Ok(());
+    }
+    let target = w.target();
+    crate::collect::cmd::run(
+        "tmux",
+        &["break-pane", "-d", "-s", &target],
+        crate::collect::cmd::FAST,
+    )?;
+    reload(model)?;
+    model.status = format!("broke a pane out of {target}");
+    Ok(())
+}
+
+/// Pull the selected window's pane into the window tmc was launched from.
+///
+/// The counterpart to break, and the reason `$TMUX_PANE` matters: the
+/// destination is where the user was, not where the popup is.
+fn join_pane(model: &mut Model) -> Result<()> {
+    let Some(w) = model.current_window() else {
+        return Ok(());
+    };
+    if w.gone {
+        model.status = "that window is not running".into();
+        return Ok(());
+    }
+    let Ok(here) = std::env::var("TMUX_PANE") else {
+        model.status = "not running inside tmux".into();
+        return Ok(());
+    };
+    let target = w.target();
+    crate::collect::cmd::run(
+        "tmux",
+        &["join-pane", "-s", &target, "-t", &here],
+        crate::collect::cmd::FAST,
+    )?;
+    reload(model)?;
+    model.status = format!("joined a pane from {target}");
+    Ok(())
+}
+
+/// Close the selected window.
+///
+/// No confirmation prompt: the workspace was snapshotted, and the point of
+/// this tool is that closing something is recoverable. The status line says
+/// how.
+fn kill_window(model: &mut Model) -> Result<()> {
+    let Some(w) = model.current_window() else {
+        return Ok(());
+    };
+    if w.gone {
+        model.status = "that window is already gone".into();
+        return Ok(());
+    }
+    let target = w.target();
+    crate::collect::cmd::run(
+        "tmux",
+        &["kill-window", "-t", &target],
+        crate::collect::cmd::FAST,
+    )?;
+    reload(model)?;
+    model.status = format!("killed {target} — press r to bring it back");
+    Ok(())
+}
+
+fn sessions() -> Result<Vec<String>> {
+    Ok(crate::collect::cmd::run(
+        "tmux",
+        &["list-sessions", "-F", "#{session_name}"],
+        crate::collect::cmd::FAST,
+    )?
+    .lines()
+    .map(str::to_string)
+    .collect())
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layout::diff::Change;
+    use crate::ui::model::{Row, WindowRow};
+
+    fn model_with_window() -> Model {
+        let mut m = Model::new(Vec::new());
+        m.rows = vec![Row::Window(WindowRow {
+            session: "projects".into(),
+            index: 1,
+            name: "alpha".into(),
+            panes: 2,
+            state: String::new(),
+            cc_session: String::new(),
+            waiting: false,
+            change: Change::Same,
+            reasons: Vec::new(),
+            gone: false,
+        })];
+        m
+    }
+
+    /// Keys that only read state, so they can be exercised without touching
+    /// tmux. The mutating ones (m/b/J/x/r/s) shell out and are covered by
+    /// their own modules.
+    fn press(model: &mut Model, c: char, mods: KeyModifiers) {
+        let _ = handle_key(model, KeyCode::Char(c), mods);
+    }
+
+    #[test]
+    fn ctrl_c_quits_rather_than_clearing_marks() {
+        // Both are bound to `c`; the modifier guard has to win.
+        let mut m = model_with_window();
+        m.marks.insert("projects:1".into());
+
+        press(&mut m, 'c', KeyModifiers::CONTROL);
+        assert!(m.quit, "ctrl-c must quit");
+        assert_eq!(m.marks.len(), 1, "and must not clear marks on the way out");
+    }
+
+    #[test]
+    fn plain_c_clears_marks_without_quitting() {
+        let mut m = model_with_window();
+        m.marks.insert("projects:1".into());
+
+        press(&mut m, 'c', KeyModifiers::NONE);
+        assert!(m.marks.is_empty());
+        assert!(!m.quit);
+    }
+
+    #[test]
+    fn enter_on_a_window_that_only_exists_in_the_point_explains_itself() {
+        let mut m = model_with_window();
+        if let Row::Window(w) = &mut m.rows[0] {
+            w.gone = true;
+        }
+        let _ = handle_key(&mut m, KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(m.switch_to, None, "there is nothing to switch to");
+        assert!(m.status.contains("restore"), "status: {}", m.status);
+    }
+
+    #[test]
+    fn enter_on_a_live_window_records_the_switch() {
+        let mut m = model_with_window();
+        let _ = handle_key(&mut m, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(m.switch_to.as_deref(), Some("projects:1"));
+    }
+
+    #[test]
+    fn a_new_keypress_clears_the_previous_status() {
+        // Otherwise a stale message sits under an unrelated action.
+        let mut m = model_with_window();
+        m.status = "something happened".into();
+        press(&mut m, 'j', KeyModifiers::NONE);
+        assert!(m.status.is_empty());
+    }
 }

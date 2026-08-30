@@ -138,6 +138,32 @@ mod tests {
     }
 
     #[test]
+    fn the_key_hint_always_shows_the_way_out() {
+        // Truncating mid-word would hide `q quit`, which is the one thing the
+        // hint line must never do.
+        for width in [60, 70, 90, 104, 140] {
+            let out = render(&model(), width, 12, 0);
+            let last = out.lines().last().unwrap_or_default();
+            assert!(
+                last.contains("q quit"),
+                "at {width} columns the quit key vanished: [{last}]",
+            );
+            assert!(
+                last.chars().count() <= width as usize,
+                "at {width} columns the hint overflowed: [{last}]",
+            );
+        }
+    }
+
+    #[test]
+    fn a_wide_terminal_shows_the_window_surgery_keys_a_narrow_one_drops() {
+        let wide = render(&model(), 140, 12, 0);
+        let narrow = render(&model(), 70, 12, 0);
+        assert!(wide.contains("x kill"), "{wide}");
+        assert!(!narrow.contains("x kill"), "dropped when it will not fit");
+    }
+
+    #[test]
     fn the_key_hint_names_what_r_will_actually_do() {
         let mut m = model();
         let plain = render(&m, 100, 14, 0);

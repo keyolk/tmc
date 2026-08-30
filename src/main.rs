@@ -38,6 +38,11 @@ enum Command {
         #[arg(long)]
         if_drifted: bool,
     },
+    /// Check a restore point for problems before you need it.
+    Doctor {
+        /// Restore point to check. Defaults to checking every one.
+        name: Option<String>,
+    },
     /// Pick a tmux paste buffer and paste it.
     Clipboard {
         /// Pane to paste into. Defaults to $TMUX_PANE, the pane that ran this.
@@ -91,6 +96,7 @@ fn main() -> Result<()> {
         Command::List => list(),
         Command::Diff { name, all } => diff(name, all),
         Command::Snapshot { width, height } => snapshot(width, height),
+        Command::Doctor { name } => doctor(name),
         Command::Clipboard { target } => ui::clipboard::run(&target.unwrap_or_else(current_pane)),
         Command::CopyMode { target } => copy_mode(&target.unwrap_or_else(current_pane)),
         Command::Load {
@@ -467,4 +473,60 @@ fn copy_mode(target: &str) -> Result<()> {
         anyhow::bail!("unknown copy-mode command: {name}");
     }
     collect::clipboard::send_copy_command(name, target)
+}
+
+fn doctor(name: Option<String>) -> Result<()> {
+    let points = point::list(&layout::save::layout_dir());
+    if points.is_empty() {
+        println!("no restore points");
+        return Ok(());
+    }
+
+    let chosen: Vec<&point::Point> = match &name {
+        Some(wanted) => points
+            .iter()
+            .filter(|p| &p.name == wanted || p.name.ends_with(wanted.as_str()))
+            .collect(),
+        None => points.iter().collect(),
+    };
+    if chosen.is_empty() {
+        anyhow::bail!("no restore point matching '{}'", name.unwrap_or_default());
+    }
+
+    let detailed = chosen.len() == 1;
+    let mut unhealthy = 0;
+
+    for p in chosen {
+        let sessions = match point::read(&p.reference) {
+            Ok(s) => s,
+            Err(e) => {
+                println!("{:<26} unreadable: {e}", p.name);
+                unhealthy += 1;
+                continue;
+            }
+        };
+        let findings = layout::doctor::check(&sessions);
+        let verdict = layout::doctor::summarize(&findings);
+        if !findings.is_empty() {
+            unhealthy += 1;
+        }
+        println!("{:<26} {verdict}", p.name);
+
+        // One point: show every finding. All of them: a line each, or the
+        // output buries the answer under 28 points' worth of detail.
+        if detailed {
+            for f in &findings {
+                let tag = match f.severity {
+                    layout::doctor::Severity::Warn => "warn",
+                    layout::doctor::Severity::Note => "note",
+                };
+                println!("  {tag}  {:<20} {}", f.where_, f.what);
+            }
+        }
+    }
+
+    if !detailed {
+        println!("\n{unhealthy} point(s) with findings; name one to see them");
+    }
+    Ok(())
 }
