@@ -78,6 +78,11 @@ pub struct Model {
     pub searching: bool,
     /// Set when the running binary predates the checked-out source.
     pub stale_build: Option<String>,
+    /// What the selected window is showing, and which window that was.
+    ///
+    /// Cached by target so moving the cursor back and forth over the same rows
+    /// does not re-shell for a capture that has not changed.
+    pub preview: Option<(String, String)>,
 }
 
 impl Model {
@@ -96,7 +101,16 @@ impl Model {
             search: String::new(),
             searching: false,
             stale_build: check_build(),
+            preview: None,
         }
+    }
+
+    /// The capture for the selected window, if it is the one we hold.
+    pub fn preview_for(&self, target: &str) -> Option<&str> {
+        self.preview
+            .as_ref()
+            .filter(|(t, _)| t == target)
+            .map(|(_, body)| body.as_str())
     }
 
     /// Row indices to display, in display order.

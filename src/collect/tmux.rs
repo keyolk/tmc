@@ -132,6 +132,52 @@ fn is_claude(comm: &str) -> bool {
     matches!(comm, "claude" | "ccproxy" | "happy")
 }
 
+/// The last `lines` rows a pane is showing.
+///
+/// What the window is actually doing, which is what you are choosing between —
+/// the name only says what it was called. `tmux.sh` put this behind every one
+/// of its fzf switchers; leaving it out made the detail panel a list of things
+/// already visible in the tree.
+///
+/// Costs ~8ms, so it is fine to refetch as the cursor moves rather than
+/// caching and going stale.
+pub fn capture_pane(target: &str, lines: u16) -> Result<String> {
+    // `-J` joins wrapped lines so a long command reads as one. `-p` prints to
+    // stdout; escape sequences are deliberately not requested — the preview is
+    // rendered with this app's own styling, and raw SGR would fight it.
+    let start = format!("-{lines}");
+    cmd::run(
+        "tmux",
+        &[
+            "capture-pane",
+            "-p",
+            "-J",
+            "-t",
+            target,
+            "-S",
+            &start,
+            "-E",
+            "-",
+        ],
+        cmd::FAST,
+    )
+}
+
+/// Trim a capture to its last non-empty `lines`, dropping trailing blanks.
+///
+/// A pane sitting at a prompt has mostly empty rows below it; showing those
+/// wastes the panel and pushes the interesting output off the top.
+pub fn tail_lines(capture: &str, lines: usize) -> Vec<&str> {
+    let all: Vec<&str> = capture.lines().collect();
+    let end = all
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let start = end.saturating_sub(lines);
+    all[start..end].to_vec()
+}
+
 /// Every pane across every session on the tmux server.
 pub fn panes() -> Result<Vec<Pane>> {
     let raw = cmd::run("tmux", &["list-panes", "-a", "-F", FORMAT], cmd::FAST)?;
@@ -194,6 +240,33 @@ mod tests {
         "12f17a65-a326-4f2f-88a9-47a53e61de7f",
         "working",
     ];
+
+    #[test]
+    fn a_capture_shows_its_last_meaningful_lines() {
+        let capture = "first\nsecond\nthird\n\n\n";
+        assert_eq!(tail_lines(capture, 2), vec!["second", "third"]);
+    }
+
+    #[test]
+    fn a_short_capture_is_returned_whole() {
+        assert_eq!(tail_lines("only\n", 10), vec!["only"]);
+    }
+
+    #[test]
+    fn a_blank_pane_yields_nothing_rather_than_blank_lines() {
+        // A freshly split pane. Rendering its empty rows would push whatever
+        // else the panel holds off the screen for no information.
+        assert!(tail_lines("\n\n\n", 5).is_empty());
+        assert!(tail_lines("", 5).is_empty());
+    }
+
+    #[test]
+    fn blank_lines_between_output_are_kept() {
+        // Only the trailing run is dropped — a gap inside the output is part
+        // of what the pane looks like.
+        let capture = "one\n\ntwo\n\n\n";
+        assert_eq!(tail_lines(capture, 5), vec!["one", "", "two"]);
+    }
 
     #[test]
     fn parses_a_full_row() {

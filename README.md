@@ -6,13 +6,16 @@ the parts you want.
 ```
 tmc  28 windows   ▌  18 waiting
 saved:20260830T150700Z  (33m ago)   ~19 +3 -3
-▾ projects  13w                                     │projects:1  cohome
->  ?   1 cohome         4p ~ 12f17a65               │
-   ?   2 right-sizing   2p ~ c7e375b9               │  4 panes, was 5
-   ?   3 kite           2p ~ 58f63e71               │  pane 4 command: ghx -> (shell)
+▾ projects  13w                                     │projects:1  cohome  4p
+>  ?   1 cohome         4p ~ 12f17a65               │  4 panes, was 5
+   ?   2 right-sizing   2p ~ c7e375b9               │  pane 4 command: ghx -> (shell)
+   *   3 kite           2p ~ 58f63e71               │  claude waiting  12f17a65
    ?   4 firewall       2p ~ 0e5b5427               │
-   ?   5 istio          2p ~ ac2792e1               │state    waiting
-                                                    │session  12f17a65-a326-4f2f-88a9
+      —  binpack        2p -                        │─ output ──────────────────────────────────
+                                                    │  cargo test
+                                                    │     Compiling tmc v0.1.0
+                                                    │  test result: ok. 166 passed
+                                                    │  ❯
 
 type to search   ↑↓ move   ⏎ switch   tab commands   esc quit
 ```
@@ -27,8 +30,8 @@ question that matters: *what has changed since?* By the time you want a
 restore point you have no idea which one to reach for.
 
 `tmc` puts that comparison on screen. The left pane is the live server, the
-right says why the selected window differs, and `r` restores only what you
-marked.
+right says why the selected window differs and shows what it is currently
+running, and `r` restores only what you marked.
 
 ## Commands
 

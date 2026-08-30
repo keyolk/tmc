@@ -193,7 +193,10 @@ fn render_row<'a>(row: &'a Row, selected: bool, model: &Model) -> Line<'a> {
                 ),
                 Span::raw(format!(" {index} ")),
                 Span::styled(
-                    format!("{:<14}", truncate(&w.name, 14)),
+                    // Padded to the display width the name actually occupies,
+                    // so a Korean window name does not shift the columns after
+                    // it — `{:<14}` counts characters, not columns.
+                    pad(&truncate(&w.name, 14), 14),
                     if w.gone {
                         Style::default()
                             .fg(Color::DarkGray)
@@ -222,59 +225,107 @@ fn render_row<'a>(row: &'a Row, selected: bool, model: &Model) -> Line<'a> {
 }
 
 fn render_detail(frame: &mut Frame, area: Rect, model: &Model) {
-    let mut lines: Vec<Line> = Vec::new();
+    let Some(w) = model.current_window() else {
+        frame.render_widget(
+            Paragraph::new(Line::styled(
+                "select a window",
+                Style::default().fg(Color::DarkGray),
+            )),
+            area,
+        );
+        return;
+    };
 
-    match model.current_window() {
-        Some(w) => {
-            lines.push(Line::from(vec![
-                Span::styled(w.target(), Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw("  "),
-                Span::styled(w.name.clone(), Style::default().fg(Color::DarkGray)),
-            ]));
-            lines.push(Line::raw(""));
-
-            if w.change == Change::Same {
-                lines.push(Line::styled(
-                    "unchanged since the restore point",
-                    Style::default().fg(Color::DarkGray),
-                ));
-            }
-            for reason in &w.reasons {
-                lines.push(Line::styled(format!("  {reason}"), style_for(w.change)));
-            }
-
-            if !w.state.is_empty() {
-                lines.push(Line::raw(""));
-                lines.push(Line::from(vec![
-                    Span::styled("state    ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(w.state.clone()),
-                ]));
-            }
-            if !w.cc_session.is_empty() {
-                lines.push(Line::from(vec![
-                    Span::styled("session  ", Style::default().fg(Color::DarkGray)),
-                    Span::raw(w.cc_session.clone()),
-                ]));
-            }
-        }
-        None => lines.push(Line::styled(
-            "select a window",
+    // Identity and diff first — they are why the panel is here — then whatever
+    // the window is showing. The capture gets the remaining height because it
+    // is what tells one `fish` prompt from another; the metadata above is a
+    // handful of lines and fixed.
+    let mut head: Vec<Line> = vec![Line::from(vec![
+        Span::styled(w.target(), Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+        Span::styled(w.name.clone(), Style::default().fg(Color::DarkGray)),
+        Span::raw("  "),
+        Span::styled(
+            format!("{}p", w.panes),
             Style::default().fg(Color::DarkGray),
-        )),
-    }
+        ),
+    ])];
 
+    for reason in &w.reasons {
+        head.push(Line::styled(format!("  {reason}"), style_for(w.change)));
+    }
+    if !w.state.is_empty() {
+        head.push(Line::from(vec![
+            Span::styled("  claude ", Style::default().fg(Color::DarkGray)),
+            Span::raw(w.state.clone()),
+            Span::styled(
+                format!("  {}", &w.cc_session[..8.min(w.cc_session.len())]),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    }
     if !model.status.is_empty() {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
+        head.push(Line::styled(
             model.status.clone(),
             Style::default().fg(Color::Yellow),
         ));
     }
 
-    frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::NONE)),
-        area,
-    );
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(head.len() as u16 + 1),
+            Constraint::Min(0),
+        ])
+        .split(area);
+    frame.render_widget(Paragraph::new(head), rows[0]);
+
+    render_preview(frame, rows[1], model, w);
+}
+
+/// What the window is showing right now.
+fn render_preview(frame: &mut Frame, area: Rect, model: &Model, w: &super::model::WindowRow) {
+    if area.height == 0 {
+        return;
+    }
+
+    let body = match model.preview_for(&w.target()) {
+        Some(body) => body,
+        None if w.gone => {
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    "  not running — press r to restore it",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                area,
+            );
+            return;
+        }
+        None => "",
+    };
+
+    let mut lines: Vec<Line> = vec![Line::styled(
+        "─ output ".to_string() + &"─".repeat(area.width.saturating_sub(9) as usize),
+        Style::default().fg(Color::DarkGray),
+    )];
+
+    // Dim, because the preview is context rather than this app's own output —
+    // and full-brightness terminal text next to the tree reads as a second UI.
+    let captured = crate::collect::tmux::tail_lines(body, area.height.saturating_sub(1) as usize);
+    if captured.is_empty() {
+        lines.push(Line::styled(
+            "  (nothing on screen)",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    for line in captured {
+        lines.push(Line::styled(
+            truncate(line, area.width as usize),
+            Style::default().fg(Color::Gray),
+        ));
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_keys(frame: &mut Frame, area: Rect, model: &Model) {
@@ -341,11 +392,39 @@ fn style_for(change: Change) -> Style {
     }
 }
 
+/// Cut a string to fit `width` terminal columns.
+///
+/// Measured in display width, not characters: CJK text is two columns per
+/// character, so counting characters overflows the panel by up to double.
+/// Window names and captured output here are routinely Korean.
 fn truncate(s: &str, width: usize) -> String {
-    if s.chars().count() <= width {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+    if s.width() <= width {
         return s.to_string();
     }
-    s.chars().take(width.saturating_sub(1)).collect::<String>() + "…"
+    // Leave a column for the ellipsis.
+    let budget = width.saturating_sub(1);
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in s.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
+/// Pad to `width` terminal columns.
+fn pad(s: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let mut out = s.to_string();
+    out.push_str(&" ".repeat(width.saturating_sub(s.width())));
+    out
 }
 
 #[cfg(test)]
@@ -377,8 +456,19 @@ mod tests {
     }
 
     #[test]
-    fn truncation_counts_characters_not_bytes() {
-        // A window named in Korean must not be cut mid-codepoint.
-        assert_eq!(truncate("한글이름테스트", 4), "한글이…");
+    fn truncation_counts_terminal_columns_not_characters() {
+        use unicode_width::UnicodeWidthStr;
+        // Korean is two columns per character. Counting characters would let
+        // a name occupy twice its budget and push the panel border off.
+        let cut = truncate("한글이름테스트", 8);
+        assert!(cut.width() <= 8, "{cut:?} is {} columns", cut.width());
+        assert_eq!(cut, "한글이…");
+    }
+
+    #[test]
+    fn padding_measures_columns_too() {
+        use unicode_width::UnicodeWidthStr;
+        assert_eq!(pad("abc", 6).width(), 6);
+        assert_eq!(pad("한글", 6).width(), 6, "two chars, four columns");
     }
 }

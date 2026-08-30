@@ -448,6 +448,15 @@ fn snapshot(width: u16, height: u16, searching: bool) -> Result<()> {
         None => Vec::new(),
     };
     model.refresh(&panes, &saved, &tree, &pending);
+    // The TUI fetches this at draw time; do the same here so the rendered
+    // frame is what the user would actually see.
+    if let Some(w) = model.current_window()
+        && !w.gone
+    {
+        let target = w.target();
+        let body = collect::tmux::capture_pane(&target, 40).unwrap_or_default();
+        model.preview = Some((target, body));
+    }
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

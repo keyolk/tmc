@@ -74,6 +74,7 @@ fn event_loop(terminal: &mut Term, model: &mut Model) -> Result<()> {
 
     loop {
         if needs_redraw {
+            refresh_preview(model);
             let now = now_secs();
             terminal.draw(|frame| super::render::draw(frame, model, now))?;
             needs_redraw = false;
@@ -438,6 +439,28 @@ fn sessions() -> Result<Vec<String>> {
     .lines()
     .map(str::to_string)
     .collect())
+}
+
+/// Fetch the capture for whatever the cursor is on, if we do not have it.
+///
+/// Done at draw time rather than on every keystroke: a held-down `j` would
+/// otherwise shell out once per repeat for panes that scroll past unseen.
+fn refresh_preview(model: &mut Model) {
+    let Some(w) = model.current_window() else {
+        model.preview = None;
+        return;
+    };
+    if w.gone {
+        // Nothing to capture — the window exists only in the restore point.
+        model.preview = None;
+        return;
+    }
+    let target = w.target();
+    if model.preview_for(&target).is_some() {
+        return;
+    }
+    let body = tmux::capture_pane(&target, 40).unwrap_or_default();
+    model.preview = Some((target, body));
 }
 
 fn now_secs() -> u64 {

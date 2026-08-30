@@ -7,6 +7,8 @@
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 
+use unicode_width::UnicodeWidthStr;
+
 use super::model::Model;
 
 /// A frame as plain text, one line per row.
@@ -20,13 +22,26 @@ pub fn render(model: &Model, width: u16, height: u16, now_secs: u64) -> String {
     let buffer = terminal.backend().buffer();
     (0..height)
         .map(|y| {
-            let line: String = (0..width)
-                .map(|x| {
-                    buffer
-                        .cell((x, y))
-                        .map_or(' ', |c| c.symbol().chars().next().unwrap_or(' '))
-                })
-                .collect();
+            // A double-width character occupies two cells: the symbol sits in
+            // the first and the second is left empty. Reading every cell would
+            // emit a stray space after each one, which is what made a Korean
+            // preview line measure wider here than it renders in a terminal.
+            let mut line = String::new();
+            let mut x = 0;
+            while x < width {
+                let Some(cell) = buffer.cell((x, y)) else {
+                    x += 1;
+                    continue;
+                };
+                let symbol = cell.symbol();
+                if symbol.is_empty() {
+                    line.push(' ');
+                    x += 1;
+                } else {
+                    line.push_str(symbol);
+                    x += symbol.width().max(1) as u16;
+                }
+            }
             line.trim_end().to_string()
         })
         .collect::<Vec<_>>()
@@ -83,6 +98,55 @@ mod tests {
         m.counts = (1, 1, 1);
         m.waiting = 1;
         m
+    }
+
+    #[test]
+    fn the_panel_shows_what_the_window_is_running() {
+        // Choosing between windows means seeing their output — the name is
+        // already in the tree. tmux.sh put this behind every one of its fzf
+        // switchers; leaving it out made the panel a list of things already
+        // on screen.
+        let mut m = model();
+        m.preview = Some((
+            "projects:8".into(),
+            "cargo test\n   Compiling tmc\ntest result: ok. 158 passed\n".into(),
+        ));
+        let out = render(&m, 110, 16, 0);
+
+        assert!(out.contains("─ output"), "the section is labelled:\n{out}");
+        assert!(out.contains("158 passed"), "the capture is shown:\n{out}");
+    }
+
+    #[test]
+    fn a_window_only_in_the_restore_point_says_why_it_has_no_output() {
+        let mut m = model();
+        // The removed window; nothing is running to capture.
+        m.cursor = 5;
+        m.preview = None;
+        let out = render(&m, 110, 16, 0);
+        assert!(out.contains("not running"), "{out}");
+    }
+
+    #[test]
+    fn a_korean_preview_stays_inside_the_panel() {
+        use unicode_width::UnicodeWidthStr;
+        // CJK is two columns per character. Measuring in characters let a
+        // preview line run past the border — and reading the render cell by
+        // cell added a stray space after every wide character on top of that.
+        let mut m = model();
+        m.preview = Some((
+            "projects:8".into(),
+            "마지막 항목은 이번에 실제로 필요했습니다 — dataexport 경로입니다\n".into(),
+        ));
+        for width in [90u16, 110, 140] {
+            for line in render(&m, width, 16, 0).lines() {
+                assert!(
+                    line.width() <= width as usize,
+                    "at {width} columns a line ran to {}: {line:?}",
+                    line.width(),
+                );
+            }
+        }
     }
 
     #[test]
