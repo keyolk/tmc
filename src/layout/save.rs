@@ -114,7 +114,7 @@ pub fn write(session: &Session, path: &Path) -> Result<()> {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     // Pretty-printed to match what tmux.sh's `jq` emits, so a diff between a
-    // tmux.sh file and a tmxx file shows real differences and not formatting.
+    // tmux.sh file and a tmc file shows real differences and not formatting.
     let text = serde_json::to_string_pretty(session)?;
     std::fs::write(path, text + "\n").with_context(|| format!("write {}", path.display()))
 }

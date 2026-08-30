@@ -3,7 +3,7 @@
 //! Deliberately the same JSON `tmux.sh` writes, so the 24 autosaves already on
 //! disk stay loadable and rolling back to the shell script during the
 //! migration does not strand a snapshot. New fields are optional and are
-//! skipped when empty, which keeps a tmxx-written file byte-comparable to a
+//! skipped when empty, which keeps a tmc-written file byte-comparable to a
 //! tmux.sh-written one for the fields both produce.
 
 pub mod save;
@@ -32,7 +32,7 @@ pub struct Window {
     pub layout: String,
     pub panes: Vec<Pane>,
     /// Chrome tab group belonging to this window, when the bridge exported
-    /// one. Passed through verbatim; tmxx never interprets it.
+    /// one. Passed through verbatim; tmc never interprets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chrome: Option<serde_json::Value>,
 }

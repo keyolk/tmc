@@ -1,5 +1,5 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
-BIN := target/release/tmxx
+BIN := target/release/tmc
 
 .PHONY: build run install clean test lint fmt check
 
@@ -10,8 +10,8 @@ run: build
 	$(BIN)
 
 install: check build
-	rm -f ~/.local/bin/tmxx
-	cp $(BIN) ~/.local/bin/tmxx
+	rm -f ~/.local/bin/tmc
+	cp $(BIN) ~/.local/bin/tmc
 
 test:
 	cargo test

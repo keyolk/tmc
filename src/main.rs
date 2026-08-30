@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "tmxx", about = "tmux workspace time machine")]
+#[command(name = "tmc", about = "tmux workspace control: snapshot, diff, restore")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
