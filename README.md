@@ -4,17 +4,17 @@ Snapshot your tmux workspace, see what has changed since, and put back only
 the parts you want.
 
 ```
-tmc  26 windows  19 waiting
-auto:20260830T124554Z  (6m ago)   ~15 +0 -0
-▾ projects  11w                                       │projects:1  cohome
->  *   1 cohome         5p   12f17a65                 │
-   ?   2 mitm           4p   46076b0f                 │state    working
-   ?   3 right-sizing   2p   c7e375b9                 │session  12f17a65-a326-4f2f
-▾ tooling  15w                                        │
-   ?   1 learn          2p ~ 014efe13                 │  pane 2 command: ccx -> ccx --watch
-      —  firewall       2p -                          │  only in the restore point
+tmc  28 windows   ▌  18 waiting
+saved:20260830T150700Z  (33m ago)   ~19 +3 -3
+▾ projects  13w                                     │projects:1  cohome
+>  ?   1 cohome         4p ~ 12f17a65               │
+   ?   2 right-sizing   2p ~ c7e375b9               │  4 panes, was 5
+   ?   3 kite           2p ~ 58f63e71               │  pane 4 command: ghx -> (shell)
+   ?   4 firewall       2p ~ 0e5b5427               │
+   ?   5 istio          2p ~ ac2792e1               │state    waiting
+                                                    │session  12f17a65-a326-4f2f-88a9
 
-/ search  j/k move  ⏎ switch   space mark  a all  r restore marked   s save  p/P point  n waiting   q quit
+type to search   ↑↓ move   ⏎ switch   tab commands   esc quit
 ```
 
 Replaces `tmux.sh`, `twm` and the `tmux-fzf` plugin.
@@ -49,9 +49,25 @@ marked.
 
 ## Keys
 
+It opens on the search line. Summoning a popup is already the decision to go
+somewhere, so type — `bnp` reaches `binpack`. `Tab` steps out to the tree when
+you want the commands; `tmc --browse` starts there instead.
+
+**Searching**
+
 | | |
 |---|---|
-| `/` | fuzzy search — type `bnp` to reach `binpack` |
+| any letter | narrow the list |
+| `↑`/`↓`, `Ctrl-n`/`Ctrl-p` | move |
+| `Enter` | switch to the window and exit |
+| `Tab` | keep the filter, hand the keys to the tree |
+| `Esc` | clear the query, then leave |
+
+**Tree**
+
+| | |
+|---|---|
+| `/` | back to searching |
 | `j`/`k`, arrows | move |
 | `g`/`G` | first / last |
 | `Enter` | switch to the window and exit |
@@ -165,6 +181,8 @@ Search is fuzzy everywhere — the tree and the buffer picker share one matcher.
 With 27 windows and 100 paste buffers, a picker that wants the exact letters
 in order is a filter, not a search. Smart case: a lowercase query ignores
 case, an uppercase one means it.
+
+`snapshot --tree` renders the tree instead of the opening search line.
 
 `snapshot` renders one frame without an interactive terminal, which is how the
 layout is reviewed. It has already caught a real bug: every window rendering

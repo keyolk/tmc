@@ -17,6 +17,15 @@ fn is_shell(comm: &str) -> bool {
     SHELLS.contains(&comm)
 }
 
+/// A process that has exited but not been reaped.
+///
+/// `ps` reports these as `<defunct>` with no command line. Recording one as a
+/// pane's command would put `<defunct>` in the snapshot and type it back on
+/// restore; a zombie means the pane is idle, which is `shell_only`.
+fn is_defunct(comm: &str) -> bool {
+    comm == "<defunct>" || comm.ends_with("<defunct>")
+}
+
 /// What a pane was running, as a command line to prefill on restore.
 ///
 /// Returns `None` when the pane held nothing but a shell — the correct thing
@@ -28,8 +37,11 @@ pub fn for_pane(
     tree: &Tree,
     args_of: impl Fn(u32) -> Option<String>,
 ) -> Option<String> {
-    let pid = tree.find_descendant(pane_pid, |c| !is_shell(c))?;
+    let pid = tree.find_descendant(pane_pid, |c| !is_shell(c) && !is_defunct(c))?;
     let raw = args_of(pid)?;
+    if is_defunct(raw.trim()) {
+        return None;
+    }
     let cmd = normalize(raw.trim());
     if cmd.is_empty() { None } else { Some(cmd) }
 }
@@ -114,6 +126,26 @@ mod tests {
     fn a_bare_shell_pane_has_no_command() {
         // Not a failure: restoring an empty prompt is correct here.
         assert_eq!(for_pane(400, &tree(), |_| Some("fish".into())), None);
+    }
+
+    #[test]
+    fn a_zombie_is_not_a_command() {
+        // Seen live: a pane whose ghx had exited but not been reaped recorded
+        // `<defunct>` as its command, which restore would then type back.
+        let tree = Tree::parse_for_test("1 0 launchd\n100 1 fish\n200 100 <defunct>\n");
+        assert_eq!(for_pane(100, &tree, |_| Some("<defunct>".into())), None);
+    }
+
+    #[test]
+    fn a_zombie_does_not_hide_a_real_command_beside_it() {
+        // The walk has to keep looking rather than stop at the first non-shell.
+        let tree =
+            Tree::parse_for_test("1 0 launchd\n100 1 fish\n200 100 <defunct>\n201 100 ccproxy\n");
+        let cmd = for_pane(100, &tree, |pid| {
+            assert_eq!(pid, 201, "should skip past the zombie");
+            Some("ccproxy claude".into())
+        });
+        assert_eq!(cmd.as_deref(), Some("ccproxy claude"));
     }
 
     #[test]

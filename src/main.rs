@@ -23,6 +23,13 @@ struct Cli {
     /// binding runs.
     #[command(subcommand)]
     command: Option<Command>,
+
+    /// Start on the tree instead of the search line.
+    ///
+    /// The TUI opens searching, since it is summoned to get somewhere. Pass
+    /// this when the intent is to look at what changed rather than to jump.
+    #[arg(long, global = true)]
+    browse: bool,
 }
 
 #[derive(Subcommand)]
@@ -66,6 +73,9 @@ enum Command {
         width: u16,
         #[arg(long, default_value = "24")]
         height: u16,
+        /// Render the tree instead of the search line the TUI opens on.
+        #[arg(long)]
+        tree: bool,
     },
     /// Show what has changed since a restore point.
     Diff {
@@ -92,15 +102,20 @@ enum Command {
 }
 
 fn main() -> Result<()> {
-    let Some(command) = Cli::parse().command else {
-        return tui();
+    let cli = Cli::parse();
+    let Some(command) = cli.command else {
+        return tui(!cli.browse);
     };
     match command {
         Command::Save { name, dry_run } => save(name, dry_run),
         Command::Autosave { if_drifted } => autosave(if_drifted),
         Command::List => list(),
         Command::Diff { name, all } => diff(name, all),
-        Command::Snapshot { width, height } => snapshot(width, height),
+        Command::Snapshot {
+            width,
+            height,
+            tree,
+        } => snapshot(width, height, !tree),
         Command::Doctor { name } => doctor(name),
         Command::Clipboard { target } => ui::clipboard::run(&target.unwrap_or_else(current_pane)),
         Command::CopyMode { target } => copy_mode(&target.unwrap_or_else(current_pane)),
@@ -333,8 +348,8 @@ fn describe(s: &layout::Session) -> String {
 /// The switch happens here rather than inside the loop: tmux's `select-window`
 /// while the alternate screen is still up leaves the terminal in a state the
 /// restored screen then paints over.
-fn tui() -> Result<()> {
-    match ui::app::run()? {
+fn tui(search: bool) -> Result<()> {
+    match ui::app::run(search)? {
         ui::app::Outcome::Quit => Ok(()),
         ui::app::Outcome::Switch(target) => {
             let (session, _) = target.split_once(':').unwrap_or((&target, ""));
@@ -420,9 +435,10 @@ fn diff(name: Option<String>, all: bool) -> Result<()> {
 
 /// Render one frame at a fixed size. How the layout is reviewed without an
 /// interactive terminal.
-fn snapshot(width: u16, height: u16) -> Result<()> {
+fn snapshot(width: u16, height: u16, searching: bool) -> Result<()> {
     let points = point::list(&layout::save::layout_dir());
     let mut model = ui::model::Model::new(points);
+    model.searching = searching;
 
     let panes = collect::tmux::panes().unwrap_or_default();
     let tree = collect::proc::Tree::capture_with_args()?;

@@ -71,14 +71,22 @@ fn render_header(frame: &mut Frame, area: Rect, model: &Model, now_secs: u64) {
     // The search sits in the header rather than a separate line: it is the
     // most important thing on screen while typing, and a mode line that
     // appears and disappears makes the tree jump.
-    if model.searching || !model.search.is_empty() {
+    if model.searching {
         summary.push(Span::styled(
-            format!("  /{}", model.search),
+            format!("   {}", model.search),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ));
         summary.push(Span::styled("▌", Style::default().fg(Color::Yellow)));
+    } else if !model.search.is_empty() {
+        // Stepped out to the tree with a filter still applied. The slash marks
+        // it as a filter rather than part of the summary, and the missing
+        // cursor says typing will no longer land here.
+        summary.push(Span::styled(
+            format!("   /{}", model.search),
+            Style::default().fg(Color::Yellow),
+        ));
     }
     if model.waiting > 0 {
         summary.push(Span::styled(
@@ -270,6 +278,23 @@ fn render_detail(frame: &mut Frame, area: Rect, model: &Model) {
 }
 
 fn render_keys(frame: &mut Frame, area: Rect, model: &Model) {
+    // Searching is where the TUI starts, so its hint has to name the way out
+    // and the way to everything else — otherwise the other twelve keys are
+    // undiscoverable from the screen you land on.
+    if model.searching {
+        let out = if model.search.is_empty() {
+            "esc quit"
+        } else {
+            "esc clear"
+        };
+        let text = format!("type to search   ↑↓ move   ⏎ switch   tab commands   {out}",);
+        frame.render_widget(
+            Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
+            area,
+        );
+        return;
+    }
+
     let restore = if model.marks.is_empty() {
         "r restore all"
     } else {

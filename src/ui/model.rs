@@ -202,9 +202,9 @@ impl Model {
         self.skip_header(1);
     }
 
-    pub fn search_clear(&mut self) {
+    /// Drop the query but stay on the search line.
+    pub fn search_clear_query(&mut self) {
         self.search.clear();
-        self.searching = false;
         self.cursor = 0;
         self.skip_header(1);
     }
@@ -709,7 +709,7 @@ mod tests {
     }
 
     #[test]
-    fn clearing_the_search_restores_the_whole_tree() {
+    fn clearing_the_query_restores_the_whole_tree() {
         let mut m = model_with(vec![
             Row::Session {
                 name: "projects".into(),
@@ -731,9 +731,8 @@ mod tests {
         m.search_push('z');
         assert!(m.visible().is_empty());
 
-        m.search_clear();
+        m.search_clear_query();
         assert_eq!(m.visible().len(), 2, "headers come back too");
-        assert!(!m.searching);
     }
 
     #[test]

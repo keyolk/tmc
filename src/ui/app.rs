@@ -27,9 +27,17 @@ pub enum Outcome {
     Switch(String),
 }
 
-pub fn run() -> Result<Outcome> {
+/// Open the TUI.
+///
+/// `search` decides which mode it starts in. Searching is the default,
+/// because this runs as a popup: summoning it is already the decision to go
+/// somewhere, and making you press `/` first is the same extra keystroke that
+/// made tmux-fzf's two-level menu tiresome. `Esc` steps out to the tree when
+/// the intent is to inspect rather than jump.
+pub fn run(search: bool) -> Result<Outcome> {
     let points = point::list(&save::layout_dir());
     let mut model = Model::new(points);
+    model.searching = search;
 
     let mut terminal = setup().context("enter alternate screen")?;
     let result = event_loop(&mut terminal, &mut model);
@@ -103,18 +111,30 @@ fn event_loop(terminal: &mut Term, model: &mut Model) -> Result<()> {
 fn handle_key(model: &mut Model, code: KeyCode, mods: KeyModifiers) -> Result<()> {
     model.status.clear();
 
-    // While searching, letters type. Everything else in the tree is one
-    // keystroke away again as soon as the search is dismissed — searching is
-    // a mode because 27 windows cannot be reached any other way, but it is a
-    // shallow one.
+    // While searching, letters type. This is where the TUI starts, so the way
+    // out has to be obvious and the way back cheap.
     if model.searching {
         match code {
-            KeyCode::Esc => model.search_clear(),
-            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => model.search_clear(),
+            // Esc backs out one step at a time — clear the query, then leave.
+            // Quitting straight from a typed query would throw away the work
+            // of typing it whenever the aim was to widen the search.
+            KeyCode::Esc => {
+                if model.search.is_empty() {
+                    model.quit = true;
+                } else {
+                    model.search_clear_query();
+                }
+            }
+            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => model.quit = true,
+            // Step out to the tree, keeping the filter. The single-key
+            // commands (mark, restore, save, window surgery) live there.
+            KeyCode::Tab => model.searching = false,
+            // Control chords come before the catch-all: a `Char` arm placed
+            // first swallows them and types the letter instead.
+            KeyCode::Char('n') if mods.contains(KeyModifiers::CONTROL) => model.move_cursor(1),
+            KeyCode::Char('p') if mods.contains(KeyModifiers::CONTROL) => model.move_cursor(-1),
             KeyCode::Backspace => model.search_pop(),
             KeyCode::Char(c) => model.search_push(c),
-            // Enter leaves the search in place and hands the keys back, so the
-            // filtered list stays while you act on it.
             KeyCode::Enter => {
                 model.searching = false;
                 if let Some(w) = model.current_window()
@@ -455,6 +475,116 @@ mod tests {
     /// their own modules.
     fn press(model: &mut Model, c: char, mods: KeyModifiers) {
         let _ = handle_key(model, KeyCode::Char(c), mods);
+    }
+
+    #[test]
+    fn esc_backs_out_one_step_at_a_time() {
+        // The TUI opens searching, so Esc is the way out — but quitting
+        // straight from a typed query would discard the typing whenever the
+        // aim was simply to widen the search.
+        let mut m = model_with_window();
+        m.searching = true;
+        for c in "alpha".chars() {
+            m.search_push(c);
+        }
+
+        let _ = handle_key(&mut m, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(m.search.is_empty(), "first Esc clears the query");
+        assert!(m.searching, "and stays on the search line");
+        assert!(!m.quit);
+
+        let _ = handle_key(&mut m, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(m.quit, "a second Esc, with nothing to clear, leaves");
+    }
+
+    #[test]
+    fn tab_hands_the_keys_to_the_tree_but_keeps_the_filter() {
+        // The single-key commands live in the tree; the filter is what got you
+        // to the right handful of windows, so it survives the switch.
+        let mut m = model_with_window();
+        m.searching = true;
+        for c in "alp".chars() {
+            m.search_push(c);
+        }
+
+        let _ = handle_key(&mut m, KeyCode::Tab, KeyModifiers::NONE);
+        assert!(!m.searching);
+        assert_eq!(m.search, "alp", "the filter is still applied");
+
+        // And a letter is a command again rather than search input.
+        let _ = handle_key(&mut m, KeyCode::Char(' '), KeyModifiers::NONE);
+        assert_eq!(m.marks.len(), 1, "space marked instead of typing");
+    }
+
+    #[test]
+    fn typing_in_search_mode_does_not_trigger_commands() {
+        // `s` saves and `x` kills a window in the tree. Landing on the search
+        // line means a stray keystroke cannot do either.
+        let mut m = model_with_window();
+        m.searching = true;
+        for c in "sx".chars() {
+            let _ = handle_key(&mut m, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(m.search, "sx");
+        assert!(m.marks.is_empty());
+        assert!(!m.quit);
+    }
+
+    #[test]
+    fn control_chords_move_instead_of_typing() {
+        // A `Char(c)` catch-all placed before these swallowed them and typed
+        // the letter — clippy caught it as an unreachable arm, but the visible
+        // symptom would have been `n` appearing in the query.
+        let mut m = Model::new(Vec::new());
+        m.rows = vec![
+            Row::Window(WindowRow {
+                session: "projects".into(),
+                index: 1,
+                name: "alpha".into(),
+                panes: 1,
+                state: String::new(),
+                cc_session: String::new(),
+                waiting: false,
+                change: Change::Same,
+                reasons: Vec::new(),
+                gone: false,
+            }),
+            Row::Window(WindowRow {
+                session: "projects".into(),
+                index: 2,
+                name: "beta".into(),
+                panes: 1,
+                state: String::new(),
+                cc_session: String::new(),
+                waiting: false,
+                change: Change::Same,
+                reasons: Vec::new(),
+                gone: false,
+            }),
+        ];
+        m.searching = true;
+
+        let _ = handle_key(&mut m, KeyCode::Char('n'), KeyModifiers::CONTROL);
+        assert!(m.search.is_empty(), "nothing was typed");
+        assert_eq!(
+            m.current_window().map(|w| w.name.clone()),
+            Some("beta".into())
+        );
+
+        let _ = handle_key(&mut m, KeyCode::Char('p'), KeyModifiers::CONTROL);
+        assert_eq!(
+            m.current_window().map(|w| w.name.clone()),
+            Some("alpha".into())
+        );
+    }
+
+    #[test]
+    fn ctrl_c_leaves_from_the_search_line_too() {
+        let mut m = model_with_window();
+        m.searching = true;
+        m.search_push('a');
+        let _ = handle_key(&mut m, KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(m.quit, "ctrl-c is an unconditional way out");
     }
 
     #[test]

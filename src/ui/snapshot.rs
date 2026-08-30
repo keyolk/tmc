@@ -138,6 +138,33 @@ mod tests {
     }
 
     #[test]
+    fn the_opening_screen_is_the_search_line() {
+        // What `prefix w` lands on. The hint has to name the way out and the
+        // way to the other commands, or they are undiscoverable from here.
+        let mut m = model();
+        m.searching = true;
+        let out = render(&m, 110, 12, 0);
+        let last = out.lines().last().unwrap_or_default();
+
+        assert!(last.contains("type to search"), "{last}");
+        assert!(last.contains("tab commands"), "{last}");
+        assert!(
+            last.contains("esc quit"),
+            "with no query, esc leaves: {last}"
+        );
+    }
+
+    #[test]
+    fn with_a_query_typed_esc_offers_to_clear_instead() {
+        let mut m = model();
+        m.searching = true;
+        m.search_push('b');
+        let last = render(&m, 110, 12, 0);
+        let last = last.lines().last().unwrap_or_default();
+        assert!(last.contains("esc clear"), "{last}");
+    }
+
+    #[test]
     fn an_active_search_shows_the_query_and_narrows_the_tree() {
         let mut m = model();
         for c in "bnp".chars() {
@@ -145,6 +172,7 @@ mod tests {
         }
         let out = render(&m, 100, 14, 0);
 
+        // Stepped out to the tree, the query shows as a filter with a slash.
         assert!(out.contains("/bnp"), "the query is visible:\n{out}");
         assert!(out.contains("binpack"), "the match is shown:\n{out}");
         assert!(!out.contains("firewall"), "non-matches are gone:\n{out}");
