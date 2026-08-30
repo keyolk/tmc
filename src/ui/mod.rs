@@ -5,6 +5,7 @@
 //! behaviour testable without a terminal.
 
 pub mod app;
+pub mod clipboard;
 pub mod model;
 pub mod render;
 pub mod snapshot;

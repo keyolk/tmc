@@ -38,6 +38,18 @@ enum Command {
         #[arg(long)]
         if_drifted: bool,
     },
+    /// Pick a tmux paste buffer and paste it.
+    Clipboard {
+        /// Pane to paste into. Defaults to $TMUX_PANE, the pane that ran this.
+        #[arg(long)]
+        target: Option<String>,
+    },
+    /// Send a copy-mode command to a pane.
+    CopyMode {
+        /// Pane to act on. Defaults to $TMUX_PANE.
+        #[arg(long)]
+        target: Option<String>,
+    },
     /// Render one TUI frame as text, for reviewing the layout.
     Snapshot {
         #[arg(long, default_value = "100")]
@@ -79,6 +91,8 @@ fn main() -> Result<()> {
         Command::List => list(),
         Command::Diff { name, all } => diff(name, all),
         Command::Snapshot { width, height } => snapshot(width, height),
+        Command::Clipboard { target } => ui::clipboard::run(&target.unwrap_or_else(current_pane)),
+        Command::CopyMode { target } => copy_mode(&target.unwrap_or_else(current_pane)),
         Command::Load {
             name,
             sessions,
@@ -414,4 +428,43 @@ fn snapshot(width: u16, height: u16) -> Result<()> {
         .unwrap_or(0);
     println!("{}", ui::snapshot::render(&model, width, height, now));
     Ok(())
+}
+
+/// The pane this process was launched from.
+///
+/// `$TMUX_PANE` rather than asking tmux for the active pane: a popup runs in
+/// its own pane, so `display-message -p` would name the popup, not the pane
+/// the user was looking at.
+fn current_pane() -> String {
+    std::env::var("TMUX_PANE").unwrap_or_default()
+}
+
+/// List the copy-mode commands and send the chosen one.
+///
+/// Plain output rather than a TUI: the list is short and fixed, and this is
+/// invoked from a popup that a picker would nest inside.
+fn copy_mode(target: &str) -> Result<()> {
+    use collect::clipboard::COPY_COMMANDS;
+
+    let width = COPY_COMMANDS
+        .iter()
+        .map(|c| c.name.len())
+        .max()
+        .unwrap_or(0);
+    for c in COPY_COMMANDS {
+        println!("{:<width$}  {}", c.name, c.about);
+    }
+    eprintln!();
+    eprint!("command: ");
+
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let name = line.trim();
+    if name.is_empty() {
+        return Ok(());
+    }
+    if !COPY_COMMANDS.iter().any(|c| c.name == name) {
+        anyhow::bail!("unknown copy-mode command: {name}");
+    }
+    collect::clipboard::send_copy_command(name, target)
 }
