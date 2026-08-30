@@ -12,7 +12,11 @@ use layout::point;
 #[derive(Parser)]
 #[command(
     name = "tmc",
-    about = "tmux workspace control: snapshot, diff, restore"
+    about = "tmux workspace control: snapshot, diff, restore",
+    // The commit this binary came from. Installing is a separate step from
+    // building, and a stale ~/.local/bin/tmc is otherwise invisible — you
+    // notice it by wondering why a feature you just wrote does nothing.
+    version = env!("TMC_COMMIT"),
 )]
 struct Cli {
     /// No subcommand opens the TUI — the common case, and what the `w` key

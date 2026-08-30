@@ -76,6 +76,8 @@ pub struct Model {
     pub search: String,
     /// True while the search line is accepting keys.
     pub searching: bool,
+    /// Set when the running binary predates the checked-out source.
+    pub stale_build: Option<String>,
 }
 
 impl Model {
@@ -93,6 +95,7 @@ impl Model {
             status: String::new(),
             search: String::new(),
             searching: false,
+            stale_build: check_build(),
         }
     }
 
@@ -368,6 +371,42 @@ fn build_rows(
         }
     }
     rows
+}
+
+/// Whether this binary is older than the source it was built from.
+///
+/// Only meaningful when run from a checkout — a released binary has no
+/// repository to compare against and reports nothing. Cheap: one `git` call
+/// at startup, never on the polling path.
+fn check_build() -> Option<String> {
+    let built = env!("TMC_COMMIT");
+    if built == "unknown" {
+        return None;
+    }
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    if !manifest.join(".git").exists() {
+        return None;
+    }
+    let head = crate::collect::cmd::run(
+        "git",
+        &["-C", manifest.to_str()?, "describe", "--always", "--dirty"],
+        crate::collect::cmd::FAST,
+    )
+    .ok()?;
+    staleness(built, head.trim())
+}
+
+/// Describe the gap between the binary's commit and the source's, if any.
+///
+/// Compares commits, not strings: `-dirty` means uncommitted edits, which is
+/// the normal state while working and says nothing about whether the binary is
+/// current. Only a different commit is real staleness.
+fn staleness(built: &str, source: &str) -> Option<String> {
+    fn commit_of(s: &str) -> &str {
+        s.trim_end_matches("-dirty")
+    }
+    let (built_at, source_at) = (commit_of(built), commit_of(source));
+    (built_at != source_at).then(|| format!("{built_at}, source is {source_at}"))
 }
 
 #[cfg(test)]
@@ -695,6 +734,26 @@ mod tests {
         m.search_clear();
         assert_eq!(m.visible().len(), 2, "headers come back too");
         assert!(!m.searching);
+    }
+
+    #[test]
+    fn a_binary_from_an_older_commit_is_reported() {
+        // The failure this exists to catch: fuzzy search was written, tested
+        // and committed, but ~/.local/bin held the previous build, so pressing
+        // `/` did nothing and the code looked wrong.
+        assert_eq!(
+            staleness("211e537", "d029676"),
+            Some("211e537, source is d029676".into()),
+        );
+    }
+
+    #[test]
+    fn uncommitted_edits_alone_are_not_staleness() {
+        // The normal state while working; warning here would train the eye to
+        // ignore the line.
+        assert_eq!(staleness("211e537", "211e537-dirty"), None);
+        assert_eq!(staleness("211e537-dirty", "211e537"), None);
+        assert_eq!(staleness("211e537", "211e537"), None);
     }
 
     #[test]

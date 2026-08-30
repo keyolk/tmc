@@ -89,6 +89,15 @@ fn render_header(frame: &mut Frame, area: Rect, model: &Model, now_secs: u64) {
     if !model.marks.is_empty() {
         summary.push(Span::raw(format!("  {} marked", model.marks.len())));
     }
+    // A binary older than the source is invisible otherwise: you notice it by
+    // wondering why a feature you just wrote does nothing. Says so rather than
+    // letting the reader debug the wrong thing.
+    if let Some(newer) = &model.stale_build {
+        summary.push(Span::styled(
+            format!("   this build is {} — run make install", newer),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
 
     let drift = Line::from(vec![
         Span::styled(point, Style::default().fg(Color::DarkGray)),
