@@ -6,6 +6,9 @@
 //! skipped when empty, which keeps a tmc-written file byte-comparable to a
 //! tmux.sh-written one for the fields both produce.
 
+pub mod autosave;
+pub mod point;
+pub mod restore;
 pub mod save;
 
 use serde::{Deserialize, Serialize};

@@ -1,14 +1,17 @@
+mod clock;
 mod collect;
 mod layout;
-
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+use layout::point;
+
 #[derive(Parser)]
-#[command(name = "tmc", about = "tmux workspace control: snapshot, diff, restore")]
+#[command(
+    name = "tmc",
+    about = "tmux workspace control: snapshot, diff, restore"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -24,138 +27,241 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// The hourly snapshot: write one per session, then prune.
+    Autosave,
+    /// Show the restore points on disk, newest first.
+    List,
+    /// Bring a restore point back.
+    Load {
+        /// Restore point name, e.g. `auto:20260829T204041Z` or `saved:mypoint`.
+        /// Defaults to the newest.
+        name: Option<String>,
+        /// Restore only this session; repeatable.
+        #[arg(long = "session", short)]
+        sessions: Vec<String>,
+        /// Print what would be created without touching tmux.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Save { name, dry_run } => save(name, dry_run),
+        Command::Autosave => autosave(),
+        Command::List => list(),
+        Command::Load {
+            name,
+            sessions,
+            dry_run,
+        } => load(name, &sessions, dry_run),
     }
 }
 
 fn save(name: Option<String>, dry_run: bool) -> Result<()> {
-    let panes = collect::tmux::panes().context("list tmux panes")?;
-    if panes.is_empty() {
-        // No server, or no panes: nothing to snapshot. Not an error — the
-        // hourly job runs whether or not tmux is up.
+    let Some(sessions) = snapshot_now()? else {
         println!("no tmux panes; nothing to save");
         return Ok(());
-    }
-    let tree = collect::proc::Tree::capture_with_args().context("read process table")?;
-
-    let now = utc_now();
-    let sessions = layout::save::snapshot(&panes, &tree, &now.timestamp);
+    };
 
     // A restore point is the whole workspace, not one session: saving them
     // separately made it impossible to bring a dashboard+projects pair back as
     // it was at one moment.
-    let name = name.unwrap_or_else(|| now.compact.clone());
+    let name = name.unwrap_or_else(|| clock::now().compact);
     if name == "autosave" {
         anyhow::bail!("'autosave' is reserved for the hourly snapshots");
     }
     let point = layout::save::layout_dir().join(name.replace('/', "_"));
 
     for session in &sessions {
-        let path: PathBuf = point.join(format!("{}.json", session.session.replace('/', "_")));
-        let panes: usize = session.windows.iter().map(|w| w.panes.len()).sum();
-        println!(
-            "  {}: {} windows, {} panes  [{}]",
-            session.session,
-            session.windows.len(),
-            panes,
-            session.label.as_deref().unwrap_or(""),
-        );
+        println!("  {}", describe(session));
         if !dry_run {
+            let path = point.join(format!("{}.json", session.session.replace('/', "_")));
             layout::save::write(session, &path)?;
         }
     }
 
-    if dry_run {
+    let verb = if dry_run { "would write" } else { "saved" };
+    println!(
+        "\n{verb} {} session(s) -> {}",
+        sessions.len(),
+        point.display()
+    );
+    Ok(())
+}
+
+fn autosave() -> Result<()> {
+    let now = clock::now();
+    let root = layout::save::layout_dir().join("autosave");
+
+    let Some(sessions) = snapshot_now()? else {
+        // No server — e.g. after a reboot, before tmux runs. Not an error: the
+        // job fires on a timer regardless.
+        println!("{} autosave: no tmux server", now.timestamp);
+        return Ok(());
+    };
+
+    let written = layout::autosave::write(&root, &sessions, &now.compact)?;
+    let pruned_snapshots = layout::autosave::prune_old(&root, layout::autosave::KEEP);
+    let pruned_sessions = layout::autosave::prune_dead(
+        &root,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        layout::autosave::MAX_AGE_DAYS,
+        layout::autosave::session_is_live,
+    );
+
+    // One line, because this goes to a log file that is read by tailing it.
+    let mut line = format!(
+        "{} autosave: {written} session(s) -> {}/<session>/{}.json",
+        now.timestamp,
+        root.display(),
+        now.compact,
+    );
+    if pruned_snapshots > 0 {
+        line.push_str(&format!(" (pruned {pruned_snapshots} snapshot(s)"));
+        if pruned_sessions > 0 {
+            line.push_str(&format!(", {pruned_sessions} dead session(s)"));
+        }
+        line.push(')');
+    } else if pruned_sessions > 0 {
+        line.push_str(&format!(" (pruned {pruned_sessions} dead session(s))"));
+    }
+    println!("{line}");
+    Ok(())
+}
+
+fn list() -> Result<()> {
+    let points = point::list(&layout::save::layout_dir());
+    if points.is_empty() {
+        println!("no restore points");
+        return Ok(());
+    }
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    for p in &points {
+        // The label answers "what was I working on", which the timestamp alone
+        // never did — every hourly point otherwise looks identical. Files
+        // written by tmux.sh have no label, so one is derived from the window
+        // names on read rather than showing a blank column.
+        let label = point::read(&p.reference)
+            .ok()
+            .map(|sessions| label_for(&sessions))
+            .unwrap_or_default();
         println!(
-            "\ndry run: {} session(s) would be written to {}",
-            sessions.len(),
-            point.display()
-        );
-    } else {
-        println!(
-            "\nsaved {} session(s) -> {}",
-            sessions.len(),
-            point.display()
+            "{:<26} {:>9}  {} session(s)  {label}",
+            p.name,
+            clock::age_of(&p.sort_key, now_secs),
+            p.sessions,
         );
     }
     Ok(())
 }
 
-struct Now {
-    /// `2026-08-30T00:00:00Z`, the `saved_at` format tmux.sh writes.
-    timestamp: String,
-    /// `20260830T000000Z`, used for directory names.
-    compact: String,
-}
-
-/// Format the current UTC time without pulling in a date library.
-///
-/// Only two fixed formats are ever needed, and both are derived from the same
-/// civil-time conversion below.
-fn utc_now() -> Now {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let (y, mo, d, h, mi, s) = civil_from_unix(secs);
-    Now {
-        timestamp: format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z"),
-        compact: format!("{y:04}{mo:02}{d:02}T{h:02}{mi:02}{s:02}Z"),
+/// A point's label: the stored one when present, else derived from the window
+/// names across every session it holds.
+fn label_for(sessions: &[layout::Session]) -> String {
+    if let Some(stored) = sessions.iter().find_map(|s| s.label.as_deref()) {
+        return stored.to_string();
+    }
+    const SHOWN: usize = 3;
+    let names: Vec<&str> = sessions
+        .iter()
+        .flat_map(|s| &s.windows)
+        .map(|w| w.name.as_str())
+        .collect();
+    let head = names
+        .iter()
+        .take(SHOWN)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    match names.len().saturating_sub(SHOWN) {
+        0 => head,
+        rest => format!("{head} +{rest}"),
     }
 }
 
-/// Days-from-civil, inverted. Howard Hinnant's algorithm — exact for every
-/// date the epoch can express, and small enough to keep the dependency list at
-/// what the collectors need.
-fn civil_from_unix(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
+fn load(name: Option<String>, only: &[String], dry_run: bool) -> Result<()> {
+    let points = point::list(&layout::save::layout_dir());
+    let chosen = match &name {
+        Some(wanted) => points
+            .iter()
+            .find(|p| &p.name == wanted || p.name.ends_with(wanted.as_str()))
+            .with_context(|| format!("no restore point matching '{wanted}'"))?,
+        None => points.first().context("no restore points on disk")?,
+    };
 
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    let y = if m <= 2 { y + 1 } else { y };
-
-    (
-        y,
-        m,
-        d,
-        (rem / 3600) as u32,
-        (rem % 3600 / 60) as u32,
-        (rem % 60) as u32,
-    )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn converts_a_known_instant() {
-        // 2026-08-30T00:00:00Z, cross-checked with `date -u -r`.
-        assert_eq!(civil_from_unix(1_788_048_000), (2026, 8, 30, 0, 0, 0));
-        // The epoch itself.
-        assert_eq!(civil_from_unix(0), (1970, 1, 1, 0, 0, 0));
-        // A leap day, which a naive 365-day conversion gets wrong.
-        assert_eq!(civil_from_unix(1_709_164_800), (2024, 2, 29, 0, 0, 0));
-    }
-
-    #[test]
-    fn formats_both_shapes_from_one_conversion() {
-        let (y, mo, d, h, mi, s) = civil_from_unix(1_788_048_061);
-        assert_eq!(
-            format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z"),
-            "2026-08-30T00:01:01Z",
+    let sessions = point::read(&chosen.reference)?;
+    let wanted: Vec<&layout::Session> = sessions
+        .iter()
+        .filter(|s| only.is_empty() || only.contains(&s.session))
+        .collect();
+    if wanted.is_empty() {
+        anyhow::bail!(
+            "restore point '{}' holds none of the requested sessions",
+            chosen.name
         );
     }
+
+    println!("restore point: {}", chosen.name);
+    for s in &wanted {
+        println!("  {}", describe(s));
+    }
+    println!();
+
+    let mut total = layout::restore::Report::default();
+    let mut server = layout::restore::Server;
+    for s in &wanted {
+        let report =
+            layout::restore::session(&mut server, s, layout::restore::Selection::all(), dry_run)?;
+        for note in &report.notes {
+            println!("  {}: {note}", s.session);
+        }
+        total.windows += report.windows;
+        total.panes += report.panes;
+        total.missing_panes += report.missing_panes;
+        total.commands_prefilled += report.commands_prefilled;
+    }
+
+    let verb = if dry_run { "would restore" } else { "restored" };
+    println!(
+        "\n{verb} {} window(s), {} pane(s), {} command(s) prefilled",
+        total.windows, total.panes, total.commands_prefilled,
+    );
+    if total.missing_panes > 0 {
+        println!("{} pane(s) did not fit the display", total.missing_panes);
+    }
+    Ok(())
+}
+
+/// Snapshot every live session, or `None` when there is no tmux server.
+fn snapshot_now() -> Result<Option<Vec<layout::Session>>> {
+    let panes = collect::tmux::panes().context("list tmux panes")?;
+    if panes.is_empty() {
+        return Ok(None);
+    }
+    let tree = collect::proc::Tree::capture_with_args().context("read process table")?;
+    Ok(Some(layout::save::snapshot(
+        &panes,
+        &tree,
+        &clock::now().timestamp,
+    )))
+}
+
+fn describe(s: &layout::Session) -> String {
+    let panes: usize = s.windows.iter().map(|w| w.panes.len()).sum();
+    format!(
+        "{}: {} windows, {} panes  [{}]",
+        s.session,
+        s.windows.len(),
+        panes,
+        label_for(std::slice::from_ref(s)),
+    )
 }
