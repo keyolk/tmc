@@ -130,7 +130,14 @@ fn render_tree(frame: &mut Frame, area: Rect, model: &Model) {
         .enumerate()
         .skip(offset)
         .take(height)
-        .map(|(pos, &i)| render_row(&model.rows[i], pos == model.cursor, model))
+        .map(|(pos, &i)| {
+            render_row(
+                &model.rows[i],
+                pos == model.cursor,
+                model,
+                area.width as usize,
+            )
+        })
         .collect();
 
     if visible.is_empty() && !model.search.is_empty() {
@@ -156,7 +163,7 @@ fn scroll_offset(cursor: usize, total: usize, height: usize) -> usize {
     cursor.saturating_sub(half).min(total - height)
 }
 
-fn render_row<'a>(row: &'a Row, selected: bool, model: &Model) -> Line<'a> {
+fn render_row<'a>(row: &'a Row, selected: bool, model: &Model, width: usize) -> Line<'a> {
     match row {
         Row::Session { name, windows } => Line::from(vec![
             Span::styled(
@@ -168,6 +175,40 @@ fn render_row<'a>(row: &'a Row, selected: bool, model: &Model) -> Line<'a> {
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
+        Row::Pane(p) => {
+            // Indented under its window, addressed by pane id — that is what
+            // the pane commands take, and showing it makes the target of
+            // `b`/`J` unambiguous rather than "whichever tmux considers
+            // active".
+            let cursor = if selected { '>' } else { ' ' };
+            let command = if p.command.is_empty() {
+                "(shell)".to_string()
+            } else {
+                p.command.clone()
+            };
+            Line::from(vec![
+                Span::raw(format!("{cursor}    ")),
+                Span::styled(
+                    format!("{:<5}", p.pane_id),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    if p.active { "· " } else { "  " },
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    // The pane id and markers take a fixed prefix; the rest is
+                    // the command, cut to what is left. Three claude panes in
+                    // one window are indistinguishable otherwise.
+                    truncate(&command, width.saturating_sub(13)),
+                    if selected {
+                        Style::default().add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    },
+                ),
+            ])
+        }
         Row::Window(w) => {
             let mark = if model.marks.contains(&w.target()) {
                 '#'
@@ -240,19 +281,43 @@ fn render_detail(frame: &mut Frame, area: Rect, model: &Model) {
     // the window is showing. The capture gets the remaining height because it
     // is what tells one `fish` prompt from another; the metadata above is a
     // handful of lines and fixed.
-    let mut head: Vec<Line> = vec![Line::from(vec![
-        Span::styled(w.target(), Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw("  "),
-        Span::styled(w.name.clone(), Style::default().fg(Color::DarkGray)),
-        Span::raw("  "),
-        Span::styled(
-            format!("{}p", w.panes),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ])];
+    // Name the pane when one is selected: with three identical claude
+    // commands in a window, the id is the only thing that says which output
+    // below belongs to which row above.
+    let mut head: Vec<Line> = vec![match model.current_pane() {
+        Some(p) => Line::from(vec![
+            Span::styled(
+                p.target().to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("{} {}", p.window_target(), w.name),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        None => Line::from(vec![
+            Span::styled(w.target(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::styled(w.name.clone(), Style::default().fg(Color::DarkGray)),
+            Span::raw("  "),
+            Span::styled(
+                format!("{}p", w.panes),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+    }];
 
-    for reason in &w.reasons {
-        head.push(Line::styled(format!("  {reason}"), style_for(w.change)));
+    match model.current_pane() {
+        Some(p) => head.push(Line::from(vec![
+            Span::styled("  cwd ", Style::default().fg(Color::DarkGray)),
+            Span::raw(p.path.clone()),
+        ])),
+        None => {
+            for reason in &w.reasons {
+                head.push(Line::styled(format!("  {reason}"), style_for(w.change)));
+            }
+        }
     }
     if !w.state.is_empty() {
         head.push(Line::from(vec![
@@ -289,7 +354,14 @@ fn render_preview(frame: &mut Frame, area: Rect, model: &Model, w: &super::model
         return;
     }
 
-    let body = match model.preview_for(&w.target()) {
+    // Keyed by whatever `app::refresh_preview` captured: the pane id when one
+    // is selected, the window otherwise. Asking by window while a pane is
+    // selected silently rendered "(nothing on screen)".
+    let key = match model.current_pane() {
+        Some(p) => p.target().to_string(),
+        None => w.target(),
+    };
+    let body = match model.preview_for(&key) {
         Some(body) => body,
         None if w.gone => {
             frame.render_widget(
@@ -357,8 +429,13 @@ fn render_keys(frame: &mut Frame, area: Rect, model: &Model) {
     let groups = [
         "/ search  j/k move  ⏎ switch".to_string(),
         format!("space mark  a all  {restore}"),
-        "s save  p/P point  n waiting".to_string(),
-        "m move  b break  J join  x kill".to_string(),
+        // Expanding comes before the rarer commands: it is how you reach a
+        // pane at all, and a hint that drops it first leaves `b`/`J` looking
+        // like they act on nothing.
+        "l/h panes".to_string(),
+        "s save  n waiting".to_string(),
+        "b break  J join  m move  x kill".to_string(),
+        "p/P point".to_string(),
     ];
 
     let mut text = String::new();

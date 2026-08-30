@@ -100,6 +100,74 @@ mod tests {
         m
     }
 
+    /// A pane of `projects:8` — `window()` builds every fixture window in the
+    /// `projects` session, whatever header sits above it.
+    fn pane_row(id: &str, command: &str) -> Row {
+        Row::Pane(crate::ui::model::PaneRow {
+            session: "projects".into(),
+            window_index: 8,
+            index: 1,
+            pane_id: id.into(),
+            command: command.into(),
+            path: "/home/u/src".into(),
+            active: false,
+        })
+    }
+
+    #[test]
+    fn an_expanded_window_lists_panes_by_id() {
+        // Three identical claude commands in one window: the id is the only
+        // thing that tells the rows apart.
+        let mut m = model();
+        m.rows
+            .insert(3, pane_row("%1084", "ccproxy claude --model default"));
+        m.rows
+            .insert(4, pane_row("%1087", "ccproxy claude --model default"));
+        let out = render(&m, 110, 16, 0);
+
+        assert!(out.contains("%1084"), "{out}");
+        assert!(out.contains("%1087"), "{out}");
+    }
+
+    #[test]
+    fn selecting_a_pane_names_it_in_the_panel() {
+        let mut m = model();
+        // model() row 2 is dashboard:8; its pane goes directly after.
+        m.rows.insert(3, pane_row("%1084", "ccproxy claude"));
+        m.cursor = 3;
+        assert!(
+            matches!(&m.rows[m.cursor], Row::Pane(_)),
+            "the cursor must land on the pane for this test to mean anything",
+        );
+        m.preview = Some(("%1084".into(), "the pane output\n".into()));
+        // Tall enough that the capture is not cut off below the fold.
+        let out = render(&m, 110, 20, 0);
+
+        // The panel titles the pane, not its window — otherwise the output
+        // below has nothing identifying it.
+        assert!(out.contains("%1084  projects:8"), "{out}");
+        assert!(out.contains("/home/u/src"), "the pane cwd:\n{out}");
+        assert!(out.contains("the pane output"), "{out}");
+    }
+
+    #[test]
+    fn a_long_pane_command_is_cut_at_the_column() {
+        use unicode_width::UnicodeWidthStr;
+        let mut m = model();
+        m.rows.insert(
+            3,
+            pane_row(
+                "%1084",
+                &"ccproxy claude --intercept=mitm -- --model default".repeat(3),
+            ),
+        );
+        for width in [90u16, 110, 140] {
+            for line in render(&m, width, 16, 0).lines() {
+                assert!(line.width() <= width as usize, "at {width}: {line:?}");
+            }
+        }
+    }
+
     #[test]
     fn the_panel_shows_what_the_window_is_running() {
         // Choosing between windows means seeing their output — the name is
@@ -276,6 +344,18 @@ mod tests {
         let narrow = render(&model(), 70, 12, 0);
         assert!(wide.contains("x kill"), "{wide}");
         assert!(!narrow.contains("x kill"), "dropped when it will not fit");
+    }
+
+    #[test]
+    fn expanding_survives_narrower_than_the_rare_commands_do() {
+        // `l` is how you reach a pane at all; dropping it before `b`/`J` would
+        // leave those looking like they act on nothing.
+        let out = render(&model(), 100, 12, 0);
+        assert!(out.contains("l/h panes"), "{out}");
+        assert!(
+            !out.contains("x kill"),
+            "the rarer group goes first:\n{out}"
+        );
     }
 
     #[test]

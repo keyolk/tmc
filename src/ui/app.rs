@@ -201,6 +201,19 @@ fn handle_key(model: &mut Model, code: KeyCode, mods: KeyModifiers) -> Result<()
         // Window-level surgery, replacing `tmux.sh move/join/break`. These
         // act on the window under the cursor, which is what the tree is for —
         // tmux.sh made you pick from a second fzf list first.
+        // Expand a window to its panes. `b` and `J` need a pane, and this is
+        // how you get one.
+        KeyCode::Char('l') | KeyCode::Right => {
+            if model.set_expanded(Some(true)) {
+                reload(model)?;
+            }
+        }
+        KeyCode::Char('h') | KeyCode::Left => {
+            if model.set_expanded(Some(false)) {
+                reload(model)?;
+            }
+        }
+
         KeyCode::Char('m') => move_window(model)?,
         KeyCode::Char('b') => break_pane(model)?,
         KeyCode::Char('J') => join_pane(model)?,
@@ -354,55 +367,81 @@ fn move_window(model: &mut Model) -> Result<()> {
     Ok(())
 }
 
-/// Break the selected window's active pane into a window of its own.
+/// Break the selected pane into a window of its own.
+///
+/// Requires a pane to be selected. Addressing this by window — which an
+/// earlier version did — makes tmux use that window's *active* pane, so the
+/// thing that moved was not the thing on screen.
 fn break_pane(model: &mut Model) -> Result<()> {
-    let Some(w) = model.current_window() else {
+    let Some(p) = model.current_pane() else {
+        model.status = "select a pane first — enter expands a window".into();
         return Ok(());
     };
-    if w.gone {
-        model.status = "that window is not running".into();
+    let pane = p.target().to_string();
+    let from = p.window_target();
+
+    // Breaking the only pane just renames its window.
+    if model.current_window().is_some_and(|w| w.panes < 2) {
+        model.status = "that window has a single pane; nothing to break out".into();
         return Ok(());
     }
-    if w.panes < 2 {
-        // Breaking the only pane just renames the window.
-        model.status = "window has a single pane; nothing to break out".into();
-        return Ok(());
-    }
-    let target = w.target();
+
+    // `-d` leaves the focus where it is: this is a popup, and stealing the
+    // client to the new window would drop the user somewhere they did not ask
+    // to be.
     crate::collect::cmd::run(
         "tmux",
-        &["break-pane", "-d", "-s", &target],
+        &["break-pane", "-d", "-s", &pane],
         crate::collect::cmd::FAST,
     )?;
     reload(model)?;
-    model.status = format!("broke a pane out of {target}");
+    model.status = format!("{pane} broken out of {from}");
     Ok(())
 }
 
-/// Pull the selected window's pane into the window tmc was launched from.
+/// Pull the selected pane into the window tmc was launched from.
 ///
-/// The counterpart to break, and the reason `$TMUX_PANE` matters: the
-/// destination is where the user was, not where the popup is.
+/// The counterpart to break. `$TMUX_PANE` is the destination and not the
+/// active pane, because a popup *is* a pane — asking tmux for the current one
+/// would name the popup and the join would fail.
 fn join_pane(model: &mut Model) -> Result<()> {
-    let Some(w) = model.current_window() else {
+    let Some(p) = model.current_pane() else {
+        model.status = "select a pane first — enter expands a window".into();
         return Ok(());
     };
-    if w.gone {
-        model.status = "that window is not running".into();
-        return Ok(());
-    }
     let Ok(here) = std::env::var("TMUX_PANE") else {
         model.status = "not running inside tmux".into();
         return Ok(());
     };
-    let target = w.target();
+    let pane = p.target().to_string();
+    let from = p.window_target();
+
+    // Refuse to join a pane into its own window: tmux would report an error,
+    // and the intent is never that.
+    let destination_window = crate::collect::cmd::run(
+        "tmux",
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            &here,
+            "#{session_name}:#{window_index}",
+        ],
+        crate::collect::cmd::FAST,
+    )
+    .unwrap_or_default();
+    if destination_window.trim() == from {
+        model.status = "that pane is already in this window".into();
+        return Ok(());
+    }
+
     crate::collect::cmd::run(
         "tmux",
-        &["join-pane", "-s", &target, "-t", &here],
+        &["join-pane", "-s", &pane, "-t", &here],
         crate::collect::cmd::FAST,
     )?;
     reload(model)?;
-    model.status = format!("joined a pane from {target}");
+    model.status = format!("{pane} joined here from {from}");
     Ok(())
 }
 
@@ -446,16 +485,18 @@ fn sessions() -> Result<Vec<String>> {
 /// Done at draw time rather than on every keystroke: a held-down `j` would
 /// otherwise shell out once per repeat for panes that scroll past unseen.
 fn refresh_preview(model: &mut Model) {
-    let Some(w) = model.current_window() else {
-        model.preview = None;
-        return;
+    // A pane row previews that pane; a window row previews its active one.
+    // Without this, expanding a window of three identical claude commands
+    // shows the same output whichever you select — and the whole reason to
+    // expand is to tell them apart.
+    let target = match (model.current_pane(), model.current_window()) {
+        (Some(p), _) => p.target().to_string(),
+        (None, Some(w)) if !w.gone => w.target(),
+        _ => {
+            model.preview = None;
+            return;
+        }
     };
-    if w.gone {
-        // Nothing to capture — the window exists only in the restore point.
-        model.preview = None;
-        return;
-    }
-    let target = w.target();
     if model.preview_for(&target).is_some() {
         return;
     }

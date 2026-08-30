@@ -80,7 +80,9 @@ you want the commands; `tmc --browse` starts there instead.
 | `r` | restore marked (or, with none marked, the missing windows) |
 | `s` | save a point now |
 | `p` / `P` | next / previous restore point |
-| `m` `b` `J` `x` | move window, break pane out, join pane in, kill window |
+| `l` / `h` | expand a window to its panes / collapse |
+| `b` / `J` | break the selected pane out / join it into this window |
+| `m` / `x` | move window to the other session / close it |
 | `q`, `Esc` | quit |
 
 ## State
@@ -135,6 +137,12 @@ process exposes no session id through its cwd, environment or open files. So
 when a window runs several claudes, the id names *a* session in that window
 and not necessarily that pane's. `tmc` records which case it is and shows it,
 rather than guessing and resuming the wrong conversation silently.
+
+**Which pane you meant.** `break-pane` and `join-pane` take a pane, and a
+window target makes tmux use whichever pane it considers active — not the one
+you were looking at. `l` expands a window to its panes, each addressed by
+`%id`, and the preview follows the selection so three identical `ccproxy
+claude` rows can still be told apart.
 
 **Whether panes match after a tmux restart.** `pane_id` is exact within one
 server lifetime and meaningless across a restart — which is precisely when a

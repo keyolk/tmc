@@ -19,6 +19,36 @@ pub enum Row {
         windows: usize,
     },
     Window(WindowRow),
+    /// A pane inside an expanded window. Only these carry a `pane_id`, which
+    /// is what `break-pane` and `join-pane` actually take — addressing them by
+    /// window let tmux pick its active pane instead of the one on screen.
+    Pane(PaneRow),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaneRow {
+    pub session: String,
+    pub window_index: u32,
+    pub index: u32,
+    /// `%N`, the unambiguous target for pane commands.
+    pub pane_id: String,
+    /// What the pane is running, from the process tree — not
+    /// `pane_current_command`, which names the shell.
+    pub command: String,
+    pub path: String,
+    pub active: bool,
+}
+
+impl PaneRow {
+    /// `%N`. Preferred over `session:window.index` because it survives the
+    /// renumbering that closing a neighbouring pane causes.
+    pub fn target(&self) -> &str {
+        &self.pane_id
+    }
+
+    pub fn window_target(&self) -> String {
+        format!("{}:{}", self.session, self.window_index)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -78,6 +108,8 @@ pub struct Model {
     pub searching: bool,
     /// Set when the running binary predates the checked-out source.
     pub stale_build: Option<String>,
+    /// Windows whose panes are listed, by target.
+    pub expanded: std::collections::HashSet<String>,
     /// What the selected window is showing, and which window that was.
     ///
     /// Cached by target so moving the cursor back and forth over the same rows
@@ -101,6 +133,7 @@ impl Model {
             search: String::new(),
             searching: false,
             stale_build: check_build(),
+            expanded: std::collections::HashSet::new(),
             preview: None,
         }
     }
@@ -123,18 +156,22 @@ impl Model {
         if self.search.is_empty() {
             return (0..self.rows.len()).collect();
         }
-        let windows: Vec<(usize, &WindowRow)> = self
+        // Windows match on their name, panes on what they are running — the
+        // pane is often the more precise thing to search for, since window
+        // names repeat but `ccproxy claude --resume …` does not.
+        let targets: Vec<(usize, String)> = self
             .rows
             .iter()
             .enumerate()
             .filter_map(|(i, r)| match r {
-                Row::Window(w) => Some((i, w)),
+                Row::Window(w) => Some((i, w.name.clone())),
+                Row::Pane(p) => Some((i, p.command.clone())),
                 Row::Session { .. } => None,
             })
             .collect();
-        crate::fuzzy::rank(&self.search, &windows, |(_, w)| w.name.as_str())
+        crate::fuzzy::rank(&self.search, &targets, |(_, text)| text.as_str())
             .into_iter()
-            .map(|pos| windows[pos].0)
+            .map(|pos| targets[pos].0)
             .collect()
     }
 
@@ -157,7 +194,7 @@ impl Model {
     ) {
         let diff = crate::layout::diff::compare(panes, saved, tree);
         self.counts = diff.counts();
-        self.rows = build_rows(panes, &diff, pending);
+        self.rows = build_rows(panes, &diff, pending, tree, &self.expanded);
         self.waiting = self
             .rows
             .iter()
@@ -178,6 +215,9 @@ impl Model {
             match row {
                 Row::Session { name, windows } => {
                     out.push_str(&format!("S:{name}:{windows}\n"));
+                }
+                Row::Pane(p) => {
+                    out.push_str(&format!("P:{}:{}:{}\n", p.target(), p.command, p.active,))
                 }
                 Row::Window(w) => out.push_str(&format!(
                     "W:{}:{}:{}:{}:{}:{}\n",
@@ -277,9 +317,47 @@ impl Model {
         self.status = "no window is waiting".into();
     }
 
+    /// Show or hide the selected window's panes.
+    ///
+    /// `want` of `None` toggles. With the cursor on a pane, collapsing acts on
+    /// its parent window — otherwise `h` on a pane row would do nothing, which
+    /// reads as a broken key.
+    pub fn set_expanded(&mut self, want: Option<bool>) -> bool {
+        let target = match self.cursor_row().and_then(|i| self.rows.get(i)) {
+            Some(Row::Window(w)) if !w.gone => w.target(),
+            Some(Row::Pane(p)) => p.window_target(),
+            _ => return false,
+        };
+        let is_open = self.expanded.contains(&target);
+        let open = want.unwrap_or(!is_open);
+        if open == is_open {
+            return false;
+        }
+        if open {
+            self.expanded.insert(target);
+        } else {
+            self.expanded.remove(&target);
+        }
+        true
+    }
+
+    /// The pane under the cursor, when one is selected.
+    pub fn current_pane(&self) -> Option<&PaneRow> {
+        match self.cursor_row().and_then(|i| self.rows.get(i)) {
+            Some(Row::Pane(p)) => Some(p),
+            _ => None,
+        }
+    }
+
     pub fn current_window(&self) -> Option<&WindowRow> {
         match self.cursor_row().and_then(|i| self.rows.get(i)) {
             Some(Row::Window(w)) => Some(w),
+            // A pane belongs to a window; commands that act on windows should
+            // still work with the cursor on one of its panes.
+            Some(Row::Pane(p)) => self.rows.iter().find_map(|r| match r {
+                Row::Window(w) if w.target() == p.window_target() => Some(w),
+                _ => None,
+            }),
             _ => None,
         }
     }
@@ -331,6 +409,8 @@ fn build_rows(
     panes: &[tmux::Pane],
     diff: &Diff,
     pending: &std::collections::HashMap<String, notify::Entry>,
+    tree: &proc::Tree,
+    expanded: &std::collections::HashSet<String>,
 ) -> Vec<Row> {
     let mut rows = Vec::new();
     let mut sessions: Vec<&str> = Vec::new();
@@ -370,6 +450,7 @@ fn build_rows(
             let waiting =
                 state == "waiting" && pending.get(&cc_session).is_some_and(|e| e.kind.blocking());
 
+            let target = format!("{}:{}", w.session, w.index);
             rows.push(Row::Window(WindowRow {
                 session: w.session.clone(),
                 index: w.index,
@@ -382,6 +463,26 @@ fn build_rows(
                 reasons: w.reasons.clone(),
                 gone: w.change == Change::Removed,
             }));
+
+            if expanded.contains(&target) {
+                for p in &live {
+                    rows.push(Row::Pane(PaneRow {
+                        session: p.session.clone(),
+                        window_index: p.window_index,
+                        index: p.pane_index,
+                        pane_id: p.pane_id.clone(),
+                        // Through the process tree, like `save` — the shell
+                        // name a pane reports says nothing about what is
+                        // running in it.
+                        command: crate::collect::command::for_pane(p.pid, tree, |pid| {
+                            tree.args(pid).map(str::to_string)
+                        })
+                        .unwrap_or_default(),
+                        path: p.path.clone(),
+                        active: p.active,
+                    }));
+                }
+            }
         }
     }
     rows
@@ -474,6 +575,10 @@ mod tests {
         map
     }
 
+    fn empty_tree() -> proc::Tree {
+        proc::Tree::parse_for_test("1 0 launchd\n")
+    }
+
     fn model_with(rows: Vec<Row>) -> Model {
         let mut m = Model::new(Vec::new());
         m.rows = rows;
@@ -486,7 +591,13 @@ mod tests {
         let diff = Diff {
             windows: vec![window_diff("projects", 1, "alpha", Change::Same)],
         };
-        let rows = build_rows(&panes, &diff, &HashMap::new());
+        let rows = build_rows(
+            &panes,
+            &diff,
+            &HashMap::new(),
+            &empty_tree(),
+            &Default::default(),
+        );
 
         assert!(matches!(&rows[0], Row::Session { name, windows: 1 } if name == "projects"));
         assert!(matches!(&rows[1], Row::Window(w) if w.name == "alpha"));
@@ -501,10 +612,22 @@ mod tests {
             windows: vec![window_diff("projects", 1, "alpha", Change::Same)],
         };
 
-        let without = build_rows(&panes, &diff, &HashMap::new());
+        let without = build_rows(
+            &panes,
+            &diff,
+            &HashMap::new(),
+            &empty_tree(),
+            &Default::default(),
+        );
         assert!(matches!(&without[1], Row::Window(w) if !w.waiting));
 
-        let with = build_rows(&panes, &diff, &pending_with("sess-a", notify::Kind::Idle));
+        let with = build_rows(
+            &panes,
+            &diff,
+            &pending_with("sess-a", notify::Kind::Idle),
+            &empty_tree(),
+            &Default::default(),
+        );
         assert!(matches!(&with[1], Row::Window(w) if w.waiting));
     }
 
@@ -518,6 +641,8 @@ mod tests {
             &panes,
             &diff,
             &pending_with("sess-a", notify::Kind::AgentDone),
+            &empty_tree(),
+            &Default::default(),
         );
         assert!(matches!(&rows[1], Row::Window(w) if !w.waiting));
     }
@@ -650,6 +775,158 @@ mod tests {
 
         assert_eq!(a.fingerprint(), same.fingerprint());
         assert_ne!(a.fingerprint(), changed.fingerprint());
+    }
+
+    #[test]
+    fn expanding_a_window_lists_its_panes_with_their_ids() {
+        // `break-pane` and `join-pane` take a pane, not a window. Addressing
+        // them by window made tmux use its active pane, so the thing that
+        // moved was not the thing on screen.
+        let panes = vec![
+            live_pane("projects", 1, "alpha", "", ""),
+            live_pane("projects", 1, "alpha", "", ""),
+        ];
+        let diff = Diff {
+            windows: vec![window_diff("projects", 1, "alpha", Change::Same)],
+        };
+        let mut expanded = std::collections::HashSet::new();
+        expanded.insert("projects:1".to_string());
+
+        let rows = build_rows(&panes, &diff, &HashMap::new(), &empty_tree(), &expanded);
+        let pane_rows: Vec<&PaneRow> = rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Pane(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(pane_rows.len(), 2);
+        assert!(
+            pane_rows[0].target().starts_with('%'),
+            "addressed by pane id"
+        );
+        assert_eq!(pane_rows[0].window_target(), "projects:1");
+    }
+
+    #[test]
+    fn a_collapsed_window_lists_no_panes() {
+        let panes = vec![live_pane("projects", 1, "alpha", "", "")];
+        let diff = Diff {
+            windows: vec![window_diff("projects", 1, "alpha", Change::Same)],
+        };
+        let rows = build_rows(
+            &panes,
+            &diff,
+            &HashMap::new(),
+            &empty_tree(),
+            &Default::default(),
+        );
+        assert!(!rows.iter().any(|r| matches!(r, Row::Pane(_))));
+    }
+
+    #[test]
+    fn collapsing_from_a_pane_row_acts_on_its_window() {
+        // Otherwise `h` with the cursor on a pane does nothing, which reads as
+        // a broken key.
+        let mut m = model_with(vec![
+            Row::Window(WindowRow {
+                session: "projects".into(),
+                index: 1,
+                name: "alpha".into(),
+                panes: 2,
+                state: String::new(),
+                cc_session: String::new(),
+                waiting: false,
+                change: Change::Same,
+                reasons: Vec::new(),
+                gone: false,
+            }),
+            Row::Pane(PaneRow {
+                session: "projects".into(),
+                window_index: 1,
+                index: 1,
+                pane_id: "%1".into(),
+                command: "ghx".into(),
+                path: "/tmp".into(),
+                active: true,
+            }),
+        ]);
+        m.expanded.insert("projects:1".into());
+        m.cursor = 1; // on the pane
+
+        assert!(m.set_expanded(Some(false)));
+        assert!(!m.expanded.contains("projects:1"));
+    }
+
+    #[test]
+    fn a_window_command_still_works_with_the_cursor_on_a_pane() {
+        // Marking, restoring and killing act on windows; the cursor sitting on
+        // one of its panes should not disable them.
+        let mut m = model_with(vec![
+            Row::Window(WindowRow {
+                session: "projects".into(),
+                index: 1,
+                name: "alpha".into(),
+                panes: 1,
+                state: String::new(),
+                cc_session: String::new(),
+                waiting: false,
+                change: Change::Same,
+                reasons: Vec::new(),
+                gone: false,
+            }),
+            Row::Pane(PaneRow {
+                session: "projects".into(),
+                window_index: 1,
+                index: 1,
+                pane_id: "%1".into(),
+                command: "ghx".into(),
+                path: "/tmp".into(),
+                active: true,
+            }),
+        ]);
+        m.cursor = 1;
+        assert_eq!(
+            m.current_window().map(|w| w.name.clone()),
+            Some("alpha".into()),
+        );
+        assert_eq!(
+            m.current_pane().map(|p| p.pane_id.clone()),
+            Some("%1".into())
+        );
+    }
+
+    #[test]
+    fn searching_matches_a_pane_on_what_it_is_running() {
+        // Window names repeat; `ccproxy claude --resume …` does not.
+        let mut m = model_with(vec![
+            Row::Pane(PaneRow {
+                session: "projects".into(),
+                window_index: 1,
+                index: 1,
+                pane_id: "%1".into(),
+                command: "ccproxy claude".into(),
+                path: "/tmp".into(),
+                active: true,
+            }),
+            Row::Pane(PaneRow {
+                session: "projects".into(),
+                window_index: 1,
+                index: 2,
+                pane_id: "%2".into(),
+                command: "ghx".into(),
+                path: "/tmp".into(),
+                active: false,
+            }),
+        ]);
+        for c in "ccp".chars() {
+            m.search_push(c);
+        }
+        assert_eq!(
+            m.current_pane().map(|p| p.pane_id.clone()),
+            Some("%1".into())
+        );
     }
 
     #[test]
