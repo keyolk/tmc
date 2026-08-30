@@ -14,7 +14,7 @@ auto:20260830T124554Z  (6m ago)   ~15 +0 -0
    ?   1 learn          2p ~ 014efe13                 │  pane 2 command: ccx -> ccx --watch
       —  firewall       2p -                          │  only in the restore point
 
-j/k move  ⏎ switch  space mark  a all  r restore marked  s save  p/P point  n waiting  q quit
+/ search  j/k move  ⏎ switch   space mark  a all  r restore marked   s save  p/P point  n waiting   q quit
 ```
 
 Replaces `tmux.sh`, `twm` and the `tmux-fzf` plugin.
