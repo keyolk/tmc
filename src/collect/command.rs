@@ -35,7 +35,11 @@ pub fn for_pane(
 }
 
 /// Tidy a raw `ps` command line into something worth typing back.
-fn normalize(raw: &str) -> String {
+///
+/// Public because comparison needs it too: a file written by `tmux.sh` holds
+/// the un-normalized form, and diffing that against a tmc-normalized live
+/// command reports a change for every claude pane when nothing has moved.
+pub fn normalize(raw: &str) -> String {
     let cmd = collapse_leading_path(raw);
     strip_stale_resume(&cmd)
 }

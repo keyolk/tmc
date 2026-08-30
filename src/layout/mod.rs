@@ -7,6 +7,7 @@
 //! tmux.sh-written one for the fields both produce.
 
 pub mod autosave;
+pub mod diff;
 pub mod point;
 pub mod restore;
 pub mod save;

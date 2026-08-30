@@ -28,7 +28,21 @@ enum Command {
         dry_run: bool,
     },
     /// The hourly snapshot: write one per session, then prune.
-    Autosave,
+    Autosave {
+        /// Skip the write when nothing has changed since the last snapshot.
+        /// Lets tmux hooks fire this on every window change without filling
+        /// the disk with identical points.
+        #[arg(long)]
+        if_drifted: bool,
+    },
+    /// Show what has changed since a restore point.
+    Diff {
+        /// Restore point to compare against. Defaults to the newest.
+        name: Option<String>,
+        /// List unchanged windows too.
+        #[arg(long)]
+        all: bool,
+    },
     /// Show the restore points on disk, newest first.
     List,
     /// Bring a restore point back.
@@ -48,8 +62,9 @@ enum Command {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Save { name, dry_run } => save(name, dry_run),
-        Command::Autosave => autosave(),
+        Command::Autosave { if_drifted } => autosave(if_drifted),
         Command::List => list(),
+        Command::Diff { name, all } => diff(name, all),
         Command::Load {
             name,
             sessions,
@@ -90,16 +105,24 @@ fn save(name: Option<String>, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-fn autosave() -> Result<()> {
+fn autosave(if_drifted: bool) -> Result<()> {
     let now = clock::now();
     let root = layout::save::layout_dir().join("autosave");
 
-    let Some(sessions) = snapshot_now()? else {
+    let panes = collect::tmux::panes().context("list tmux panes")?;
+    if panes.is_empty() {
         // No server — e.g. after a reboot, before tmux runs. Not an error: the
         // job fires on a timer regardless.
         println!("{} autosave: no tmux server", now.timestamp);
         return Ok(());
-    };
+    }
+    let tree = collect::proc::Tree::capture_with_args().context("read process table")?;
+    let sessions = layout::save::snapshot(&panes, &tree, &now.timestamp);
+
+    if if_drifted && !drifted_since_last(&root, &panes, &tree)? {
+        println!("{} autosave: no drift; skipped", now.timestamp);
+        return Ok(());
+    }
 
     let written = layout::autosave::write(&root, &sessions, &now.compact)?;
     let pruned_snapshots = layout::autosave::prune_old(&root, layout::autosave::KEEP);
@@ -264,4 +287,67 @@ fn describe(s: &layout::Session) -> String {
         panes,
         label_for(std::slice::from_ref(s)),
     )
+}
+
+/// Whether the live workspace differs from the newest autosave.
+///
+/// Uses the same comparison the `diff` command shows, deliberately. An earlier
+/// version compared the serialized windows and treated any difference as
+/// drift, which fired on every run: snapshots written by tmux.sh carry none of
+/// tmc's fields (`pane_id`, `shell_only`, `session_confidence`), so a workspace
+/// nobody had touched still looked changed. Drift has to mean what the user
+/// would recognize as a change, not what the file format happens to record.
+fn drifted_since_last(
+    root: &std::path::Path,
+    live: &[collect::tmux::Pane],
+    tree: &collect::proc::Tree,
+) -> Result<bool> {
+    let points = point::list(root.parent().unwrap_or(root));
+    let Some(previous) = points.iter().find(|p| p.is_auto) else {
+        return Ok(true); // nothing to compare against yet
+    };
+    let saved = point::read(&previous.reference)?;
+    Ok(layout::diff::compare(live, &saved, tree).has_drift())
+}
+
+fn diff(name: Option<String>, all: bool) -> Result<()> {
+    let points = point::list(&layout::save::layout_dir());
+    let chosen = match &name {
+        Some(wanted) => points
+            .iter()
+            .find(|p| &p.name == wanted || p.name.ends_with(wanted.as_str()))
+            .with_context(|| format!("no restore point matching '{wanted}'"))?,
+        None => points.first().context("no restore points on disk")?,
+    };
+    let saved = point::read(&chosen.reference)?;
+
+    let panes = collect::tmux::panes().context("list tmux panes")?;
+    let tree = collect::proc::Tree::capture_with_args().context("read process table")?;
+    let diff = layout::diff::compare(&panes, &saved, &tree);
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (modified, added, removed) = diff.counts();
+    println!(
+        "{}  ({})\n{modified} changed, {added} added, {removed} removed\n",
+        chosen.name,
+        clock::age_of(&chosen.sort_key, now_secs),
+    );
+
+    for w in &diff.windows {
+        if w.change == layout::diff::Change::Same && !all {
+            continue;
+        }
+        println!("{} {:<24} {}", w.change.marker(), w.target(), w.name);
+        for reason in &w.reasons {
+            println!("      {reason}");
+        }
+    }
+
+    if !diff.has_drift() {
+        println!("no changes");
+    }
+    Ok(())
 }
