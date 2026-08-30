@@ -5,5 +5,6 @@
 
 pub mod cmd;
 pub mod command;
+pub mod notify;
 pub mod proc;
 pub mod tmux;

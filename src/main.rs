@@ -1,6 +1,7 @@
 mod clock;
 mod collect;
 mod layout;
+mod ui;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -13,8 +14,10 @@ use layout::point;
     about = "tmux workspace control: snapshot, diff, restore"
 )]
 struct Cli {
+    /// No subcommand opens the TUI — the common case, and what the `w` key
+    /// binding runs.
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -34,6 +37,13 @@ enum Command {
         /// the disk with identical points.
         #[arg(long)]
         if_drifted: bool,
+    },
+    /// Render one TUI frame as text, for reviewing the layout.
+    Snapshot {
+        #[arg(long, default_value = "100")]
+        width: u16,
+        #[arg(long, default_value = "24")]
+        height: u16,
     },
     /// Show what has changed since a restore point.
     Diff {
@@ -60,11 +70,15 @@ enum Command {
 }
 
 fn main() -> Result<()> {
-    match Cli::parse().command {
+    let Some(command) = Cli::parse().command else {
+        return tui();
+    };
+    match command {
         Command::Save { name, dry_run } => save(name, dry_run),
         Command::Autosave { if_drifted } => autosave(if_drifted),
         Command::List => list(),
         Command::Diff { name, all } => diff(name, all),
+        Command::Snapshot { width, height } => snapshot(width, height),
         Command::Load {
             name,
             sessions,
@@ -289,6 +303,33 @@ fn describe(s: &layout::Session) -> String {
     )
 }
 
+/// Open the TUI, then act on what it chose.
+///
+/// The switch happens here rather than inside the loop: tmux's `select-window`
+/// while the alternate screen is still up leaves the terminal in a state the
+/// restored screen then paints over.
+fn tui() -> Result<()> {
+    match ui::app::run()? {
+        ui::app::Outcome::Quit => Ok(()),
+        ui::app::Outcome::Switch(target) => {
+            let (session, _) = target.split_once(':').unwrap_or((&target, ""));
+            collect::cmd::run(
+                "tmux",
+                &["select-window", "-t", &target],
+                collect::cmd::FAST,
+            )?;
+            // Only needed when the target lives in another session; harmless
+            // otherwise, and cheaper than asking which session is attached.
+            let _ = collect::cmd::run(
+                "tmux",
+                &["switch-client", "-t", session],
+                collect::cmd::FAST,
+            );
+            Ok(())
+        }
+    }
+}
+
 /// Whether the live workspace differs from the newest autosave.
 ///
 /// Uses the same comparison the `diff` command shows, deliberately. An earlier
@@ -349,5 +390,28 @@ fn diff(name: Option<String>, all: bool) -> Result<()> {
     if !diff.has_drift() {
         println!("no changes");
     }
+    Ok(())
+}
+
+/// Render one frame at a fixed size. How the layout is reviewed without an
+/// interactive terminal.
+fn snapshot(width: u16, height: u16) -> Result<()> {
+    let points = point::list(&layout::save::layout_dir());
+    let mut model = ui::model::Model::new(points);
+
+    let panes = collect::tmux::panes().unwrap_or_default();
+    let tree = collect::proc::Tree::capture_with_args()?;
+    let pending = collect::notify::load();
+    let saved = match model.current_point() {
+        Some(p) => point::read(&p.reference).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    model.refresh(&panes, &saved, &tree, &pending);
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    println!("{}", ui::snapshot::render(&model, width, height, now));
     Ok(())
 }

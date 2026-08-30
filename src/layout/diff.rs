@@ -89,31 +89,78 @@ pub fn compare(live: &[tmux::Pane], saved: &[Session], tree: &proc::Tree) -> Dif
     let live_sessions = group_live(live, tree);
     let mut windows = Vec::new();
 
-    // Sessions present in either side. A session missing from one is not an
-    // error: the point may predate it, or hold one since closed.
-    let mut names: Vec<&str> = live_sessions.iter().map(|(n, _)| *n).collect();
-    for s in saved {
-        if !names.contains(&s.session.as_str()) {
-            names.push(&s.session);
+    // Pair the two sides up before comparing. A session that was renamed
+    // still holds the same work, and treating it as one gone plus one new
+    // reports the whole workspace as rebuilt — which is what happened here
+    // when `dashboard` became `tooling`: 15 added, 16 removed, and nothing
+    // useful on screen.
+    let mut pairs: Vec<(&str, &[Window], &[Window])> = Vec::new();
+    let mut claimed: Vec<usize> = Vec::new();
+
+    for (name, live_windows) in &live_sessions {
+        match match_session(name, live_windows, saved, &claimed) {
+            Some(i) => {
+                claimed.push(i);
+                pairs.push((name, live_windows, &saved[i].windows));
+            }
+            None => pairs.push((name, live_windows, &[])),
         }
     }
-    names.sort_unstable();
+    for (i, s) in saved.iter().enumerate() {
+        if !claimed.contains(&i) {
+            pairs.push((&s.session, &[], &s.windows));
+        }
+    }
+    pairs.sort_by_key(|(name, _, _)| *name);
 
-    for name in names {
-        let live_windows = live_sessions
-            .iter()
-            .find(|(n, _)| *n == name)
-            .map(|(_, w)| w.as_slice())
-            .unwrap_or(&[]);
-        let saved_windows = saved
-            .iter()
-            .find(|s| s.session == name)
-            .map(|s| s.windows.as_slice())
-            .unwrap_or(&[]);
+    for (name, live_windows, saved_windows) in pairs {
         windows.extend(compare_session(name, live_windows, saved_windows));
     }
 
     Diff { windows }
+}
+
+/// Find the saved session this live one corresponds to.
+///
+/// By name when there is one, else by content: a session that was renamed
+/// keeps its windows, so an unclaimed saved session sharing most of their
+/// names is the same workspace under a new label. Without this a rename reads
+/// as the entire workspace being replaced.
+fn match_session(
+    name: &str,
+    live: &[Window],
+    saved: &[Session],
+    claimed: &[usize],
+) -> Option<usize> {
+    if let Some(i) = saved.iter().position(|s| s.session == name) {
+        return Some(i);
+    }
+    if live.is_empty() {
+        return None;
+    }
+
+    let live_names: Vec<&str> = live.iter().map(|w| w.name.as_str()).collect();
+    let (mut best, mut best_score) = (None, 0.0);
+
+    for (i, s) in saved.iter().enumerate() {
+        if claimed.contains(&i) || s.windows.is_empty() {
+            continue;
+        }
+        let shared = s
+            .windows
+            .iter()
+            .filter(|w| live_names.contains(&w.name.as_str()))
+            .count();
+        let score = shared as f64 / live_names.len().max(s.windows.len()) as f64;
+        if score > best_score {
+            best_score = score;
+            best = Some(i);
+        }
+    }
+
+    // More than half the windows in common. Below that these are two different
+    // workspaces that happen to share a few window names.
+    (best_score > 0.5).then_some(best).flatten()
 }
 
 fn compare_session(session: &str, live: &[Window], saved: &[Window]) -> Vec<WindowDiff> {
@@ -345,6 +392,20 @@ mod tests {
         proc::Tree::parse_for_test("1 0 launchd\n100 1 fish\n")
     }
 
+    /// As `live_pane`, in a named session.
+    fn live_pane_in(
+        session: &str,
+        win: u32,
+        win_name: &str,
+        idx: u32,
+        path: &str,
+        id: &str,
+    ) -> tmux::Pane {
+        let mut p = live_pane(win, win_name, idx, path, id);
+        p.session = session.into();
+        p
+    }
+
     fn live_pane(win: u32, win_name: &str, idx: u32, path: &str, id: &str) -> tmux::Pane {
         tmux::Pane {
             session: "projects".into(),
@@ -556,6 +617,60 @@ mod tests {
 
         let diff = compare(&live, &saved, &tree);
         assert!(!diff.has_drift(), "reasons: {:?}", diff.windows[0].reasons);
+    }
+
+    #[test]
+    fn a_renamed_session_is_matched_by_its_windows() {
+        // Observed live: `dashboard` was renamed to `tooling`. Pairing by name
+        // alone reported 15 added and 16 removed — the whole workspace as
+        // rebuilt — which is exactly the noise that makes a diff unusable.
+        let live = vec![
+            live_pane_in("tooling", 1, "alpha", 1, "/tmp", "%1"),
+            live_pane_in("tooling", 2, "beta", 1, "/tmp", "%2"),
+            live_pane_in("tooling", 3, "gamma", 1, "/tmp", "%3"),
+        ];
+        let saved = vec![Session {
+            session: "dashboard".into(),
+            saved_at: "2026-08-30T00:00:00Z".into(),
+            label: None,
+            windows: vec![
+                saved_window(1, "alpha", vec![saved_pane(1, "", "/tmp", Some("%1"))]),
+                saved_window(2, "beta", vec![saved_pane(1, "", "/tmp", Some("%2"))]),
+                saved_window(3, "gamma", vec![saved_pane(1, "", "/tmp", Some("%3"))]),
+            ],
+        }];
+
+        let diff = compare(&live, &saved, &tree());
+        assert_eq!(
+            diff.counts(),
+            (0, 0, 0),
+            "a rename alone is not a change: {:?}",
+            diff.windows,
+        );
+    }
+
+    #[test]
+    fn two_unrelated_sessions_are_not_paired_by_a_shared_window_name() {
+        // Below half the windows in common these are different workspaces that
+        // happen to share a name, and pairing them would invent changes.
+        let live = vec![
+            live_pane_in("new", 1, "shared", 1, "/tmp", "%1"),
+            live_pane_in("new", 2, "unique-a", 1, "/tmp", "%2"),
+            live_pane_in("new", 3, "unique-b", 1, "/tmp", "%3"),
+        ];
+        let saved = vec![Session {
+            session: "old".into(),
+            saved_at: "2026-08-30T00:00:00Z".into(),
+            label: None,
+            windows: vec![
+                saved_window(1, "shared", vec![saved_pane(1, "", "/tmp", None)]),
+                saved_window(2, "other-x", vec![saved_pane(1, "", "/tmp", None)]),
+                saved_window(3, "other-y", vec![saved_pane(1, "", "/tmp", None)]),
+            ],
+        }];
+
+        let diff = compare(&live, &saved, &tree());
+        assert_eq!(diff.counts(), (0, 3, 3), "kept apart: {:?}", diff.windows);
     }
 
     #[test]
