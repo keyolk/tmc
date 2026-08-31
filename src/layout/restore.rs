@@ -40,6 +40,8 @@ pub trait Tmux {
     fn send_literal(&mut self, target: &str, text: &str);
     /// Block until the pane's foreground process is a shell.
     fn wait_for_shell(&self, target: &str);
+    /// Close a session and everything in it.
+    fn kill_session(&mut self, name: &str) -> Result<()>;
 }
 
 /// The real thing.
@@ -136,6 +138,15 @@ impl Tmux for Server {
     /// A flat sleep is too short when a heavy rc file is still rendering: the
     /// text then lands before the prompt exists and the pane looks empty even
     /// though the command was sent.
+    fn kill_session(&mut self, name: &str) -> Result<()> {
+        cmd::run(
+            "tmux",
+            &["kill-session", "-t", &format!("={name}")],
+            cmd::FAST,
+        )?;
+        Ok(())
+    }
+
     fn wait_for_shell(&self, target: &str) {
         const SHELLS: [&str; 6] = ["fish", "bash", "zsh", "sh", "dash", "ksh"];
         for _ in 0..40 {
@@ -189,14 +200,16 @@ impl Selection<'_> {
 
 /// Recreate a saved session.
 ///
-/// Refuses a session that is already running: appending its windows to a live
-/// one silently doubles the workspace, and for a recovery tool skipping is the
-/// safe default. The caller closes the session first.
+/// A session that is already running is skipped: appending its windows to a
+/// live one silently doubles the workspace, and for a recovery tool that is
+/// the safe default. `force` closes it first instead — irreversible, so the
+/// caller shows what would be lost before offering it.
 pub fn session<T: Tmux>(
     tmux: &mut T,
     saved: &Session,
     select: Selection,
     dry_run: bool,
+    force: bool,
 ) -> Result<Report> {
     let mut report = Report::default();
 
@@ -206,13 +219,24 @@ pub fn session<T: Tmux>(
     // is still open, deciding whether to close it.
     let clash = tmux.session_exists(&saved.session);
     if clash {
-        report.notes.push(format!(
-            "session '{}' is already running — close it first{}",
-            saved.session,
-            if dry_run { "" } else { "; skipped" },
-        ));
-        if !dry_run {
-            return Ok(report);
+        if force {
+            report
+                .notes
+                .push(format!("closed the running '{}'", saved.session));
+            if !dry_run {
+                // Everything in it goes. The caller is expected to have shown
+                // the user what that costs — see `main::load`.
+                tmux.kill_session(&saved.session)?;
+            }
+        } else {
+            report.notes.push(format!(
+                "session '{}' is already running — close it, or pass --force{}",
+                saved.session,
+                if dry_run { "" } else { "; skipped" },
+            ));
+            if !dry_run {
+                return Ok(report);
+            }
         }
     }
 
@@ -294,17 +318,12 @@ fn resume_command(pane: &crate::layout::Pane) -> String {
     if !mentions_claude(&pane.command) {
         return pane.command.clone();
     }
-    // Insert right after the `claude` word so wrapper flags before it and
-    // claude's own flags after it both keep their positions.
-    let mut out = Vec::new();
-    for token in pane.command.split(' ') {
-        out.push(token.to_string());
-        if token == "claude" {
-            out.push("--resume".into());
-            out.push(id.to_string());
-        }
-    }
-    out.join(" ")
+    // Appended, not spliced after the `claude` word. Inserting mid-command
+    // has to reason about `--`: in `ccproxy claude --intercept=mitm --
+    // --dangerously-skip-permissions`, everything after `--` belongs to
+    // claude, and placing a flag before it hands it to the wrapper instead.
+    // The end of the line is unambiguous in both forms.
+    format!("{} --resume {id}", pane.command)
 }
 
 fn mentions_claude(command: &str) -> bool {
@@ -375,12 +394,27 @@ mod tests {
     }
 
     #[test]
-    fn splices_the_session_id_after_the_claude_word() {
+    fn appends_the_session_id() {
         let p = pane("ccproxy claude --model default", Some("abc-123"));
         assert_eq!(
             resume_command(&p),
-            "ccproxy claude --resume abc-123 --model default",
-            "wrapper flags stay before, claude's flags stay after",
+            "ccproxy claude --model default --resume abc-123"
+        );
+    }
+
+    #[test]
+    fn appending_keeps_a_double_dash_meaning_what_it_meant() {
+        // `ccproxy claude --intercept=mitm -- <claude flags>`: everything after
+        // `--` is claude's. Splicing `--resume` in after the `claude` word put
+        // it before the separator, where ccproxy would take it instead — the
+        // end of the line is on claude's side in both forms.
+        let p = pane(
+            "ccproxy claude --intercept=mitm -- --dangerously-skip-permissions",
+            Some("abc-123"),
+        );
+        assert_eq!(
+            resume_command(&p),
+            "ccproxy claude --intercept=mitm -- --dangerously-skip-permissions --resume abc-123",
         );
     }
 
@@ -469,6 +503,11 @@ mod tests {
             self.calls.push(format!("send {target} [{text}]"));
         }
         fn wait_for_shell(&self, _target: &str) {}
+        fn kill_session(&mut self, name: &str) -> Result<()> {
+            self.calls.push(format!("kill-session {name}"));
+            self.live_sessions.retain(|s| s != name);
+            Ok(())
+        }
     }
 
     fn saved_session(windows: Vec<Window>) -> Session {
@@ -498,7 +537,7 @@ mod tests {
             window(2, "beta", vec![pane("", None)]),
         ]);
 
-        let report = session(&mut tmux, &saved, Selection::all(), false).unwrap();
+        let report = session(&mut tmux, &saved, Selection::all(), false, false).unwrap();
 
         assert_eq!(report.windows, 2);
         assert!(tmux.calls[0].starts_with("new-session projects alpha"));
@@ -517,7 +556,7 @@ mod tests {
         tmux.base_index = 1;
         let saved = saved_session(vec![window(1, "alpha", vec![pane("ghx", None)])]);
 
-        session(&mut tmux, &saved, Selection::all(), false).unwrap();
+        session(&mut tmux, &saved, Selection::all(), false, false).unwrap();
 
         assert!(
             tmux.calls.iter().any(|c| c == "send projects:0.1 [ghx]"),
@@ -532,7 +571,7 @@ mod tests {
         let panes: Vec<Pane> = (0..4).map(|_| pane("", None)).collect();
         let saved = saved_session(vec![window(1, "alpha", panes)]);
 
-        session(&mut tmux, &saved, Selection::all(), false).unwrap();
+        session(&mut tmux, &saved, Selection::all(), false, false).unwrap();
 
         let tiled = tmux.calls.iter().filter(|c| c.ends_with("tiled")).count();
         assert!(tiled >= 3, "one re-tile per split; calls: {:?}", tmux.calls);
@@ -548,7 +587,7 @@ mod tests {
         let panes: Vec<Pane> = (0..4).map(|_| pane("", None)).collect();
         let saved = saved_session(vec![window(1, "alpha", panes)]);
 
-        let report = session(&mut tmux, &saved, Selection::all(), false).unwrap();
+        let report = session(&mut tmux, &saved, Selection::all(), false, false).unwrap();
 
         assert_eq!(report.panes, 2);
         assert_eq!(report.missing_panes, 2);
@@ -565,7 +604,7 @@ mod tests {
         tmux.live_sessions.push("projects".into());
         let saved = saved_session(vec![window(1, "alpha", vec![pane("", None)])]);
 
-        let report = session(&mut tmux, &saved, Selection::all(), false).unwrap();
+        let report = session(&mut tmux, &saved, Selection::all(), false, false).unwrap();
 
         assert_eq!(
             report.windows, 0,
@@ -573,6 +612,73 @@ mod tests {
         );
         assert!(tmux.calls.is_empty());
         assert!(report.notes[0].contains("already running"));
+    }
+
+    #[test]
+    fn force_closes_the_running_session_before_rebuilding() {
+        let mut tmux = Fake::new();
+        tmux.live_sessions.push("projects".into());
+        let saved = saved_session(vec![window(1, "alpha", vec![pane("ghx", None)])]);
+
+        let report = session(&mut tmux, &saved, Selection::all(), false, true).unwrap();
+
+        assert_eq!(report.windows, 1, "the rebuild happened");
+        assert_eq!(
+            tmux.calls.first().map(String::as_str),
+            Some("kill-session projects"),
+            "and the close came first; calls: {:?}",
+            tmux.calls,
+        );
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|n| n.contains("closed the running"))
+        );
+    }
+
+    #[test]
+    fn without_force_a_live_session_is_left_alone() {
+        let mut tmux = Fake::new();
+        tmux.live_sessions.push("projects".into());
+        let saved = saved_session(vec![window(1, "alpha", vec![pane("ghx", None)])]);
+
+        let report = session(&mut tmux, &saved, Selection::all(), false, false).unwrap();
+
+        assert_eq!(report.windows, 0);
+        assert!(tmux.calls.is_empty(), "nothing was touched");
+        assert!(
+            report.notes[0].contains("--force"),
+            "and the way forward is named: {}",
+            report.notes[0],
+        );
+    }
+
+    #[test]
+    fn a_forced_dry_run_still_kills_nothing() {
+        let mut tmux = Fake::new();
+        tmux.live_sessions.push("projects".into());
+        let saved = saved_session(vec![window(1, "alpha", vec![pane("ghx", None)])]);
+
+        let report = session(&mut tmux, &saved, Selection::all(), true, true).unwrap();
+
+        assert_eq!(report.windows, 1, "still previews the rebuild");
+        assert!(tmux.calls.is_empty(), "a dry run mutates nothing");
+    }
+
+    #[test]
+    fn force_on_a_session_that_is_not_running_is_a_plain_restore() {
+        let mut tmux = Fake::new();
+        let saved = saved_session(vec![window(1, "alpha", vec![pane("ghx", None)])]);
+
+        let report = session(&mut tmux, &saved, Selection::all(), false, true).unwrap();
+
+        assert_eq!(report.windows, 1);
+        assert!(
+            !tmux.calls.iter().any(|c| c.starts_with("kill-session")),
+            "nothing to close: {:?}",
+            tmux.calls,
+        );
     }
 
     #[test]
@@ -584,7 +690,7 @@ mod tests {
         tmux.live_sessions.push("projects".into());
         let saved = saved_session(vec![window(1, "alpha", vec![pane("ghx", None)])]);
 
-        let report = session(&mut tmux, &saved, Selection::all(), true).unwrap();
+        let report = session(&mut tmux, &saved, Selection::all(), true, false).unwrap();
 
         assert_eq!(report.windows, 1);
         assert_eq!(report.commands_prefilled, 1);
@@ -607,6 +713,7 @@ mod tests {
                 windows: Some(&[2]),
             },
             false,
+            false,
         )
         .unwrap();
 
@@ -624,7 +731,7 @@ mod tests {
             vec![pane("", None), pane("ghx", None)],
         )]);
 
-        let report = session(&mut tmux, &saved, Selection::all(), false).unwrap();
+        let report = session(&mut tmux, &saved, Selection::all(), false, false).unwrap();
 
         assert_eq!(report.commands_prefilled, 1, "only the non-empty command");
         assert_eq!(

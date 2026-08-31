@@ -50,6 +50,11 @@ running, and `r` restores only what you marked.
 
 `--dry-run` on `save` and `load` shows what would happen and touches nothing.
 
+`load` skips a session that is already running, since appending its windows to
+a live one would silently double the workspace. `--force` closes it and
+rebuilds instead — it prints what would be lost first and asks, so the answer
+is informed; `--yes` skips the asking for scripts.
+
 ## Keys
 
 It opens on the search line. Summoning a popup is already the decision to go

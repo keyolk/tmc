@@ -164,6 +164,17 @@ mod tests {
     }
 
     #[test]
+    fn probe_real_forms() {
+        for raw in [
+            "ccproxy claude --intercept=mitm -- --dangerously-skip-permissions --model default",
+            "ccproxy claude --intercept=mitm --resume 12f17a65 --dangerously-skip-permissions --model default",
+        ] {
+            eprintln!("in : {raw}");
+            eprintln!("out: {}\n", normalize(raw));
+        }
+    }
+
+    #[test]
     fn drops_a_stale_resume_id() {
         // Observed verbatim on the reference machine.
         assert_eq!(

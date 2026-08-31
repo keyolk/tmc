@@ -101,6 +101,16 @@ enum Command {
         /// Print what would be created without touching tmux.
         #[arg(long)]
         dry_run: bool,
+        /// Close a session that is already running and rebuild it.
+        ///
+        /// Irreversible: every window and pane in the live session goes. What
+        /// would be lost is printed first, and the run stops for confirmation
+        /// unless --yes is also given.
+        #[arg(long)]
+        force: bool,
+        /// Skip the confirmation prompt that --force asks for.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -127,7 +137,9 @@ fn main() -> Result<()> {
             name,
             sessions,
             dry_run,
-        } => load(name, &sessions, dry_run),
+            force,
+            yes,
+        } => load(name, &sessions, dry_run, force, yes),
     }
 }
 
@@ -269,7 +281,13 @@ fn label_for(sessions: &[layout::Session]) -> String {
     }
 }
 
-fn load(name: Option<String>, only: &[String], dry_run: bool) -> Result<()> {
+fn load(
+    name: Option<String>,
+    only: &[String],
+    dry_run: bool,
+    force: bool,
+    yes: bool,
+) -> Result<()> {
     let points = point::list(&layout::save::layout_dir());
     let chosen = match &name {
         Some(wanted) => points
@@ -297,11 +315,56 @@ fn load(name: Option<String>, only: &[String], dry_run: bool) -> Result<()> {
     }
     println!();
 
+    // With --force the live sessions are about to be destroyed. Show what that
+    // costs first — the same comparison `tmc diff` prints — because "restore
+    // the 08:58 point" and "throw away everything since 08:58" are one action
+    // described from two ends.
+    if force && !dry_run {
+        let live = collect::tmux::panes().unwrap_or_default();
+        let clashing: Vec<&&layout::Session> = wanted
+            .iter()
+            .filter(|s| live.iter().any(|p| p.session == s.session))
+            .collect();
+
+        if !clashing.is_empty() {
+            let tree = collect::proc::Tree::capture_with_args()?;
+            let owned: Vec<layout::Session> = clashing.iter().map(|s| (**s).clone()).collect();
+            let d = layout::diff::compare(&live, &owned, &tree);
+            let (modified, added, removed) = d.counts();
+
+            println!(
+                "--force closes the running session(s) and rebuilds them.\n\
+                 {added} window(s) created since the point would be lost, \
+                 {modified} changed, {removed} brought back.\n"
+            );
+            for w in &d.windows {
+                if w.change == layout::diff::Change::Same {
+                    continue;
+                }
+                println!("  {} {:<22} {}", w.change.marker(), w.target(), w.name);
+                for reason in &w.reasons {
+                    println!("        {reason}");
+                }
+            }
+            println!();
+
+            if !yes && !confirm("close them and restore?")? {
+                println!("cancelled; nothing changed");
+                return Ok(());
+            }
+        }
+    }
+
     let mut total = layout::restore::Report::default();
     let mut server = layout::restore::Server;
     for s in &wanted {
-        let report =
-            layout::restore::session(&mut server, s, layout::restore::Selection::all(), dry_run)?;
+        let report = layout::restore::session(
+            &mut server,
+            s,
+            layout::restore::Selection::all(),
+            dry_run,
+            force,
+        )?;
         for note in &report.notes {
             println!("  {}: {note}", s.session);
         }
@@ -566,4 +629,18 @@ fn doctor(name: Option<String>) -> Result<()> {
         println!("\n{unhealthy} point(s) with findings; name one to see them");
     }
     Ok(())
+}
+
+/// Ask on the terminal. Returns false on anything but an explicit yes, and on
+/// a non-interactive stdin — a script piping into this must pass --yes rather
+/// than have the answer guessed.
+fn confirm(question: &str) -> Result<bool> {
+    use std::io::Write;
+    print!("{question} [y/N] ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line)? == 0 {
+        return Ok(false);
+    }
+    Ok(matches!(line.trim(), "y" | "Y" | "yes"))
 }

@@ -311,6 +311,11 @@ fn restore_marked(model: &mut Model) -> Result<()> {
                 windows: Some(&indices),
             },
             false,
+            // Never forced from the TUI: `r` here restores windows the point
+            // has and the server does not, so there is nothing live to
+            // displace. Closing a running session is a CLI decision, with the
+            // diff and confirmation that come with it.
+            false,
         )?;
         windows += report.windows;
         notes.extend(report.notes);
