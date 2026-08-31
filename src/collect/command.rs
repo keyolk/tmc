@@ -53,7 +53,25 @@ pub fn for_pane(
 /// command reports a change for every claude pane when nothing has moved.
 pub fn normalize(raw: &str) -> String {
     let cmd = collapse_leading_path(raw);
-    strip_stale_resume(&cmd)
+    let cmd = strip_stale_resume(&cmd);
+    strip_bare_separator(&cmd)
+}
+
+/// Drop a lone `--`.
+///
+/// `ccproxy claude --intercept=mitm -- --dangerously-skip-permissions` and the
+/// same line without the separator both run, and both hand the trailing flags
+/// to claude — ccproxy only consumes the ones it knows. The separator survives
+/// in `ps` output for a session started that way but not one resumed, so
+/// keeping it made two spellings of one command: a diff reported a change for
+/// every claude pane, and a `--resume` appended afterwards landed on the far
+/// side of a separator that did not need to be there.
+///
+/// Only a bare `--` goes. `--flag` and `--` inside a quoted argument are not
+/// separators and are left alone.
+fn strip_bare_separator(cmd: &str) -> String {
+    let kept: Vec<&str> = cmd.split(' ').filter(|t| *t != "--").collect();
+    kept.join(" ")
 }
 
 /// `/opt/homebrew/bin/nvim ~/.tmux.conf` → `nvim ~/.tmux.conf`.
@@ -175,6 +193,33 @@ mod tests {
     }
 
     #[test]
+    fn drops_a_bare_separator() {
+        // Both spellings run and mean the same thing; recording one of them
+        // keeps a command comparable to itself across a restart.
+        assert_eq!(
+            normalize("ccproxy claude --intercept=mitm -- --dangerously-skip-permissions"),
+            "ccproxy claude --intercept=mitm --dangerously-skip-permissions",
+        );
+    }
+
+    #[test]
+    fn a_flag_that_merely_starts_with_dashes_survives() {
+        assert_eq!(normalize("cargo test --release"), "cargo test --release");
+        assert_eq!(normalize("git log --"), "git log");
+    }
+
+    #[test]
+    fn the_resumed_and_fresh_forms_normalize_to_the_same_thing() {
+        // The pair seen live: one claude started fresh, one resumed by
+        // ccproxy. Without this they compared as different commands and every
+        // claude pane showed up as changed.
+        let fresh =
+            "ccproxy claude --intercept=mitm -- --dangerously-skip-permissions --model default";
+        let resumed = "ccproxy claude --intercept=mitm --resume abc-123 --dangerously-skip-permissions --model default";
+        assert_eq!(normalize(fresh), normalize(resumed));
+    }
+
+    #[test]
     fn drops_a_stale_resume_id() {
         // Observed verbatim on the reference machine.
         assert_eq!(
@@ -182,7 +227,7 @@ mod tests {
                 "ccproxy claude --intercept=mitm -- --model default \
                  --resume cf997492-ca4f-4fc7-9236-563d78b7149d"
             ),
-            "ccproxy claude --intercept=mitm -- --model default",
+            "ccproxy claude --intercept=mitm --model default",
         );
     }
 

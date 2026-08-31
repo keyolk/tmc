@@ -403,11 +403,11 @@ mod tests {
     }
 
     #[test]
-    fn appending_keeps_a_double_dash_meaning_what_it_meant() {
-        // `ccproxy claude --intercept=mitm -- <claude flags>`: everything after
-        // `--` is claude's. Splicing `--resume` in after the `claude` word put
-        // it before the separator, where ccproxy would take it instead — the
-        // end of the line is on claude's side in both forms.
+    fn appending_survives_a_separator_in_an_older_snapshot() {
+        // `save` strips a bare `--` now, but snapshots written before that do
+        // not, and those still have to restore. Appending works either way;
+        // splicing after the `claude` word put the id before the separator,
+        // where ccproxy took it and claude started a fresh conversation.
         let p = pane(
             "ccproxy claude --intercept=mitm -- --dangerously-skip-permissions",
             Some("abc-123"),
