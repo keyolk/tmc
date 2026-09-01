@@ -11,7 +11,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use super::model::Model;
+use super::model::{Model, WindowRow};
 use crate::collect::{notify, proc, tmux};
 use crate::layout::{point, restore, save};
 
@@ -112,20 +112,38 @@ fn event_loop(terminal: &mut Term, model: &mut Model) -> Result<()> {
 fn handle_key(model: &mut Model, code: KeyCode, mods: KeyModifiers) -> Result<()> {
     model.status.clear();
 
+    // A pane has been picked and only a destination window is selectable. Deal
+    // with this before the ordinary tree keys so Enter cannot switch windows
+    // and Esc cannot quit while the user is in the middle of choosing.
+    if model.pane_move.is_some() {
+        match code {
+            KeyCode::Esc => {
+                model.pane_move = None;
+                model.status = "pane move cancelled".into();
+            }
+            KeyCode::Char('q') => model.quit = true,
+            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => model.quit = true,
+            KeyCode::Char('j') | KeyCode::Down => {
+                model.move_destination(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                model.move_destination(-1);
+            }
+            KeyCode::Enter | KeyCode::Char('J') => join_pane(model)?,
+            _ => {
+                model.status = "choose a window: j/k move, Enter join, Esc cancel".into();
+            }
+        }
+        return Ok(());
+    }
+
     // While searching, letters type. This is where the TUI starts, so the way
     // out has to be obvious and the way back cheap.
     if model.searching {
         match code {
-            // Esc backs out one step at a time — clear the query, then leave.
-            // Quitting straight from a typed query would throw away the work
-            // of typing it whenever the aim was to widen the search.
-            KeyCode::Esc => {
-                if model.search.is_empty() {
-                    model.quit = true;
-                } else {
-                    model.search_clear_query();
-                }
-            }
+            // Esc is a mode change, never an exit. Keep the query as a visible
+            // filter, just as Tab does, so backing out does not discard typing.
+            KeyCode::Esc => model.searching = false,
             KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => model.quit = true,
             // Step out to the tree, keeping the filter. The single-key
             // commands (mark, restore, save, window surgery) live there.
@@ -153,7 +171,11 @@ fn handle_key(model: &mut Model, code: KeyCode, mods: KeyModifiers) -> Result<()
 
     match code {
         KeyCode::Char('/') => model.searching = true,
-        KeyCode::Char('q') | KeyCode::Esc => model.quit = true,
+        KeyCode::Char('q') => model.quit = true,
+        // Esc leaves modes and cancels choices; in the plain tree there is
+        // nothing to leave, so it deliberately does nothing. q/Ctrl-C are the
+        // only exits.
+        KeyCode::Esc => {}
         KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => model.quit = true,
 
         KeyCode::Char('j') | KeyCode::Down => model.move_cursor(1),
@@ -404,49 +426,53 @@ fn break_pane(model: &mut Model) -> Result<()> {
     Ok(())
 }
 
-/// Pull the selected pane into the window tmc was launched from.
+/// Arguments that move one exact pane into one exact window.
 ///
-/// The counterpart to break. `$TMUX_PANE` is the destination and not the
-/// active pane, because a popup *is* a pane — asking tmux for the current one
-/// would name the popup and the join would fail.
+/// `join-pane` calls its target a dst-pane, but tmux accepts a window target and
+/// resolves that to the window's active pane. That gives the requested window
+/// without relying on whichever pane launched the popup.
+fn join_pane_args<'a>(pane: &'a str, destination: &'a str) -> [&'a str; 6] {
+    ["join-pane", "-d", "-s", pane, "-t", destination]
+}
+
+/// Pick a pane, then move it into an explicitly selected window.
+///
+/// The first `J` remembers the pane and changes the tree into destination
+/// selection mode. The second `J` (or Enter) joins it into the window under the
+/// cursor. A previous version always used `$TMUX_PANE`, which meant "the window
+/// that opened tmc" rather than the window the user actually wanted.
 fn join_pane(model: &mut Model) -> Result<()> {
-    let Some(p) = model.current_pane() else {
-        model.status = "select a pane first — enter expands a window".into();
+    if let Some(moving) = model.pane_move.clone() {
+        let Some(destination) = model.destination_window().map(WindowRow::target) else {
+            model.status = "choose a live window: j/k move, Enter join, Esc cancel".into();
+            return Ok(());
+        };
+
+        crate::collect::cmd::run(
+            "tmux",
+            &join_pane_args(&moving.pane, &destination),
+            crate::collect::cmd::FAST,
+        )?;
+        model.pane_move = None;
+        reload(model)?;
+        model.status = format!(
+            "{} moved from {} into {destination}",
+            moving.pane, moving.from
+        );
         return Ok(());
-    };
-    let Ok(here) = std::env::var("TMUX_PANE") else {
-        model.status = "not running inside tmux".into();
+    }
+
+    let Some(p) = model.current_pane() else {
+        model.status = "select a pane first — l expands a window".into();
         return Ok(());
     };
     let pane = p.target().to_string();
     let from = p.window_target();
-
-    // Refuse to join a pane into its own window: tmux would report an error,
-    // and the intent is never that.
-    let destination_window = crate::collect::cmd::run(
-        "tmux",
-        &[
-            "display-message",
-            "-p",
-            "-t",
-            &here,
-            "#{session_name}:#{window_index}",
-        ],
-        crate::collect::cmd::FAST,
-    )
-    .unwrap_or_default();
-    if destination_window.trim() == from {
-        model.status = "that pane is already in this window".into();
-        return Ok(());
+    if model.begin_pane_move(pane.clone(), from) {
+        model.status = format!("moving {pane}: choose a window, then press Enter or J");
+    } else {
+        model.status = "no other live window to move that pane into".into();
     }
-
-    crate::collect::cmd::run(
-        "tmux",
-        &["join-pane", "-s", &pane, "-t", &here],
-        crate::collect::cmd::FAST,
-    )?;
-    reload(model)?;
-    model.status = format!("{pane} joined here from {from}");
     Ok(())
 }
 
@@ -547,10 +573,7 @@ mod tests {
     }
 
     #[test]
-    fn esc_backs_out_one_step_at_a_time() {
-        // The TUI opens searching, so Esc is the way out — but quitting
-        // straight from a typed query would discard the typing whenever the
-        // aim was simply to widen the search.
+    fn esc_leaves_search_for_normal_mode_without_quitting() {
         let mut m = model_with_window();
         m.searching = true;
         for c in "alpha".chars() {
@@ -558,12 +581,12 @@ mod tests {
         }
 
         let _ = handle_key(&mut m, KeyCode::Esc, KeyModifiers::NONE);
-        assert!(m.search.is_empty(), "first Esc clears the query");
-        assert!(m.searching, "and stays on the search line");
-        assert!(!m.quit);
+        assert!(!m.searching, "Esc returns to normal mode");
+        assert_eq!(m.search, "alpha", "the query remains as a filter");
+        assert!(!m.quit, "Esc never exits the program");
 
         let _ = handle_key(&mut m, KeyCode::Esc, KeyModifiers::NONE);
-        assert!(m.quit, "a second Esc, with nothing to clear, leaves");
+        assert!(!m.quit, "Esc in normal mode is also harmless");
     }
 
     #[test]
@@ -645,6 +668,30 @@ mod tests {
             m.current_window().map(|w| w.name.clone()),
             Some("alpha".into())
         );
+    }
+
+    #[test]
+    fn pane_move_names_the_exact_source_and_destination() {
+        assert_eq!(
+            join_pane_args("%1084", "tooling:3"),
+            ["join-pane", "-d", "-s", "%1084", "-t", "tooling:3"],
+        );
+    }
+
+    #[test]
+    fn esc_cancels_a_pane_move_without_quitting() {
+        let mut m = model_with_window();
+        m.pane_move = Some(crate::ui::model::PaneMove {
+            pane: "%1084".into(),
+            from: "projects:2".into(),
+            destination: Some("tooling:3".into()),
+        });
+
+        let _ = handle_key(&mut m, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(m.pane_move.is_none(), "the pending move is gone");
+        assert!(!m.quit, "Esc cancels the mode, not the program");
+        assert_eq!(m.status, "pane move cancelled");
     }
 
     #[test]

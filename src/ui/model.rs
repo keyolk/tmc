@@ -86,6 +86,19 @@ impl WindowRow {
     }
 }
 
+/// A pane waiting for the user to choose its destination window.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PaneMove {
+    /// `%N`, stable even if another pane disappears while choosing.
+    pub pane: String,
+    /// The window it currently belongs to; selecting this is never useful.
+    pub from: String,
+    /// The exact live window chosen, kept separately from the row number so a
+    /// polling refresh cannot silently turn the same cursor position into a
+    /// different destination.
+    pub destination: Option<String>,
+}
+
 /// The TUI's whole state.
 pub struct Model {
     pub rows: Vec<Row>,
@@ -102,6 +115,8 @@ pub struct Model {
     pub switch_to: Option<String>,
     pub quit: bool,
     pub status: String,
+    /// Set after `J` on a pane, until a destination window is confirmed.
+    pub pane_move: Option<PaneMove>,
     /// Typed search. Empty means the whole tree is shown.
     pub search: String,
     /// True while the search line is accepting keys.
@@ -130,6 +145,7 @@ impl Model {
             switch_to: None,
             quit: false,
             status: String::new(),
+            pane_move: None,
             search: String::new(),
             searching: false,
             stale_build: check_build(),
@@ -200,7 +216,32 @@ impl Model {
             .iter()
             .filter(|r| matches!(r, Row::Window(w) if w.waiting))
             .count();
-        self.clamp_cursor();
+
+        // A polling refresh may insert, remove or reorder rows while a pane
+        // destination is being chosen. Follow the remembered target rather
+        // than leaving the same numeric cursor on a different window.
+        if let Some(target) = self
+            .pane_move
+            .as_ref()
+            .and_then(|moving| moving.destination.clone())
+        {
+            if let Some(row) = self
+                .rows
+                .iter()
+                .position(|r| matches!(r, Row::Window(w) if !w.gone && w.target() == target))
+            {
+                self.cursor = row;
+            } else {
+                // Never substitute another window after the user picked one.
+                // A refresh can remove or renumber it; silently keeping the row
+                // number would move the pane somewhere they did not choose.
+                self.pane_move = None;
+                self.status = format!("pane move cancelled — {target} is no longer available");
+                self.clamp_cursor();
+            }
+        } else {
+            self.clamp_cursor();
+        }
     }
 
     /// A cheap value that changes exactly when the display would.
@@ -252,13 +293,6 @@ impl Model {
 
     pub fn search_pop(&mut self) {
         self.search.pop();
-        self.cursor = 0;
-        self.skip_header(1);
-    }
-
-    /// Drop the query but stay on the search line.
-    pub fn search_clear_query(&mut self) {
-        self.search.clear();
         self.cursor = 0;
         self.skip_header(1);
     }
@@ -360,6 +394,67 @@ impl Model {
             }),
             _ => None,
         }
+    }
+
+    /// The exact window row under the cursor, excluding a pane's parent.
+    ///
+    /// A pane move needs an explicit destination. Treating a pane row as its
+    /// parent here would let `J` confirm a window that is not visibly selected.
+    pub fn destination_window(&self) -> Option<&WindowRow> {
+        match self.cursor_row().and_then(|i| self.rows.get(i)) {
+            Some(Row::Window(w)) if !w.gone => Some(w),
+            _ => None,
+        }
+    }
+
+    /// Remember a pane and put the cursor on the first usable destination.
+    pub fn begin_pane_move(&mut self, pane: String, from: String) -> bool {
+        self.search.clear();
+        self.searching = false;
+        self.pane_move = Some(PaneMove {
+            pane,
+            from,
+            destination: None,
+        });
+        self.cursor = 0;
+        if self.move_destination(1) {
+            true
+        } else {
+            self.pane_move = None;
+            false
+        }
+    }
+
+    /// Move among live window rows while choosing a pane destination.
+    pub fn move_destination(&mut self, delta: isize) -> bool {
+        let Some(from) = self.pane_move.as_ref().map(|moving| moving.from.clone()) else {
+            return false;
+        };
+        let candidates: Vec<(usize, String)> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, row)| match row {
+                Row::Window(w) if !w.gone && w.target() != from => Some((i, w.target())),
+                _ => None,
+            })
+            .collect();
+        if candidates.is_empty() {
+            return false;
+        }
+
+        // Search is cleared when this mode starts, so visible positions and row
+        // indices are identical. From a non-candidate row, choose the first one;
+        // thereafter j/k wrap only across candidate windows.
+        let next = match candidates.iter().position(|(i, _)| *i == self.cursor) {
+            Some(pos) => (pos as isize + delta).rem_euclid(candidates.len() as isize) as usize,
+            None => 0,
+        };
+        self.cursor = candidates[next].0;
+        if let Some(moving) = &mut self.pane_move {
+            moving.destination = Some(candidates[next].1.clone());
+        }
+        true
     }
 
     /// Mark or unmark the window under the cursor.
@@ -1000,33 +1095,6 @@ mod tests {
     }
 
     #[test]
-    fn clearing_the_query_restores_the_whole_tree() {
-        let mut m = model_with(vec![
-            Row::Session {
-                name: "projects".into(),
-                windows: 1,
-            },
-            Row::Window(WindowRow {
-                session: "projects".into(),
-                index: 1,
-                name: "cohome".into(),
-                panes: 1,
-                state: String::new(),
-                cc_session: String::new(),
-                waiting: false,
-                change: Change::Same,
-                reasons: Vec::new(),
-                gone: false,
-            }),
-        ]);
-        m.search_push('z');
-        assert!(m.visible().is_empty());
-
-        m.search_clear_query();
-        assert_eq!(m.visible().len(), 2, "headers come back too");
-    }
-
-    #[test]
     fn a_binary_from_an_older_commit_is_reported() {
         // The failure this exists to catch: fuzzy search was written, tested
         // and committed, but ~/.local/bin held the previous build, so pressing
@@ -1044,6 +1112,102 @@ mod tests {
         assert_eq!(staleness("211e537", "211e537-dirty"), None);
         assert_eq!(staleness("211e537-dirty", "211e537"), None);
         assert_eq!(staleness("211e537", "211e537"), None);
+    }
+
+    #[test]
+    fn pane_move_visits_only_other_live_windows() {
+        let window = |session: &str, index: u32, name: &str, gone: bool| {
+            Row::Window(WindowRow {
+                session: session.into(),
+                index,
+                name: name.into(),
+                panes: 1,
+                state: String::new(),
+                cc_session: String::new(),
+                waiting: false,
+                change: Change::Same,
+                reasons: Vec::new(),
+                gone,
+            })
+        };
+        let mut m = model_with(vec![
+            Row::Session {
+                name: "projects".into(),
+                windows: 3,
+            },
+            window("projects", 1, "source", false),
+            Row::Pane(PaneRow {
+                session: "projects".into(),
+                window_index: 1,
+                index: 1,
+                pane_id: "%11".into(),
+                command: "claude".into(),
+                path: "/src".into(),
+                active: true,
+            }),
+            window("projects", 2, "first", false),
+            window("projects", 3, "gone", true),
+            Row::Session {
+                name: "tooling".into(),
+                windows: 1,
+            },
+            window("tooling", 1, "second", false),
+        ]);
+
+        assert!(m.begin_pane_move("%11".into(), "projects:1".into()));
+        assert_eq!(
+            m.destination_window().map(WindowRow::target),
+            Some("projects:2".into()),
+            "the source, its pane row and the gone window are skipped",
+        );
+        assert_eq!(
+            m.pane_move
+                .as_ref()
+                .and_then(|moving| moving.destination.as_deref()),
+            Some("projects:2"),
+            "the target is remembered independently of the cursor row",
+        );
+
+        m.move_destination(1);
+        assert_eq!(
+            m.destination_window().map(WindowRow::target),
+            Some("tooling:1".into()),
+            "a window in another session is a valid destination",
+        );
+        assert_eq!(
+            m.pane_move
+                .as_ref()
+                .and_then(|moving| moving.destination.as_deref()),
+            Some("tooling:1"),
+        );
+        m.move_destination(1);
+        assert_eq!(
+            m.destination_window().map(WindowRow::target),
+            Some("projects:2".into()),
+            "destination selection wraps",
+        );
+    }
+
+    #[test]
+    fn pane_move_is_not_started_without_another_live_window() {
+        let mut m = model_with(vec![Row::Window(WindowRow {
+            session: "projects".into(),
+            index: 1,
+            name: "only".into(),
+            panes: 1,
+            state: String::new(),
+            cc_session: String::new(),
+            waiting: false,
+            change: Change::Same,
+            reasons: Vec::new(),
+            gone: false,
+        })]);
+
+        assert!(!m.begin_pane_move("%11".into(), "projects:1".into()));
+        assert!(
+            m.pane_move.is_none(),
+            "no half-entered selection mode remains"
+        );
     }
 
     #[test]

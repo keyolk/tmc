@@ -401,16 +401,24 @@ fn render_preview(frame: &mut Frame, area: Rect, model: &Model, w: &super::model
 }
 
 fn render_keys(frame: &mut Frame, area: Rect, model: &Model) {
+    if let Some(moving) = &model.pane_move {
+        let text = format!(
+            "moving {} from {}   j/k choose window   ⏎/J move   esc cancel   q quit",
+            moving.pane, moving.from,
+        );
+        frame.render_widget(
+            Paragraph::new(truncate(&text, area.width as usize))
+                .style(Style::default().fg(Color::Yellow)),
+            area,
+        );
+        return;
+    }
+
     // Searching is where the TUI starts, so its hint has to name the way out
     // and the way to everything else — otherwise the other twelve keys are
     // undiscoverable from the screen you land on.
     if model.searching {
-        let out = if model.search.is_empty() {
-            "esc quit"
-        } else {
-            "esc clear"
-        };
-        let text = format!("type to search   ↑↓ move   ⏎ switch   tab commands   {out}",);
+        let text = "type to search   ↑↓ move   ⏎ switch   tab/esc commands   ctrl-c quit";
         frame.render_widget(
             Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
             area,

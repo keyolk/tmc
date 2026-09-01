@@ -17,7 +17,7 @@ saved:20260830T150700Z  (33m ago)   ~19 +3 -3
                                                     │  test result: ok. 166 passed
                                                     │  ❯
 
-type to search   ↑↓ move   ⏎ switch   tab commands   esc quit
+type to search   ↑↓ move   ⏎ switch   tab/esc commands   ctrl-c quit
 ```
 
 Replaces `tmux.sh`, `twm` and the `tmux-fzf` plugin.
@@ -58,8 +58,8 @@ is informed; `--yes` skips the asking for scripts.
 ## Keys
 
 It opens on the search line. Summoning a popup is already the decision to go
-somewhere, so type — `bnp` reaches `binpack`. `Tab` steps out to the tree when
-you want the commands; `tmc --browse` starts there instead.
+somewhere, so type — `bnp` reaches `binpack`. `Tab` or `Esc` steps out to the
+tree while keeping the query as a filter; `tmc --browse` starts there instead.
 
 **Searching**
 
@@ -68,8 +68,7 @@ you want the commands; `tmc --browse` starts there instead.
 | any letter | narrow the list |
 | `↑`/`↓`, `Ctrl-n`/`Ctrl-p` | move |
 | `Enter` | switch to the window and exit |
-| `Tab` | keep the filter, hand the keys to the tree |
-| `Esc` | clear the query, then leave |
+| `Tab`, `Esc` | keep the filter, return to normal/tree mode |
 
 **Tree**
 
@@ -86,9 +85,11 @@ you want the commands; `tmc --browse` starts there instead.
 | `s` | save a point now |
 | `p` / `P` | next / previous restore point |
 | `l` / `h` | expand a window to its panes / collapse |
-| `b` / `J` | break the selected pane out / join it into this window |
+| `b` | break the selected pane out into its own window |
+| `J` | choose a destination window for the selected pane; `j`/`k`, then `Enter`/`J` |
 | `m` / `x` | move window to the other session / close it |
-| `q`, `Esc` | quit |
+| `Esc` | cancel pane destination selection; otherwise stay in normal mode |
+| `q`, `Ctrl-C` | quit |
 
 ## State
 

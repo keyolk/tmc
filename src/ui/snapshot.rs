@@ -279,21 +279,26 @@ mod tests {
         let last = out.lines().last().unwrap_or_default();
 
         assert!(last.contains("type to search"), "{last}");
-        assert!(last.contains("tab commands"), "{last}");
+        assert!(last.contains("tab/esc commands"), "{last}");
+        assert!(last.contains("ctrl-c quit"), "{last}");
         assert!(
-            last.contains("esc quit"),
-            "with no query, esc leaves: {last}"
+            !last.contains("esc quit"),
+            "Esc changes mode, never exits: {last}"
         );
     }
 
     #[test]
-    fn with_a_query_typed_esc_offers_to_clear_instead() {
+    fn with_a_query_typed_esc_still_offers_normal_mode() {
         let mut m = model();
         m.searching = true;
         m.search_push('b');
         let last = render(&m, 110, 12, 0);
         let last = last.lines().last().unwrap_or_default();
-        assert!(last.contains("esc clear"), "{last}");
+        assert!(last.contains("tab/esc commands"), "{last}");
+        assert!(
+            !last.contains("esc clear"),
+            "the query remains as a filter: {last}"
+        );
     }
 
     #[test]
