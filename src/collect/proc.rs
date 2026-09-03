@@ -40,9 +40,20 @@ impl Tree {
     /// `tmux.sh` does — costs ~0.05s each and is most of why its save takes
     /// 10s. `-ww` disables the terminal-width truncation that would otherwise
     /// silently cut long command lines.
+    ///
+    /// The two listings run concurrently. They cannot be merged into one `ps`
+    /// — `comm` may itself contain spaces (`Google Chrome Helper (Renderer)`),
+    /// so a `comm=,args=` row has no parseable boundary between the columns.
+    /// Run in sequence they cost ~0.05s each and together were a quarter of
+    /// the startup the TUI spends before its first frame; overlapped they cost
+    /// one of them.
     pub fn capture_with_args() -> Result<Self> {
+        let args_job =
+            std::thread::spawn(|| cmd::run("ps", &["-axww", "-o", "pid=,args="], cmd::FAST));
         let mut tree = Self::capture()?;
-        let raw = cmd::run("ps", &["-axww", "-o", "pid=,args="], cmd::FAST)?;
+        let raw = args_job
+            .join()
+            .map_err(|_| anyhow::anyhow!("ps args listing panicked"))??;
         for line in raw.lines() {
             let Some((pid, rest)) = split_field(line.trim_start()) else {
                 continue;

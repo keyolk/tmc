@@ -518,6 +518,11 @@ fn snapshot(width: u16, height: u16, searching: bool, expand: Option<String>) ->
         None => Vec::new(),
     };
     model.refresh(&panes, &saved, &tree, &pending);
+    // The TUI opens on the window it was summoned from; a snapshot that
+    // started at row 0 would show a frame the user never gets.
+    if let Some(target) = ui::app::summoning_window() {
+        model.focus(&target);
+    }
     // The TUI fetches this at draw time; do the same here so the rendered
     // frame is what the user would actually see.
     if let Some(w) = model.current_window()
