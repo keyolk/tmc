@@ -63,6 +63,12 @@ pub struct WindowRow {
     pub cc_session: String,
     /// Whether a human is blocked on this window right now.
     pub waiting: bool,
+    /// A claude is running in one of this window's panes.
+    ///
+    /// Read from the process tree, not from `@cc_state`: the two disagree in
+    /// both directions. A window can run claude with no state published, and
+    /// a window can carry state from a session that has since exited.
+    pub running_claude: bool,
     pub change: Change,
     pub reasons: Vec<String>,
     /// True when the window exists only in the restore point.
@@ -76,11 +82,19 @@ impl WindowRow {
 
     /// The state glyph. Letters and punctuation rather than colour alone, so
     /// the tree reads under `NO_COLOR` and in monochrome — twm's rule, kept.
+    ///
+    /// `.` is a claude the hooks never reached: the window is running one, but
+    /// no `@cc_state` was ever published on it — a session resumed outside
+    /// tmux and re-attached, or one that has yet to take its first turn. Blank
+    /// would file it with the shell windows and hide a session that is very
+    /// much alive; a real state would claim to know something we do not. Not
+    /// `~`, which the change column already uses on the same row.
     pub fn state_glyph(&self) -> char {
         match self.state.as_str() {
             "waiting" => '?',
             "working" => '*',
             "done" => '+',
+            _ if self.running_claude => '.',
             _ => ' ',
         }
     }
@@ -550,11 +564,26 @@ fn build_rows(
                 .iter()
                 .filter(|p| p.session == w.session && p.window_index == w.index)
                 .collect();
-            let state = live.first().map(|p| p.cc_state.clone()).unwrap_or_default();
             let cc_session = live
                 .first()
                 .map(|p| p.cc_session.clone())
                 .unwrap_or_default();
+
+            // Whether a claude is actually running here, from the process
+            // tree. `@cc_state` is published by hooks and outlives the session
+            // that set it — a window whose claude exited without a SessionEnd
+            // keeps advertising `waiting` forever. Asking the process table
+            // costs nothing extra: the tree is already loaded for the diff.
+            let running_claude = live
+                .iter()
+                .any(|p| tree.find_descendant(p.pid, |c| c == "claude").is_some());
+
+            // A state with no claude behind it is a leftover, not a status.
+            let state = if running_claude {
+                live.first().map(|p| p.cc_state.clone()).unwrap_or_default()
+            } else {
+                String::new()
+            };
 
             // Waiting is the join of two sources: the hook publishes the state
             // on the window, and notify.py records *why* it is blocked. Both
@@ -572,6 +601,7 @@ fn build_rows(
                 state,
                 cc_session,
                 waiting,
+                running_claude,
                 change: w.change,
                 reasons: w.reasons.clone(),
                 gone: w.change == Change::Removed,
@@ -692,6 +722,15 @@ mod tests {
         proc::Tree::parse_for_test("1 0 launchd\n")
     }
 
+    /// A tree where `live_pane`'s pid (100) has a claude under it.
+    ///
+    /// Most state assertions need this now: a window with no claude in its
+    /// process tree reports no state at all, since `@cc_state` outlives the
+    /// session that published it.
+    fn claude_tree() -> proc::Tree {
+        proc::Tree::parse_for_test("1 0 launchd\n100 1 fish\n200 100 claude\n")
+    }
+
     fn model_with(rows: Vec<Row>) -> Model {
         let mut m = Model::new(Vec::new());
         m.rows = rows;
@@ -729,7 +768,7 @@ mod tests {
             &panes,
             &diff,
             &HashMap::new(),
-            &empty_tree(),
+            &claude_tree(),
             &Default::default(),
         );
         assert!(matches!(&without[1], Row::Window(w) if !w.waiting));
@@ -738,10 +777,60 @@ mod tests {
             &panes,
             &diff,
             &pending_with("sess-a", notify::Kind::Idle),
-            &empty_tree(),
+            &claude_tree(),
             &Default::default(),
         );
         assert!(matches!(&with[1], Row::Window(w) if w.waiting));
+    }
+
+    #[test]
+    fn a_state_with_no_claude_behind_it_is_dropped() {
+        // @cc_state is published by a hook and nothing retires it when the
+        // session dies without a SessionEnd — killed, crashed, lost to a
+        // reboot. Measured on a live server: windows advertising `waiting`
+        // for 35 hours. The process table is the tiebreaker.
+        let panes = vec![live_pane("projects", 1, "alpha", "waiting", "sess-a")];
+        let diff = Diff {
+            windows: vec![window_diff("projects", 1, "alpha", Change::Same)],
+        };
+
+        let rows = build_rows(
+            &panes,
+            &diff,
+            &pending_with("sess-a", notify::Kind::Idle),
+            &empty_tree(), // no claude under the pane
+            &Default::default(),
+        );
+        let Row::Window(w) = &rows[1] else {
+            panic!("expected a window row")
+        };
+        assert!(!w.running_claude);
+        assert_eq!(w.state, "", "a leftover state is not a status");
+        assert!(!w.waiting, "and it must not count toward the waiting total");
+    }
+
+    #[test]
+    fn a_claude_the_hooks_never_reached_is_still_marked() {
+        // The other direction: a window running claude with no state ever
+        // published — a session resumed outside tmux, or one yet to take its
+        // first turn. Blank would file it with the shell windows.
+        let panes = vec![live_pane("projects", 1, "alpha", "", "")];
+        let diff = Diff {
+            windows: vec![window_diff("projects", 1, "alpha", Change::Same)],
+        };
+
+        let rows = build_rows(
+            &panes,
+            &diff,
+            &HashMap::new(),
+            &claude_tree(),
+            &Default::default(),
+        );
+        let Row::Window(w) = &rows[1] else {
+            panic!("expected a window row")
+        };
+        assert!(w.running_claude);
+        assert_eq!(w.state_glyph(), '.');
     }
 
     #[test]
@@ -775,6 +864,7 @@ mod tests {
                 state: String::new(),
                 cc_session: String::new(),
                 waiting: false,
+                running_claude: false,
                 change: Change::Same,
                 reasons: Vec::new(),
                 gone: false,
@@ -796,6 +886,7 @@ mod tests {
                 state: String::new(),
                 cc_session: String::new(),
                 waiting: false,
+                running_claude: false,
                 change: Change::Same,
                 reasons: Vec::new(),
                 gone,
@@ -827,6 +918,7 @@ mod tests {
             state: String::new(),
             cc_session: String::new(),
             waiting: false,
+            running_claude: false,
             change: Change::Same,
             reasons: Vec::new(),
             gone: false,
@@ -850,6 +942,7 @@ mod tests {
                 state: String::new(),
                 cc_session: String::new(),
                 waiting: false,
+                running_claude: false,
                 change: Change::Same,
                 reasons: Vec::new(),
                 gone: false,
@@ -862,6 +955,7 @@ mod tests {
                 state: String::new(),
                 cc_session: String::new(),
                 waiting: false,
+                running_claude: false,
                 change: Change::Removed,
                 reasons: Vec::new(),
                 gone: true,
@@ -888,6 +982,7 @@ mod tests {
                 },
                 cc_session: String::new(),
                 waiting,
+                running_claude: waiting,
                 change: Change::Same,
                 reasons: Vec::new(),
                 gone: false,
@@ -912,6 +1007,7 @@ mod tests {
             state: String::new(),
             cc_session: String::new(),
             waiting: false,
+            running_claude: false,
             change: Change::Same,
             reasons: Vec::new(),
             gone: false,
@@ -932,6 +1028,7 @@ mod tests {
                 state: String::new(),
                 cc_session: String::new(),
                 waiting: false,
+                running_claude: false,
                 change,
                 reasons: Vec::new(),
                 gone: false,
@@ -965,6 +1062,7 @@ mod tests {
                 state: state.into(),
                 cc_session: String::new(),
                 waiting: false,
+                running_claude: false,
                 change: Change::Same,
                 reasons: Vec::new(),
                 gone: false,
@@ -1039,6 +1137,7 @@ mod tests {
                 state: String::new(),
                 cc_session: String::new(),
                 waiting: false,
+                running_claude: false,
                 change: Change::Same,
                 reasons: Vec::new(),
                 gone: false,
@@ -1073,6 +1172,7 @@ mod tests {
                 state: String::new(),
                 cc_session: String::new(),
                 waiting: false,
+                running_claude: false,
                 change: Change::Same,
                 reasons: Vec::new(),
                 gone: false,
@@ -1141,6 +1241,7 @@ mod tests {
                 state: String::new(),
                 cc_session: String::new(),
                 waiting: false,
+                running_claude: false,
                 change: Change::Same,
                 reasons: Vec::new(),
                 gone: false,
@@ -1182,6 +1283,7 @@ mod tests {
                 state: String::new(),
                 cc_session: String::new(),
                 waiting: false,
+                running_claude: false,
                 change: Change::Same,
                 reasons: Vec::new(),
                 gone: false,
@@ -1231,6 +1333,7 @@ mod tests {
                 state: String::new(),
                 cc_session: String::new(),
                 waiting: false,
+                running_claude: false,
                 change: Change::Same,
                 reasons: Vec::new(),
                 gone,
@@ -1304,6 +1407,7 @@ mod tests {
             state: String::new(),
             cc_session: String::new(),
             waiting: false,
+            running_claude: false,
             change: Change::Same,
             reasons: Vec::new(),
             gone: false,
@@ -1326,6 +1430,7 @@ mod tests {
             state: state.into(),
             cc_session: String::new(),
             waiting: false,
+            running_claude: false,
             change: Change::Same,
             reasons: Vec::new(),
             gone: false,
@@ -1334,5 +1439,13 @@ mod tests {
         assert_eq!(mk("working").state_glyph(), '*');
         assert_eq!(mk("done").state_glyph(), '+');
         assert_eq!(mk("").state_glyph(), ' ');
+
+        // A running claude with no published state gets its own mark rather
+        // than passing for a plain shell window.
+        let unreached = WindowRow {
+            running_claude: true,
+            ..mk("")
+        };
+        assert_eq!(unreached.state_glyph(), '.');
     }
 }

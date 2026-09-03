@@ -67,6 +67,7 @@ mod tests {
                 "e399ae98-489d-4cc7".into()
             },
             waiting,
+            running_claude: !state.is_empty(),
             change,
             reasons: match change {
                 Change::Modified => vec!["pane 2 command: ccx -> ccx --watch".into()],
