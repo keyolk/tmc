@@ -40,7 +40,7 @@ pub fn run(search: bool) -> Result<Outcome> {
     model.searching = search;
 
     let mut terminal = setup().context("enter alternate screen")?;
-    let result = event_loop(&mut terminal, &mut model);
+    let result = event_loop(&mut terminal, &mut model, summoning_window());
     teardown(&mut terminal)?;
     result?;
 
@@ -66,8 +66,22 @@ fn teardown(terminal: &mut Term) -> Result<()> {
     Ok(())
 }
 
-fn event_loop(terminal: &mut Term, model: &mut Model) -> Result<()> {
+fn event_loop(terminal: &mut Term, model: &mut Model, focus: Option<String>) -> Result<()> {
+    // Paint the chrome before reading the world. This runs as a popup, and the
+    // first reload costs ~0.1s of `ps` and `tmux` before it can say anything;
+    // drawing after it meant the popup sat blank for that whole time and read
+    // as slow to open. The frame drawn here is the real one with an empty
+    // tree — the search line, the header and the panel are all already in
+    // place, so the reload below fills the rows in rather than replacing the
+    // screen.
+    terminal.draw(|frame| super::render::draw(frame, model, now_secs()))?;
+
     reload(model)?;
+    // The window this was summoned from is the context the user is already in,
+    // so it is what the panel should describe first.
+    if let Some(target) = &focus {
+        model.focus(target);
+    }
     let mut last = model.fingerprint();
     let mut needs_redraw = true;
     let mut next_tick = Instant::now() + TICK;
@@ -533,6 +547,32 @@ fn refresh_preview(model: &mut Model) {
     }
     let body = tmux::capture_pane(&target, 40).unwrap_or_default();
     model.preview = Some((target, body));
+}
+
+/// The window that ran this, as `session:index`.
+///
+/// Public so `tmc snapshot` renders the same frame the TUI opens on — a
+/// snapshot that skipped the focus would review a layout nobody sees.
+///
+/// Asked of tmux rather than derived from `$TMUX_PANE`, because a popup is
+/// itself a pane and `display-message` without a target would name the popup.
+/// `-t $TMUX_PANE` pins the answer to the pane the key was pressed in.
+pub fn summoning_window() -> Option<String> {
+    let pane = std::env::var("TMUX_PANE").ok()?;
+    let out = crate::collect::cmd::run(
+        "tmux",
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            &pane,
+            "#{session_name}:#{window_index}",
+        ],
+        crate::collect::cmd::FAST,
+    )
+    .ok()?;
+    let target = out.trim().to_string();
+    (!target.is_empty()).then_some(target)
 }
 
 fn now_secs() -> u64 {

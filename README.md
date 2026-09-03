@@ -61,6 +61,10 @@ It opens on the search line. Summoning a popup is already the decision to go
 somewhere, so type — `bnp` reaches `binpack`. `Tab` or `Esc` steps out to the
 tree while keeping the query as a filter; `tmc --browse` starts there instead.
 
+The cursor starts on the window it was summoned from, so the panel opens
+describing where you already are rather than some other session's first
+window.
+
 **Searching**
 
 | | |

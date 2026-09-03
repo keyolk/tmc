@@ -330,6 +330,24 @@ impl Model {
         self.skip_header(1);
     }
 
+    /// Put the cursor on `target`, e.g. `projects:1`. Returns whether it was
+    /// found.
+    ///
+    /// The TUI opens on the window it was summoned from, so the first thing on
+    /// screen — the preview, the diff reasons — describes where the user
+    /// already is. Landing on row 0 instead showed some unrelated session's
+    /// first window and made the panel say nothing about the current context.
+    pub fn focus(&mut self, target: &str) -> bool {
+        let visible = self.visible();
+        let Some(pos) = visible.iter().position(
+            |&i| matches!(&self.rows[i], Row::Window(w) if !w.gone && w.target() == target),
+        ) else {
+            return false;
+        };
+        self.cursor = pos;
+        true
+    }
+
     /// Jump to the next window blocked on a human.
     ///
     /// twm's `w`, and the whole point of showing state here: with 27 windows
@@ -765,6 +783,94 @@ mod tests {
         m.cursor = 0;
         m.move_cursor(0);
         assert_eq!(m.cursor, 1, "a header is a label, not a destination");
+    }
+
+    #[test]
+    fn focus_lands_on_the_window_it_names() {
+        let win = |session: &str, index: u32, name: &str, gone: bool| {
+            Row::Window(WindowRow {
+                session: session.into(),
+                index,
+                name: name.into(),
+                panes: 1,
+                state: String::new(),
+                cc_session: String::new(),
+                waiting: false,
+                change: Change::Same,
+                reasons: Vec::new(),
+                gone,
+            })
+        };
+        let mut m = model_with(vec![
+            Row::Session {
+                name: "projects".into(),
+                windows: 2,
+            },
+            win("projects", 1, "alpha", false),
+            win("projects", 2, "beta", false),
+        ]);
+
+        assert!(m.focus("projects:2"));
+        assert_eq!(m.cursor, 2);
+    }
+
+    #[test]
+    fn focus_reports_a_miss_and_leaves_the_cursor_alone() {
+        // The summoning window can be absent from the tree — the popup was
+        // opened from a session the search has filtered away. Moving the
+        // cursor somewhere arbitrary would be worse than not moving it.
+        let mut m = model_with(vec![Row::Window(WindowRow {
+            session: "projects".into(),
+            index: 1,
+            name: "alpha".into(),
+            panes: 1,
+            state: String::new(),
+            cc_session: String::new(),
+            waiting: false,
+            change: Change::Same,
+            reasons: Vec::new(),
+            gone: false,
+        })]);
+        m.cursor = 0;
+
+        assert!(!m.focus("other:9"));
+        assert_eq!(m.cursor, 0);
+    }
+
+    #[test]
+    fn focus_ignores_a_window_that_only_exists_in_the_point() {
+        // A `gone` row cannot be switched to, so focusing it would put the
+        // panel on a window the user cannot reach.
+        let mut m = model_with(vec![
+            Row::Window(WindowRow {
+                session: "projects".into(),
+                index: 1,
+                name: "alpha".into(),
+                panes: 1,
+                state: String::new(),
+                cc_session: String::new(),
+                waiting: false,
+                change: Change::Same,
+                reasons: Vec::new(),
+                gone: false,
+            }),
+            Row::Window(WindowRow {
+                session: "projects".into(),
+                index: 2,
+                name: "beta".into(),
+                panes: 1,
+                state: String::new(),
+                cc_session: String::new(),
+                waiting: false,
+                change: Change::Removed,
+                reasons: Vec::new(),
+                gone: true,
+            }),
+        ]);
+        m.cursor = 0;
+
+        assert!(!m.focus("projects:2"));
+        assert_eq!(m.cursor, 0);
     }
 
     #[test]
