@@ -105,6 +105,7 @@ alone, so the tree reads under `NO_COLOR` and in monochrome.
 | `?` | waiting on you |
 | `*` | working |
 | `+` | done, output unread |
+| `.` | running claude, no state published |
 
 | marker | |
 |---|---|
@@ -116,6 +117,13 @@ Claude state is not inferred: `~/.claude/hooks/cc_state.py` publishes it into
 the `@cc_state` window option, and `notify.py` records *why* a session is
 blocked. A window shows as waiting only when both agree, so a stale state
 cannot claim someone is holding it up.
+
+Both are hook output, and hooks miss in both directions, so the process table
+is the tiebreaker. A published state with no claude running behind it is a
+leftover — nothing retires `@cc_state` when a session is killed or lost to a
+reboot, and windows were found still advertising `waiting` 35 hours on — so it
+is dropped rather than shown. The reverse, a claude with no state, gets `.`:
+it is alive, and how it is doing is simply not known.
 
 ## Restore points
 
