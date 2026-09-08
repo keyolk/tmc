@@ -126,6 +126,16 @@ fn event_loop(terminal: &mut Term, model: &mut Model, focus: Option<String>) -> 
 fn handle_key(model: &mut Model, code: KeyCode, mods: KeyModifiers) -> Result<()> {
     model.status.clear();
 
+    // Under a Korean input source the shortcut keys arrive as jamo (`q` -> `ㅂ`)
+    // and do nothing until the input source is switched back. Rewrite them to
+    // the Latin key at the same physical position -- but not while searching,
+    // where letters type and the jamo IS the input.
+    let code = if model.searching {
+        code
+    } else {
+        crate::keymap::normalize(code, mods)
+    };
+
     // A pane has been picked and only a destination window is selectable. Deal
     // with this before the ordinary tree keys so Enter cannot switch windows
     // and Esc cannot quit while the user is in the middle of choosing.
@@ -793,5 +803,74 @@ mod tests {
         m.status = "something happened".into();
         press(&mut m, 'j', KeyModifiers::NONE);
         assert!(m.status.is_empty());
+    }
+    // --- CJK input source ---------------------------------------------------
+
+    // Under a Korean input source every shortcut arrives as a jamo. tmc starts
+    // in search mode, so the first thing a user does is Tab out to the tree --
+    // where, without this mapping, the whole keyboard was dead.
+    #[test]
+    fn hangul_clears_marks_like_latin_c() {
+        let mut m = model_with_window();
+        m.searching = false;
+        m.marks.insert("projects:1".into());
+
+        // `ㅊ` is the physical `c` under the 2-set layout.
+        press(&mut m, 'ㅊ', KeyModifiers::NONE);
+        assert!(m.marks.is_empty(), "ㅊ (physical c) must clear marks");
+        assert!(!m.quit);
+    }
+
+    #[test]
+    fn hangul_quits_like_latin_q() {
+        let mut m = model_with_window();
+        m.searching = false;
+        // `ㅂ` sits on the physical `q` key.
+        press(&mut m, 'ㅂ', KeyModifiers::NONE);
+        assert!(m.quit, "ㅂ (physical q) must quit");
+    }
+
+    // Search mode is where letters type, so a jamo there is the query -- a
+    // Korean window name would otherwise be unsearchable.
+    #[test]
+    fn search_mode_keeps_hangul_verbatim() {
+        let mut m = model_with_window();
+        m.searching = true;
+        press(&mut m, 'ㅂ', KeyModifiers::NONE);
+        assert_eq!(m.search, "ㅂ", "searching must not rewrite the jamo");
+        assert!(!m.quit);
+    }
+
+    fn pending_move() -> crate::ui::model::PaneMove {
+        crate::ui::model::PaneMove {
+            pane: "%1084".into(),
+            from: "projects:2".into(),
+            destination: Some("tooling:3".into()),
+        }
+    }
+
+    // The pane-move picker is its own mode ahead of the tree keys, and it is
+    // all shortcuts, so it normalizes too.
+    #[test]
+    fn hangul_moves_the_destination_cursor_in_pane_move() {
+        let mut with_jamo = model_with_window();
+        with_jamo.searching = false;
+        with_jamo.pane_move = Some(pending_move());
+        // `ㅓ` is the physical `j`.
+        press(&mut with_jamo, 'ㅓ', KeyModifiers::NONE);
+
+        let mut with_latin = model_with_window();
+        with_latin.searching = false;
+        with_latin.pane_move = Some(pending_move());
+        press(&mut with_latin, 'j', KeyModifiers::NONE);
+
+        // j is a bound navigation key, so it leaves no "choose a window" hint;
+        // an unmapped key would. Asserting both are empty AND equal makes the
+        // comparison meaningful rather than two identical error strings.
+        assert_eq!(with_latin.status, "", "j should navigate, not fall through");
+        assert_eq!(
+            with_jamo.status, with_latin.status,
+            "ㅓ must reach the same handler j does"
+        );
     }
 }
