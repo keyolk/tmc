@@ -1,6 +1,7 @@
 mod clock;
 mod collect;
 mod fuzzy;
+mod keymap;
 mod layout;
 mod ui;
 
