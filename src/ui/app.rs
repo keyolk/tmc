@@ -13,6 +13,7 @@ use ratatui::backend::CrosstermBackend;
 
 use super::model::{Model, WindowRow};
 use crate::collect::{notify, proc, tmux};
+use crate::config;
 use crate::layout::{point, restore, save};
 
 /// How often the world is re-read. tmux exposes no event stream a foreign
@@ -337,8 +338,19 @@ fn restore_marked(model: &mut Model) -> Result<()> {
         return Ok(());
     }
 
+    // A config error stops the restore rather than the app: `r` is one
+    // keystroke inside a popup, and quitting the TUI to report a typo in a
+    // file the user can fix in the next pane is the wrong trade.
+    let autorun = match config::load() {
+        Ok(cfg) => cfg.restore,
+        Err(e) => {
+            model.status = format!("{}: {e:#}", config::path().display());
+            return Ok(());
+        }
+    };
     let mut server = restore::Server;
     let mut windows = 0;
+    let mut ran = 0;
     let mut notes = Vec::new();
 
     for session in &saved {
@@ -356,6 +368,7 @@ fn restore_marked(model: &mut Model) -> Result<()> {
             restore::Selection {
                 windows: Some(&indices),
             },
+            &autorun,
             false,
             // Never forced from the TUI: `r` here restores windows the point
             // has and the server does not, so there is nothing live to
@@ -364,13 +377,20 @@ fn restore_marked(model: &mut Model) -> Result<()> {
             false,
         )?;
         windows += report.windows;
+        ran += report.commands_run;
         notes.extend(report.notes);
     }
 
     model.marks.clear();
     reload(model)?;
     model.status = if notes.is_empty() {
-        format!("restored {windows} window(s)")
+        let mut line = format!("restored {windows} window(s)");
+        // Worth a word even in a one-line status: the panes that started on
+        // their own are the ones the user did not press a key for.
+        if ran > 0 {
+            line.push_str(&format!(", ran {ran} command(s)"));
+        }
+        line
     } else {
         notes.join("; ")
     };
