@@ -34,7 +34,7 @@ pub enum Outcome {
 /// because this runs as a popup: summoning it is already the decision to go
 /// somewhere, and making you press `/` first is the same extra keystroke that
 /// made tmux-fzf's two-level menu tiresome. `Esc` steps out to the tree when
-/// the intent is to inspect rather than jump.
+/// the intent is to inspect rather than jump, and again to leave.
 pub fn run(search: bool) -> Result<Outcome> {
     let points = point::list(&save::layout_dir());
     let mut model = Model::new(points);
@@ -196,11 +196,11 @@ fn handle_key(model: &mut Model, code: KeyCode, mods: KeyModifiers) -> Result<()
 
     match code {
         KeyCode::Char('/') => model.searching = true,
-        KeyCode::Char('q') => model.quit = true,
-        // Esc leaves modes and cancels choices; in the plain tree there is
-        // nothing to leave, so it deliberately does nothing. q/Ctrl-C are the
-        // only exits.
-        KeyCode::Esc => {}
+        // Esc pops one level: the pane-move choice, then the search line, then
+        // the app. Making it do nothing at the root meant the key that got you
+        // out of everything else stopped working exactly once, which reads as
+        // the popup being stuck rather than as a rule.
+        KeyCode::Char('q') | KeyCode::Esc => model.quit = true,
         KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => model.quit = true,
 
         KeyCode::Char('j') | KeyCode::Down => model.move_cursor(1),
@@ -654,10 +654,48 @@ mod tests {
         let _ = handle_key(&mut m, KeyCode::Esc, KeyModifiers::NONE);
         assert!(!m.searching, "Esc returns to normal mode");
         assert_eq!(m.search, "alpha", "the query remains as a filter");
-        assert!(!m.quit, "Esc never exits the program");
+        assert!(!m.quit, "the first Esc is a mode change, not an exit");
+    }
+
+    #[test]
+    fn esc_in_the_tree_quits() {
+        // One level per press. The tree is the last one, so Esc there leaves.
+        let mut m = model_with_window();
+        assert!(!m.searching, "already at the root");
 
         let _ = handle_key(&mut m, KeyCode::Esc, KeyModifiers::NONE);
-        assert!(!m.quit, "Esc in normal mode is also harmless");
+
+        assert!(m.quit);
+    }
+
+    #[test]
+    fn two_escapes_from_the_search_line_leave() {
+        // The path the TUI actually opens on: search -> tree -> out.
+        let mut m = model_with_window();
+        m.searching = true;
+
+        let _ = handle_key(&mut m, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!m.quit, "the first lands in the tree");
+        let _ = handle_key(&mut m, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(m.quit, "the second leaves");
+    }
+
+    #[test]
+    fn esc_during_a_pane_move_cancels_rather_than_quitting() {
+        // The level below the tree still has to be popped first, or a cancel
+        // costs the whole session.
+        let mut m = model_with_window();
+        m.pane_move = Some(crate::ui::model::PaneMove {
+            pane: "%1084".into(),
+            from: "projects:2".into(),
+            destination: None,
+        });
+
+        let _ = handle_key(&mut m, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!m.quit, "the move was cancelled, not the program");
+
+        let _ = handle_key(&mut m, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(m.quit, "and the next press is at the root");
     }
 
     #[test]

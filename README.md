@@ -99,6 +99,9 @@ The cursor starts on the window it was summoned from, so the panel opens
 describing where you already are rather than some other session's first
 window.
 
+`Esc` pops one level each press: a pending pane move, then the search line,
+then the app. Pressing it twice from where the TUI opens leaves.
+
 **Searching**
 
 | | |
@@ -126,8 +129,7 @@ window.
 | `b` | break the selected pane out into its own window |
 | `J` | choose a destination window for the selected pane; `j`/`k`, then `Enter`/`J` |
 | `m` / `x` | move window to the other session / close it |
-| `Esc` | cancel pane destination selection; otherwise stay in normal mode |
-| `q`, `Ctrl-C` | quit |
+| `q`, `Esc`, `Ctrl-C` | quit |
 
 ## State
 

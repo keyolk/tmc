@@ -284,7 +284,8 @@ mod tests {
         assert!(last.contains("ctrl-c quit"), "{last}");
         assert!(
             !last.contains("esc quit"),
-            "Esc changes mode, never exits: {last}"
+            "from here Esc is still a mode change; it only exits from the \
+             tree, and promising otherwise costs a session: {last}",
         );
     }
 
@@ -328,14 +329,14 @@ mod tests {
 
     #[test]
     fn the_key_hint_always_shows_the_way_out() {
-        // Truncating mid-word would hide `q quit`, which is the one thing the
-        // hint line must never do.
-        for width in [60, 70, 90, 104, 140] {
+        // Truncating mid-word would hide the quit keys, which is the one thing
+        // the hint line must never do.
+        for width in [60, 70, 90, 104, 140, 160] {
             let out = render(&model(), width, 12, 0);
             let last = out.lines().last().unwrap_or_default();
             assert!(
-                last.contains("q quit"),
-                "at {width} columns the quit key vanished: [{last}]",
+                last.contains("esc/q quit"),
+                "at {width} columns the quit keys vanished: [{last}]",
             );
             assert!(
                 last.chars().count() <= width as usize,
@@ -346,7 +347,10 @@ mod tests {
 
     #[test]
     fn a_wide_terminal_shows_the_window_surgery_keys_a_narrow_one_drops() {
-        let wide = render(&model(), 140, 12, 0);
+        // The widths are only "roomy" and "not roomy" — the exact threshold
+        // moves whenever a hint gains a word, and pinning it here would make
+        // that an unrelated test failure.
+        let wide = render(&model(), 160, 12, 0);
         let narrow = render(&model(), 70, 12, 0);
         assert!(wide.contains("x kill"), "{wide}");
         assert!(!narrow.contains("x kill"), "dropped when it will not fit");
