@@ -47,6 +47,7 @@ running, and `r` restores only what you marked.
 | `tmc clipboard` | paste-buffer picker |
 | `tmc copy-mode` | send a copy-mode command |
 | `tmc snapshot` | render one frame as text |
+| `tmc config` | the effective configuration |
 
 `--dry-run` on `save` and `load` shows what would happen and touches nothing.
 
@@ -54,6 +55,39 @@ running, and `r` restores only what you marked.
 a live one would silently double the workspace. `--force` closes it and
 rebuilds instead — it prints what would be lost first and asks, so the answer
 is informed; `--yes` skips the asking for scripts.
+
+## Autorun
+
+Restore types each pane's command at its prompt and stops there: bringing a
+workspace back should not start 30 processes unasked, and a line sitting at a
+prompt is undone with `ctrl-c`.
+
+But a few commands are the reason you restored at all. A `claude` pane you
+still have to start by hand is a pane you have not recovered yet — and it is
+the one that carries a `--resume <id>` you did not type and cannot retype.
+So which commands run is a per-pattern choice, in
+`~/.config/tmc/config.toml`:
+
+```toml
+[restore]
+autorun = ["claude", "nvim *", "htop"]
+```
+
+`claude` is the default; everything else is typed and left. An explicit
+`autorun = []` turns it off entirely. `tmc config` prints what is in force,
+which is otherwise only observable by restoring and watching what starts.
+
+Two spellings, because they answer different questions:
+
+- **a plain word** matches any *token* of the command line. The program is
+  rarely the interesting word — `claude` has to find `ccproxy claude
+  --intercept=mitm`, and a substring match would also find `echo claudette`.
+- **`*` or `?`** makes it a glob over the whole line, for when the token is
+  not the unit you want: `nvim *`, `cargo watch*`, `*--resume*`.
+
+Patterns see the *restored* line, `--resume` included. Per run, `--autorun
+<pattern>` replaces the list and `--no-autorun` empties it; `--dry-run`
+counts the two kinds separately, since only one of them is irreversible.
 
 ## Keys
 
@@ -64,6 +98,9 @@ tree while keeping the query as a filter; `tmc --browse` starts there instead.
 The cursor starts on the window it was summoned from, so the panel opens
 describing where you already are rather than some other session's first
 window.
+
+`Esc` pops one level each press: a pending pane move, then the search line,
+then the app. Pressing it twice from where the TUI opens leaves.
 
 **Searching**
 
@@ -92,8 +129,7 @@ window.
 | `b` | break the selected pane out into its own window |
 | `J` | choose a destination window for the selected pane; `j`/`k`, then `Enter`/`J` |
 | `m` / `x` | move window to the other session / close it |
-| `Esc` | cancel pane destination selection; otherwise stay in normal mode |
-| `q`, `Ctrl-C` | quit |
+| `q`, `Esc`, `Ctrl-C` | quit |
 
 ## State
 

@@ -453,14 +453,15 @@ fn render_keys(frame: &mut Frame, area: Rect, model: &Model) {
         } else {
             format!("{text}   {group}")
         };
-        // Leave room for `q quit`, which is always shown: leaving without a
-        // visible way out is the one thing the hint line must never do.
-        if candidate.chars().count() + 9 > area.width as usize {
+        // Leave room for the quit hint, which is always shown: leaving without
+        // a visible way out is the one thing the hint line must never do.
+        const QUIT: &str = "   esc/q quit";
+        if candidate.chars().count() + QUIT.chars().count() > area.width as usize {
             break;
         }
         text = candidate;
     }
-    text.push_str("   q quit");
+    text.push_str("   esc/q quit");
 
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),

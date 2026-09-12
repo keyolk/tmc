@@ -1,5 +1,6 @@
 mod clock;
 mod collect;
+mod config;
 mod fuzzy;
 mod keymap;
 mod layout;
@@ -112,7 +113,17 @@ enum Command {
         /// Skip the confirmation prompt that --force asks for.
         #[arg(long)]
         yes: bool,
+        /// Run commands matching this pattern instead of leaving them at the
+        /// prompt; repeatable. Replaces `restore.autorun` from the config file
+        /// rather than adding to it, so one run can be decided entirely here.
+        #[arg(long = "autorun")]
+        autorun: Vec<String>,
+        /// Leave every command at the prompt, whatever the config says.
+        #[arg(long, conflicts_with = "autorun")]
+        no_autorun: bool,
     },
+    /// Print the effective configuration and where it came from.
+    Config,
 }
 
 fn main() -> Result<()> {
@@ -140,8 +151,45 @@ fn main() -> Result<()> {
             dry_run,
             force,
             yes,
-        } => load(name, &sessions, dry_run, force, yes),
+            autorun,
+            no_autorun,
+        } => {
+            let over = if no_autorun {
+                Some(Vec::new())
+            } else if autorun.is_empty() {
+                None
+            } else {
+                Some(autorun)
+            };
+            load(name, &sessions, dry_run, force, yes, over)
+        }
+        Command::Config => show_config(),
     }
+}
+
+/// Print the effective config, so `autorun` can be checked without restoring.
+///
+/// Whether a pattern list is in force is otherwise only observable by running
+/// a restore and watching what starts, which is the wrong place to find out.
+fn show_config() -> Result<()> {
+    let path = config::path();
+    let cfg = config::load()?;
+    println!(
+        "config: {} ({})",
+        path.display(),
+        if path.exists() {
+            "read"
+        } else {
+            "absent; using defaults"
+        }
+    );
+    println!("\n[restore]");
+    if cfg.restore.autorun.is_empty() {
+        println!("  autorun = []   # every command is typed, none submitted");
+    } else {
+        println!("  autorun = {:?}", cfg.restore.autorun);
+    }
+    Ok(())
 }
 
 fn save(name: Option<String>, dry_run: bool) -> Result<()> {
@@ -288,6 +336,8 @@ fn load(
     dry_run: bool,
     force: bool,
     yes: bool,
+    // `--autorun`/`--no-autorun`, replacing the config's list for this run.
+    autorun_override: Option<Vec<String>>,
 ) -> Result<()> {
     let points = point::list(&layout::save::layout_dir());
     let chosen = match &name {
@@ -356,6 +406,10 @@ fn load(
         }
     }
 
+    let autorun = match autorun_override {
+        Some(autorun) => config::Restore { autorun },
+        None => config::load()?.restore,
+    };
     let mut total = layout::restore::Report::default();
     let mut server = layout::restore::Server;
     for s in &wanted {
@@ -363,6 +417,7 @@ fn load(
             &mut server,
             s,
             layout::restore::Selection::all(),
+            &autorun,
             dry_run,
             force,
         )?;
@@ -373,6 +428,7 @@ fn load(
         total.panes += report.panes;
         total.missing_panes += report.missing_panes;
         total.commands_prefilled += report.commands_prefilled;
+        total.commands_run += report.commands_run;
     }
 
     let verb = if dry_run { "would restore" } else { "restored" };
@@ -380,6 +436,12 @@ fn load(
         "\n{verb} {} window(s), {} pane(s), {} command(s) prefilled",
         total.windows, total.panes, total.commands_prefilled,
     );
+    // Named separately, and always when non-zero: prefilling is reversible by
+    // pressing ctrl-c at a prompt, and running is not.
+    if total.commands_run > 0 {
+        let verb = if dry_run { "would run" } else { "ran" };
+        println!("{verb} {} command(s) matching autorun", total.commands_run);
+    }
     if total.missing_panes > 0 {
         println!("{} pane(s) did not fit the display", total.missing_panes);
     }

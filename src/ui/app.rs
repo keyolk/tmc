@@ -13,6 +13,7 @@ use ratatui::backend::CrosstermBackend;
 
 use super::model::{Model, WindowRow};
 use crate::collect::{notify, proc, tmux};
+use crate::config;
 use crate::layout::{point, restore, save};
 
 /// How often the world is re-read. tmux exposes no event stream a foreign
@@ -33,7 +34,7 @@ pub enum Outcome {
 /// because this runs as a popup: summoning it is already the decision to go
 /// somewhere, and making you press `/` first is the same extra keystroke that
 /// made tmux-fzf's two-level menu tiresome. `Esc` steps out to the tree when
-/// the intent is to inspect rather than jump.
+/// the intent is to inspect rather than jump, and again to leave.
 pub fn run(search: bool) -> Result<Outcome> {
     let points = point::list(&save::layout_dir());
     let mut model = Model::new(points);
@@ -195,11 +196,11 @@ fn handle_key(model: &mut Model, code: KeyCode, mods: KeyModifiers) -> Result<()
 
     match code {
         KeyCode::Char('/') => model.searching = true,
-        KeyCode::Char('q') => model.quit = true,
-        // Esc leaves modes and cancels choices; in the plain tree there is
-        // nothing to leave, so it deliberately does nothing. q/Ctrl-C are the
-        // only exits.
-        KeyCode::Esc => {}
+        // Esc pops one level: the pane-move choice, then the search line, then
+        // the app. Making it do nothing at the root meant the key that got you
+        // out of everything else stopped working exactly once, which reads as
+        // the popup being stuck rather than as a rule.
+        KeyCode::Char('q') | KeyCode::Esc => model.quit = true,
         KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => model.quit = true,
 
         KeyCode::Char('j') | KeyCode::Down => model.move_cursor(1),
@@ -337,8 +338,19 @@ fn restore_marked(model: &mut Model) -> Result<()> {
         return Ok(());
     }
 
+    // A config error stops the restore rather than the app: `r` is one
+    // keystroke inside a popup, and quitting the TUI to report a typo in a
+    // file the user can fix in the next pane is the wrong trade.
+    let autorun = match config::load() {
+        Ok(cfg) => cfg.restore,
+        Err(e) => {
+            model.status = format!("{}: {e:#}", config::path().display());
+            return Ok(());
+        }
+    };
     let mut server = restore::Server;
     let mut windows = 0;
+    let mut ran = 0;
     let mut notes = Vec::new();
 
     for session in &saved {
@@ -356,6 +368,7 @@ fn restore_marked(model: &mut Model) -> Result<()> {
             restore::Selection {
                 windows: Some(&indices),
             },
+            &autorun,
             false,
             // Never forced from the TUI: `r` here restores windows the point
             // has and the server does not, so there is nothing live to
@@ -364,13 +377,20 @@ fn restore_marked(model: &mut Model) -> Result<()> {
             false,
         )?;
         windows += report.windows;
+        ran += report.commands_run;
         notes.extend(report.notes);
     }
 
     model.marks.clear();
     reload(model)?;
     model.status = if notes.is_empty() {
-        format!("restored {windows} window(s)")
+        let mut line = format!("restored {windows} window(s)");
+        // Worth a word even in a one-line status: the panes that started on
+        // their own are the ones the user did not press a key for.
+        if ran > 0 {
+            line.push_str(&format!(", ran {ran} command(s)"));
+        }
+        line
     } else {
         notes.join("; ")
     };
@@ -634,10 +654,48 @@ mod tests {
         let _ = handle_key(&mut m, KeyCode::Esc, KeyModifiers::NONE);
         assert!(!m.searching, "Esc returns to normal mode");
         assert_eq!(m.search, "alpha", "the query remains as a filter");
-        assert!(!m.quit, "Esc never exits the program");
+        assert!(!m.quit, "the first Esc is a mode change, not an exit");
+    }
+
+    #[test]
+    fn esc_in_the_tree_quits() {
+        // One level per press. The tree is the last one, so Esc there leaves.
+        let mut m = model_with_window();
+        assert!(!m.searching, "already at the root");
 
         let _ = handle_key(&mut m, KeyCode::Esc, KeyModifiers::NONE);
-        assert!(!m.quit, "Esc in normal mode is also harmless");
+
+        assert!(m.quit);
+    }
+
+    #[test]
+    fn two_escapes_from_the_search_line_leave() {
+        // The path the TUI actually opens on: search -> tree -> out.
+        let mut m = model_with_window();
+        m.searching = true;
+
+        let _ = handle_key(&mut m, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!m.quit, "the first lands in the tree");
+        let _ = handle_key(&mut m, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(m.quit, "the second leaves");
+    }
+
+    #[test]
+    fn esc_during_a_pane_move_cancels_rather_than_quitting() {
+        // The level below the tree still has to be popped first, or a cancel
+        // costs the whole session.
+        let mut m = model_with_window();
+        m.pane_move = Some(crate::ui::model::PaneMove {
+            pane: "%1084".into(),
+            from: "projects:2".into(),
+            destination: None,
+        });
+
+        let _ = handle_key(&mut m, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!m.quit, "the move was cancelled, not the program");
+
+        let _ = handle_key(&mut m, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(m.quit, "and the next press is at the root");
     }
 
     #[test]

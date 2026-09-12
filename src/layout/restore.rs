@@ -12,14 +12,19 @@
 //! - **Layout only when the count matches.** `select-layout` requires the live
 //!   pane count to equal the layout string's, and applying a mismatched one
 //!   errors out. A `tiled` fallback beats a failed restore.
-//! - **Prefill, never execute.** Commands are typed into the prompt and left
-//!   there. Restoring a workspace should not run 30 processes unasked.
+//! - **Prefill, don't execute — unless asked.** Commands are typed into the
+//!   prompt and left there, because restoring a workspace should not start 30
+//!   processes unasked. The exception is per-command and the user's:
+//!   `config::Restore::autorun` names the patterns worth running, and a
+//!   `claude` pane that has to be started by hand is a pane you have not
+//!   actually recovered yet.
 
 use std::time::Duration;
 
 use anyhow::Result;
 
 use crate::collect::cmd;
+use crate::config;
 use crate::layout::{Session, Window};
 
 /// The tmux operations a restore performs.
@@ -38,6 +43,8 @@ pub trait Tmux {
     fn pane_indices(&self, target: &str) -> Vec<String>;
     /// Type text at the prompt without executing it.
     fn send_literal(&mut self, target: &str, text: &str);
+    /// Submit whatever is at the prompt.
+    fn send_enter(&mut self, target: &str);
     /// Block until the pane's foreground process is a shell.
     fn wait_for_shell(&self, target: &str);
     /// Close a session and everything in it.
@@ -133,6 +140,14 @@ impl Tmux for Server {
         );
     }
 
+    fn send_enter(&mut self, target: &str) {
+        // Separate from `send_literal` so the text is committed as one literal
+        // chunk first. Sending `Enter` inside the same `-l` call would type the
+        // characters "Enter"; sending the command without `-l` would let tmux
+        // interpret words in it as key names.
+        let _ = cmd::run("tmux", &["send-keys", "-t", target, "Enter"], cmd::FAST);
+    }
+
     /// Wait until the pane's foreground process is a shell.
     ///
     /// A flat sleep is too short when a heavy rc file is still rendering: the
@@ -177,7 +192,10 @@ pub struct Report {
     pub panes: usize,
     /// Panes that could not be created — the display ran out of room.
     pub missing_panes: usize,
+    /// Typed at the prompt and left for the user to submit.
     pub commands_prefilled: usize,
+    /// Typed and submitted, because a pattern in `autorun` matched.
+    pub commands_run: usize,
     pub notes: Vec<String>,
 }
 
@@ -208,6 +226,7 @@ pub fn session<T: Tmux>(
     tmux: &mut T,
     saved: &Session,
     select: Selection,
+    autorun: &config::Restore,
     dry_run: bool,
     force: bool,
 ) -> Result<Report> {
@@ -250,9 +269,9 @@ pub fn session<T: Tmux>(
         return Ok(report);
     }
 
-    // (target, command) pairs, typed once every window exists so the shells
+    // What to type where, deferred until every window exists so the shells
     // have had the longest possible head start.
-    let mut pending: Vec<(String, String)> = Vec::new();
+    let mut pending: Vec<Prefill> = Vec::new();
 
     for (i, window) in windows.iter().enumerate() {
         let first_path = window.panes.first().map(|p| p.path.as_str()).unwrap_or("");
@@ -282,26 +301,52 @@ pub fn session<T: Tmux>(
             }
             let Some(idx) = live.get(pos) else { continue };
             let command = resume_command(pane);
-            pending.push((format!("{}:{}.{}", saved.session, target, idx), command));
+            pending.push(Prefill {
+                target: format!("{}:{}.{}", saved.session, target, idx),
+                run: autorun.should_run(&command),
+                command,
+            });
         }
     }
 
     if dry_run {
-        report.commands_prefilled = windows
-            .iter()
-            .flat_map(|w| &w.panes)
-            .filter(|p| !p.command.is_empty())
-            .count();
+        // No panes were created, so there is nothing to read live indices
+        // from; the counts come from the saved panes instead. A preview that
+        // did not distinguish the two would hide the only irreversible part
+        // of a restore — which commands start on their own.
+        for pane in windows.iter().flat_map(|w| &w.panes) {
+            if pane.command.is_empty() {
+                continue;
+            }
+            if autorun.should_run(&resume_command(pane)) {
+                report.commands_run += 1;
+            } else {
+                report.commands_prefilled += 1;
+            }
+        }
         return Ok(report);
     }
 
-    for (target, command) in &pending {
-        tmux.wait_for_shell(target);
-        tmux.send_literal(target, command);
-        report.commands_prefilled += 1;
+    for p in &pending {
+        tmux.wait_for_shell(&p.target);
+        tmux.send_literal(&p.target, &p.command);
+        if p.run {
+            tmux.send_enter(&p.target);
+            report.commands_run += 1;
+        } else {
+            report.commands_prefilled += 1;
+        }
     }
 
     Ok(report)
+}
+
+/// One command waiting on its pane's shell.
+struct Prefill {
+    target: String,
+    command: String,
+    /// Submit it, rather than leaving it at the prompt.
+    run: bool,
 }
 
 /// Attach the pane's own Claude session to its command.
@@ -502,11 +547,28 @@ mod tests {
         fn send_literal(&mut self, target: &str, text: &str) {
             self.calls.push(format!("send {target} [{text}]"));
         }
+        fn send_enter(&mut self, target: &str) {
+            self.calls.push(format!("enter {target}"));
+        }
         fn wait_for_shell(&self, _target: &str) {}
         fn kill_session(&mut self, name: &str) -> Result<()> {
             self.calls.push(format!("kill-session {name}"));
             self.live_sessions.retain(|s| s != name);
             Ok(())
+        }
+    }
+
+    /// Autorun off, which is what most of these tests want: they are about
+    /// sequencing, and a command that submits itself adds noise to `calls`.
+    fn no_autorun() -> config::Restore {
+        config::Restore {
+            autorun: Vec::new(),
+        }
+    }
+
+    fn autorun(patterns: &[&str]) -> config::Restore {
+        config::Restore {
+            autorun: patterns.iter().map(|p| p.to_string()).collect(),
         }
     }
 
@@ -537,7 +599,15 @@ mod tests {
             window(2, "beta", vec![pane("", None)]),
         ]);
 
-        let report = session(&mut tmux, &saved, Selection::all(), false, false).unwrap();
+        let report = session(
+            &mut tmux,
+            &saved,
+            Selection::all(),
+            &no_autorun(),
+            false,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(report.windows, 2);
         assert!(tmux.calls[0].starts_with("new-session projects alpha"));
@@ -556,7 +626,15 @@ mod tests {
         tmux.base_index = 1;
         let saved = saved_session(vec![window(1, "alpha", vec![pane("ghx", None)])]);
 
-        session(&mut tmux, &saved, Selection::all(), false, false).unwrap();
+        session(
+            &mut tmux,
+            &saved,
+            Selection::all(),
+            &no_autorun(),
+            false,
+            false,
+        )
+        .unwrap();
 
         assert!(
             tmux.calls.iter().any(|c| c == "send projects:0.1 [ghx]"),
@@ -571,7 +649,15 @@ mod tests {
         let panes: Vec<Pane> = (0..4).map(|_| pane("", None)).collect();
         let saved = saved_session(vec![window(1, "alpha", panes)]);
 
-        session(&mut tmux, &saved, Selection::all(), false, false).unwrap();
+        session(
+            &mut tmux,
+            &saved,
+            Selection::all(),
+            &no_autorun(),
+            false,
+            false,
+        )
+        .unwrap();
 
         let tiled = tmux.calls.iter().filter(|c| c.ends_with("tiled")).count();
         assert!(tiled >= 3, "one re-tile per split; calls: {:?}", tmux.calls);
@@ -587,7 +673,15 @@ mod tests {
         let panes: Vec<Pane> = (0..4).map(|_| pane("", None)).collect();
         let saved = saved_session(vec![window(1, "alpha", panes)]);
 
-        let report = session(&mut tmux, &saved, Selection::all(), false, false).unwrap();
+        let report = session(
+            &mut tmux,
+            &saved,
+            Selection::all(),
+            &no_autorun(),
+            false,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(report.panes, 2);
         assert_eq!(report.missing_panes, 2);
@@ -604,7 +698,15 @@ mod tests {
         tmux.live_sessions.push("projects".into());
         let saved = saved_session(vec![window(1, "alpha", vec![pane("", None)])]);
 
-        let report = session(&mut tmux, &saved, Selection::all(), false, false).unwrap();
+        let report = session(
+            &mut tmux,
+            &saved,
+            Selection::all(),
+            &no_autorun(),
+            false,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(
             report.windows, 0,
@@ -620,7 +722,15 @@ mod tests {
         tmux.live_sessions.push("projects".into());
         let saved = saved_session(vec![window(1, "alpha", vec![pane("ghx", None)])]);
 
-        let report = session(&mut tmux, &saved, Selection::all(), false, true).unwrap();
+        let report = session(
+            &mut tmux,
+            &saved,
+            Selection::all(),
+            &no_autorun(),
+            false,
+            true,
+        )
+        .unwrap();
 
         assert_eq!(report.windows, 1, "the rebuild happened");
         assert_eq!(
@@ -643,7 +753,15 @@ mod tests {
         tmux.live_sessions.push("projects".into());
         let saved = saved_session(vec![window(1, "alpha", vec![pane("ghx", None)])]);
 
-        let report = session(&mut tmux, &saved, Selection::all(), false, false).unwrap();
+        let report = session(
+            &mut tmux,
+            &saved,
+            Selection::all(),
+            &no_autorun(),
+            false,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(report.windows, 0);
         assert!(tmux.calls.is_empty(), "nothing was touched");
@@ -660,7 +778,15 @@ mod tests {
         tmux.live_sessions.push("projects".into());
         let saved = saved_session(vec![window(1, "alpha", vec![pane("ghx", None)])]);
 
-        let report = session(&mut tmux, &saved, Selection::all(), true, true).unwrap();
+        let report = session(
+            &mut tmux,
+            &saved,
+            Selection::all(),
+            &no_autorun(),
+            true,
+            true,
+        )
+        .unwrap();
 
         assert_eq!(report.windows, 1, "still previews the rebuild");
         assert!(tmux.calls.is_empty(), "a dry run mutates nothing");
@@ -671,7 +797,15 @@ mod tests {
         let mut tmux = Fake::new();
         let saved = saved_session(vec![window(1, "alpha", vec![pane("ghx", None)])]);
 
-        let report = session(&mut tmux, &saved, Selection::all(), false, true).unwrap();
+        let report = session(
+            &mut tmux,
+            &saved,
+            Selection::all(),
+            &no_autorun(),
+            false,
+            true,
+        )
+        .unwrap();
 
         assert_eq!(report.windows, 1);
         assert!(
@@ -690,7 +824,15 @@ mod tests {
         tmux.live_sessions.push("projects".into());
         let saved = saved_session(vec![window(1, "alpha", vec![pane("ghx", None)])]);
 
-        let report = session(&mut tmux, &saved, Selection::all(), true, false).unwrap();
+        let report = session(
+            &mut tmux,
+            &saved,
+            Selection::all(),
+            &no_autorun(),
+            true,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(report.windows, 1);
         assert_eq!(report.commands_prefilled, 1);
@@ -712,6 +854,7 @@ mod tests {
             Selection {
                 windows: Some(&[2]),
             },
+            &no_autorun(),
             false,
             false,
         )
@@ -731,13 +874,170 @@ mod tests {
             vec![pane("", None), pane("ghx", None)],
         )]);
 
-        let report = session(&mut tmux, &saved, Selection::all(), false, false).unwrap();
+        let report = session(
+            &mut tmux,
+            &saved,
+            Selection::all(),
+            &no_autorun(),
+            false,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(report.commands_prefilled, 1, "only the non-empty command");
         assert_eq!(
             tmux.calls.iter().filter(|c| c.starts_with("send ")).count(),
             1
         );
+    }
+
+    #[test]
+    fn a_matching_command_is_submitted_not_just_typed() {
+        let mut tmux = Fake::new();
+        let saved = saved_session(vec![window(
+            1,
+            "alpha",
+            vec![pane("ccproxy claude --model default", Some("abc-123"))],
+        )]);
+
+        let report = session(
+            &mut tmux,
+            &saved,
+            Selection::all(),
+            &autorun(&["claude"]),
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(report.commands_run, 1);
+        assert_eq!(report.commands_prefilled, 0, "counted as run, not both");
+        let sends: Vec<&String> = tmux
+            .calls
+            .iter()
+            .filter(|c| c.starts_with("send ") || c.starts_with("enter "))
+            .collect();
+        assert_eq!(
+            sends,
+            vec![
+                "send projects:0.0 [ccproxy claude --model default --resume abc-123]",
+                "enter projects:0.0",
+            ],
+            "the text lands first, then Enter commits it; calls: {:?}",
+            tmux.calls,
+        );
+    }
+
+    #[test]
+    fn a_command_that_does_not_match_is_left_at_the_prompt() {
+        let mut tmux = Fake::new();
+        let saved = saved_session(vec![window(
+            1,
+            "alpha",
+            vec![pane("nvim ~/.tmux.conf", None)],
+        )]);
+
+        let report = session(
+            &mut tmux,
+            &saved,
+            Selection::all(),
+            &autorun(&["claude"]),
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(report.commands_prefilled, 1);
+        assert_eq!(report.commands_run, 0);
+        assert!(
+            !tmux.calls.iter().any(|c| c.starts_with("enter ")),
+            "nothing was submitted: {:?}",
+            tmux.calls,
+        );
+    }
+
+    #[test]
+    fn the_pattern_sees_the_resume_flag_that_was_appended() {
+        // `--resume <id>` is added after the saved command, so a pattern
+        // written against the restored line has to match the final form.
+        let mut tmux = Fake::new();
+        let saved = saved_session(vec![window(
+            1,
+            "alpha",
+            vec![pane("ccproxy claude", Some("abc-123"))],
+        )]);
+
+        let report = session(
+            &mut tmux,
+            &saved,
+            Selection::all(),
+            &autorun(&["*--resume*"]),
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(report.commands_run, 1);
+    }
+
+    #[test]
+    fn a_dry_run_says_which_commands_would_run_and_starts_none() {
+        // The counts are the only warning the user gets before the one part of
+        // a restore that cannot be undone by pressing ctrl-c at a prompt.
+        let mut tmux = Fake::new();
+        let saved = saved_session(vec![window(
+            1,
+            "alpha",
+            vec![pane("ccproxy claude", None), pane("htop", None)],
+        )]);
+
+        let report = session(
+            &mut tmux,
+            &saved,
+            Selection::all(),
+            &autorun(&["claude"]),
+            true,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(report.commands_run, 1);
+        assert_eq!(report.commands_prefilled, 1);
+        assert!(tmux.calls.is_empty(), "a dry run mutates nothing");
+    }
+
+    #[test]
+    fn every_enter_follows_its_own_send() {
+        // Submitting into a pane whose text has not landed yet runs a partial
+        // line. With two identical commands the ordering is the only thing
+        // that says the pairs did not interleave.
+        let mut tmux = Fake::new();
+        let saved = saved_session(vec![window(
+            1,
+            "alpha",
+            vec![pane("claude", None), pane("claude", None)],
+        )]);
+
+        session(
+            &mut tmux,
+            &saved,
+            Selection::all(),
+            &autorun(&["claude"]),
+            false,
+            false,
+        )
+        .unwrap();
+
+        let seq: Vec<&String> = tmux
+            .calls
+            .iter()
+            .filter(|c| c.starts_with("send ") || c.starts_with("enter "))
+            .collect();
+        assert_eq!(seq.len(), 4);
+        for pair in seq.chunks(2) {
+            assert!(pair[0].starts_with("send "), "text first: {pair:?}");
+            assert!(pair[1].starts_with("enter "), "then Enter: {pair:?}");
+        }
     }
 
     #[test]
