@@ -369,6 +369,51 @@ mod tests {
     }
 
     #[test]
+    fn a_marked_pane_is_marked_in_the_same_column_a_window_is() {
+        // Windows and panes can be selected together; two conventions in one
+        // list would make a mixed selection unreadable.
+        let mut m = model();
+        m.rows.insert(3, pane_row("%42", "claude --resume"));
+        m.marks.insert("%42".into());
+        m.marks.insert("projects:12".into());
+
+        let out = render(&m, 100, 14, 0);
+        let pane = out
+            .lines()
+            .find(|l| l.contains("%42"))
+            .expect("the pane row is on screen");
+        let window = out
+            .lines()
+            .find(|l| l.contains("binpack"))
+            .expect("the window row is on screen");
+
+        assert_eq!(pane.chars().nth(1), Some('#'), "pane row: [{pane}]");
+        assert_eq!(window.chars().nth(1), Some('#'), "window row: [{window}]");
+        assert!(out.contains("1 marked"), "{out}");
+        assert!(out.contains("1 panes marked"), "{out}");
+    }
+
+    #[test]
+    fn choosing_a_destination_says_what_is_moving_and_from_where() {
+        let mut m = model();
+        m.pending_move = Some(crate::ui::model::PendingMove {
+            panes: vec![
+                ("%11".into(), "projects:1".into()),
+                ("%22".into(), "projects:12".into()),
+            ],
+            kind: crate::ui::model::MoveKind::Merge,
+            destination: Some("projects:8".into()),
+        });
+
+        let out = render(&m, 120, 14, 0);
+        let hint = out.lines().last().unwrap_or_default();
+        assert!(hint.contains("2 panes"), "[{hint}]");
+        assert!(hint.contains("projects:1"), "[{hint}]");
+        assert!(hint.contains("/ filter"), "the way to narrow it: [{hint}]");
+        assert!(hint.contains("esc cancel"), "[{hint}]");
+    }
+
+    #[test]
     fn the_key_hint_names_what_r_will_actually_do() {
         let mut m = model();
         let plain = render(&m, 100, 14, 0);
