@@ -81,6 +81,9 @@ enum Command {
         /// Expand this window's panes, e.g. `projects:1`.
         #[arg(long)]
         expand: Option<String>,
+        /// Render the `x` menu over the frame.
+        #[arg(long)]
+        menu: bool,
     },
     /// Show what has changed since a restore point.
     Diff {
@@ -141,7 +144,8 @@ fn main() -> Result<()> {
             height,
             tree,
             expand,
-        } => snapshot(width, height, !tree, expand),
+            menu,
+        } => snapshot(width, height, !tree, expand, menu),
         Command::Doctor { name } => doctor(name),
         Command::Clipboard { target } => ui::clipboard::run(&target.unwrap_or_else(current_pane)),
         Command::CopyMode { target } => copy_mode(&target.unwrap_or_else(current_pane)),
@@ -565,10 +569,17 @@ fn diff(name: Option<String>, all: bool) -> Result<()> {
 
 /// Render one frame at a fixed size. How the layout is reviewed without an
 /// interactive terminal.
-fn snapshot(width: u16, height: u16, searching: bool, expand: Option<String>) -> Result<()> {
+fn snapshot(
+    width: u16,
+    height: u16,
+    searching: bool,
+    expand: Option<String>,
+    menu: bool,
+) -> Result<()> {
     let points = point::list(&layout::save::layout_dir());
     let mut model = ui::model::Model::new(points);
     model.searching = searching;
+    model.menu = menu;
     if let Some(target) = expand {
         model.expanded.insert(target);
     }

@@ -13,7 +13,7 @@ use ratatui::backend::CrosstermBackend;
 
 use std::collections::HashMap;
 
-use super::model::{Model, MoveKind, Row, WindowRow};
+use super::model::{ActionKind, Model, MoveKind, Row, WindowRow, actions};
 use crate::collect::{cmd, notify, proc, tmux};
 use crate::config;
 use crate::layout::{point, restore, save};
@@ -117,6 +117,15 @@ fn event_loop(terminal: &mut Term, model: &mut Model, focus: Option<String>) -> 
         // Tick: re-read the world, but only redraw when the display would
         // differ. On an idle workspace this leaves the app at 0 fps.
         next_tick = Instant::now() + TICK;
+        // Not while the `x` menu is up. It names what it would act on -- "2
+        // panes", "3 windows" -- and a poll landing between the prompt and the
+        // keypress would move the cursor or drop a mark, so the command would
+        // act on something other than what was on screen when it was chosen.
+        // The menu is a momentary mode; a stale tree for a second is the
+        // cheaper of the two.
+        if model.menu {
+            continue;
+        }
         reload(model)?;
         let current = model.fingerprint();
         if current != last {
@@ -188,11 +197,43 @@ fn handle_key(model: &mut Model, code: KeyCode, mods: KeyModifiers) -> Result<()
             KeyCode::Char('k') | KeyCode::Up => {
                 model.move_destination(-1);
             }
-            KeyCode::Enter | KeyCode::Char('J') | KeyCode::Char('M') => confirm_move(model)?,
+            KeyCode::Enter => confirm_move(model)?,
             _ => {
                 model.status =
                     "choose a window: j/k move, / filter, Enter confirm, Esc cancel".into();
             }
+        }
+        return Ok(());
+    }
+
+    // The `x` menu is waiting for its second key. It sits above the tree keys
+    // so `b`, `j`, `m`, `s` and `k` mean the menu's commands here and their
+    // ordinary selves outside it.
+    if model.menu {
+        // Cleared before anything is matched, so the menu is one-shot by
+        // construction: Esc, an unknown letter and a command that ran all
+        // leave it closed without an arm each.
+        model.menu = false;
+        match code {
+            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => model.quit = true,
+            // The prefix again is the old `x`: one tap opens the menu, the
+            // second lands on the command `x` alone used to be. The muscle
+            // memory still works, and in two keystrokes rather than one.
+            // Routed through the table like any other key, so it reports an
+            // unavailable close the same way `k` does.
+            KeyCode::Char(c) => match actions(model)
+                .into_iter()
+                .find(|a| a.key == if c == 'x' { 'k' } else { c })
+            {
+                Some(action) if action.enabled => run_action(model, action.kind)?,
+                // A greyed row already says what is missing; pressing it
+                // should say the same thing rather than close in silence.
+                Some(action) => model.status = format!("{} — {}", action.label, action.detail),
+                // Never offered, so it does nothing. A complaint here would
+                // be noise on the screen that was showing the answer.
+                None => {}
+            },
+            _ => {}
         }
         return Ok(());
     }
@@ -296,11 +337,11 @@ fn handle_key(model: &mut Model, code: KeyCode, mods: KeyModifiers) -> Result<()
             }
         }
 
-        KeyCode::Char('m') => move_windows(model)?,
-        KeyCode::Char('b') => break_panes(model)?,
-        KeyCode::Char('J') => move_panes(model)?,
-        KeyCode::Char('M') => merge_windows(model)?,
-        KeyCode::Char('x') => kill_windows(model)?,
+        // Everything that rearranges tmux lives behind `x`. As five top-level
+        // letters they were the least used keys in the app and had taken the
+        // most memorable ones: `x` meant kill, and `m` and `M` meant two
+        // moves with nothing in common.
+        KeyCode::Char('x') => model.menu = true,
 
         KeyCode::Char('R') => reload(model)?,
         _ => {}
@@ -431,6 +472,18 @@ fn restore_marked(model: &mut Model) -> Result<()> {
         notes.join("; ")
     };
     Ok(())
+}
+
+/// Run a menu command. Exhaustive over `ActionKind`, which is what keeps the
+/// menu and the commands from drifting apart.
+fn run_action(model: &mut Model, kind: ActionKind) -> Result<()> {
+    match kind {
+        ActionKind::Break => break_panes(model),
+        ActionKind::Join => move_panes(model),
+        ActionKind::Merge => merge_windows(model),
+        ActionKind::Send => move_windows(model),
+        ActionKind::Kill => kill_windows(model),
+    }
 }
 
 /// `session:index` for a live pane.
@@ -653,7 +706,7 @@ fn move_panes(model: &mut Model) -> Result<()> {
         many => format!("{} panes", many.len()),
     };
     if model.begin_move(chosen, MoveKind::Panes) {
-        model.status = format!("moving {what}: choose a window, then Enter or J");
+        model.status = format!("moving {what}: choose a window, then Enter");
     } else {
         model.status = "no other live window to move that into".into();
     }
@@ -670,7 +723,7 @@ fn move_panes(model: &mut Model) -> Result<()> {
 fn merge_windows(model: &mut Model) -> Result<()> {
     let sources = model.marked_live_windows();
     if sources.len() < 2 {
-        model.status = "mark two or more windows with space, then M".into();
+        model.status = "mark two or more windows with space, then x m".into();
         return Ok(());
     }
 
@@ -1091,10 +1144,77 @@ mod tests {
         let mut m = model_with_two_windows();
         m.marks.insert("projects:1".into());
 
-        press(&mut m, 'M', KeyModifiers::NONE);
+        press(&mut m, 'x', KeyModifiers::NONE);
+        press(&mut m, 'm', KeyModifiers::NONE);
 
         assert!(m.pending_move.is_none(), "nothing was started");
         assert!(m.status.contains("two or more"), "status: {}", m.status);
+    }
+
+    #[test]
+    fn the_menu_opens_on_x_and_closes_on_the_key_it_ran() {
+        let mut m = model_with_two_windows();
+        press(&mut m, 'x', KeyModifiers::NONE);
+        assert!(m.menu, "x opens the menu");
+
+        let _ = handle_key(&mut m, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!m.menu, "Esc closes it");
+        assert!(!m.quit, "without leaving the app");
+    }
+
+    #[test]
+    fn a_letter_that_is_not_in_the_menu_just_closes_it() {
+        // Not an error: `x` then a mistyped letter is a slip, and a complaint
+        // about it would be noise on a screen that was showing the answer.
+        let mut m = model_with_two_windows();
+        press(&mut m, 'x', KeyModifiers::NONE);
+        press(&mut m, 'z', KeyModifiers::NONE);
+
+        assert!(!m.menu);
+        assert!(m.status.is_empty(), "status: {}", m.status);
+        assert!(!m.quit);
+    }
+
+    #[test]
+    fn a_disabled_row_says_what_is_missing_when_pressed() {
+        // The menu shows the reason greyed out; pressing it must not silently
+        // do nothing, which reads as a broken key.
+        let mut m = model_with_two_windows();
+        press(&mut m, 'x', KeyModifiers::NONE);
+        press(&mut m, 'b', KeyModifiers::NONE); // break, with no pane selected
+
+        assert!(!m.menu);
+        assert!(m.status.contains("needs a pane"), "status: {}", m.status);
+    }
+
+    #[test]
+    fn the_menu_shields_the_tree_keys() {
+        // `j` moves the cursor in the tree and joins inside the menu. Whichever
+        // it means, it must not do both.
+        let mut m = model_with_two_windows();
+        let before = m.cursor;
+        press(&mut m, 'x', KeyModifiers::NONE);
+        press(&mut m, 'j', KeyModifiers::NONE);
+
+        assert_eq!(m.cursor, before, "j did not also move the cursor");
+    }
+
+    #[test]
+    fn the_prefix_twice_is_the_close_it_used_to_be() {
+        // `x` alone killed a window before this menu existed. Two taps still
+        // reach it, which keeps the muscle memory and is strictly safer than
+        // the single press it replaces.
+        let mut m = model_with_two_windows();
+        press(&mut m, 'x', KeyModifiers::NONE);
+
+        assert_eq!(
+            actions(&m)
+                .into_iter()
+                .find(|a| a.kind == ActionKind::Kill)
+                .map(|a| a.enabled),
+            Some(true),
+            "a live window is selected, so close is on offer",
+        );
     }
 
     #[test]

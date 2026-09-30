@@ -4,9 +4,9 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
-use super::model::{Model, Row};
+use super::model::{Model, Row, actions};
 use crate::clock;
 use crate::layout::diff::Change;
 
@@ -49,6 +49,142 @@ pub fn draw(frame: &mut Frame, model: &Model, now_secs: u64) {
     }
 
     render_keys(frame, rows[2], model);
+
+    // Last, so it sits over the tree and the panel both.
+    if model.menu {
+        render_menu(frame, rows[1], model);
+    }
+}
+
+/// The `x` menu: every window and pane command, with what each would act on.
+///
+/// Floating rather than a panel swap, because it is momentary and because
+/// covering the tree is the point — the commands act on the selection, which
+/// the title line names, not on whatever the cursor is passing over.
+fn render_menu(frame: &mut Frame, body: Rect, model: &Model) {
+    let entries = actions(model);
+    let title = format!(" x  {} ", menu_target(model));
+
+    // Sized to its contents: the detail column is right-aligned, so the box
+    // has to know the widest row before it can place anything.
+    let keys: Vec<String> = entries
+        .iter()
+        .map(|a| format!("{}:{}", a.key, a.label))
+        .collect();
+    let widest_key = keys.iter().map(|k| k.chars().count()).max().unwrap_or(0);
+    let widest_detail = entries
+        .iter()
+        .map(|a| a.detail.chars().count())
+        .max()
+        .unwrap_or(0);
+    const GAP: usize = 3;
+    let inner = (widest_key + GAP + widest_detail)
+        .max(title.chars().count())
+        .max("esc cancel".len());
+    // +2 for the border, +2 for a column of padding either side.
+    let width = (inner as u16 + 4).min(body.width);
+    // One row per action, one for the footer, one blank above it.
+    let height = (entries.len() as u16 + 2 + 2).min(body.height);
+    let area = centred(body, width, height);
+
+    let usable = area.width.saturating_sub(4) as usize;
+    // The box is capped by the terminal, so on a narrow one the detail is
+    // what gives. Cut explicitly rather than letting the paragraph clip it:
+    // `needs a pane - l expan` reads as a typo, `needs a pane…` as a cut.
+    let budget = usable.saturating_sub(widest_key + GAP);
+    let mut lines: Vec<Line> = entries
+        .iter()
+        .zip(&keys)
+        .map(|(action, key)| {
+            let detail = truncate(&action.detail, budget);
+            let pad = usable
+                .saturating_sub(widest_key + detail.chars().count())
+                .max(1);
+            let (key_style, label_style) = if action.enabled {
+                (
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                    Style::default(),
+                )
+            } else {
+                // Greyed rather than hidden. With five commands the reason a
+                // row is unavailable is the useful part — "needs two or more
+                // marked" is how you learn merge takes a selection at all —
+                // and a menu that changes shape teaches nothing.
+                (
+                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::DarkGray),
+                )
+            };
+            let (k, label) = key.split_at(1);
+            Line::from(vec![
+                Span::styled(k.to_string(), key_style),
+                Span::styled(label.to_string(), label_style),
+                Span::raw(" ".repeat(widest_key - key.chars().count() + pad)),
+                Span::styled(detail, Style::default().fg(Color::DarkGray)),
+            ])
+        })
+        .collect();
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "esc cancel",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(Span::styled(
+                    truncate(&title, area.width.saturating_sub(4) as usize),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ))
+                .padding(ratatui::widgets::Padding::horizontal(1)),
+        ),
+        area,
+    );
+}
+
+/// What the menu's commands would act on, for its title.
+///
+/// The selection, when there is one — the commands prefer it over the cursor,
+/// so the title has to as well or the box would name a window it will not
+/// touch.
+fn menu_target(model: &Model) -> String {
+    let (windows, panes) = model.mark_counts();
+    let mut parts = Vec::new();
+    if windows > 0 {
+        parts.push(format!("{windows} window{}", plural(windows)));
+    }
+    if panes > 0 {
+        parts.push(format!("{panes} pane{}", plural(panes)));
+    }
+    if !parts.is_empty() {
+        return format!("{} marked", parts.join(", "));
+    }
+    match (model.current_pane(), model.current_window()) {
+        (Some(p), _) => p.target().to_string(),
+        (None, Some(w)) => format!("{}  {}", w.target(), w.name),
+        _ => "nothing selected".to_string(),
+    }
+}
+
+fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
+}
+
+/// A box of this size in the middle of `area`.
+fn centred(area: Rect, width: u16, height: u16) -> Rect {
+    Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    }
 }
 
 fn render_header(frame: &mut Frame, area: Rect, model: &Model, now_secs: u64) {
@@ -415,6 +551,18 @@ fn render_preview(frame: &mut Frame, area: Rect, model: &Model, w: &super::model
 }
 
 fn render_keys(frame: &mut Frame, area: Rect, model: &Model) {
+    // While the menu is up its letters mean the menu's commands. Leaving the
+    // tree's hints on screen would advertise `j/k move` at the moment `j`
+    // joins panes into a window.
+    if model.menu {
+        frame.render_widget(
+            Paragraph::new("a letter runs it   esc cancel")
+                .style(Style::default().fg(Color::DarkGray)),
+            area,
+        );
+        return;
+    }
+
     if let Some(moving) = &model.pending_move {
         let what = match moving.panes.as_slice() {
             [(pane, from)] => format!("moving {pane} from {from}"),
@@ -465,7 +613,10 @@ fn render_keys(frame: &mut Frame, area: Rect, model: &Model) {
         // like they act on nothing.
         "l/h panes".to_string(),
         "s save  n waiting".to_string(),
-        "b break  J join  M merge  m move  x kill".to_string(),
+        // One entry now, because the menu behind it is self-describing --
+        // and because a hint line that spelled all five was the thing that
+        // pushed `p/P point` off the end of a narrow terminal.
+        "x window/pane".to_string(),
         "p/P point".to_string(),
     ];
 

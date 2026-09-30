@@ -152,6 +152,116 @@ impl PendingMove {
     }
 }
 
+/// A window- or pane-level tmux command, reached through the `x` menu.
+///
+/// The variants are what `app` matches on, so the menu and the dispatch come
+/// from one list: adding a command here fails to compile until it is handled.
+/// They used to be five separate top-level letters, which is how `x` came to
+/// mean "kill" and `m` and `M` came to mean two unrelated moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActionKind {
+    Break,
+    Join,
+    Merge,
+    Send,
+    Kill,
+}
+
+/// One row of the `x` menu.
+pub struct Action {
+    pub kind: ActionKind,
+    pub key: char,
+    pub label: &'static str,
+    /// What it would act on right now, or why it cannot — the menu shows this
+    /// either way, so a greyed row says what is missing rather than just
+    /// refusing.
+    pub detail: String,
+    pub enabled: bool,
+}
+
+/// The `x` menu, in a fixed order, with each row's availability resolved
+/// against the current selection.
+///
+/// Every command is listed whether or not it applies. Hiding the ones that do
+/// not would make the menu change shape under the cursor and would never
+/// teach what the missing ingredient was — "merge" greyed out with "mark two
+/// or more windows" is the whole answer, and it is on screen at the moment
+/// the question arises.
+pub fn actions(model: &Model) -> Vec<Action> {
+    let panes = model.selected_pane_count();
+    let windows = model.selected_window_count();
+    let live_windows = model
+        .rows
+        .iter()
+        .filter(|r| matches!(r, Row::Window(w) if !w.gone))
+        .count();
+    let merging = model.marked_live_windows().len();
+
+    let panes_detail = match panes {
+        0 => "needs a pane — l expands".to_string(),
+        1 => "1 pane".to_string(),
+        n => format!("{n} panes"),
+    };
+    let windows_detail = match windows {
+        0 => "needs a window".to_string(),
+        1 => "1 window".to_string(),
+        n => format!("{n} windows"),
+    };
+
+    vec![
+        Action {
+            kind: ActionKind::Break,
+            key: 'b',
+            label: "break out",
+            detail: panes_detail.clone(),
+            enabled: panes > 0,
+        },
+        Action {
+            kind: ActionKind::Join,
+            key: 'j',
+            label: "join into a window",
+            detail: if panes > 0 && live_windows < 2 {
+                "no other window".to_string()
+            } else {
+                panes_detail
+            },
+            enabled: panes > 0 && live_windows >= 2,
+        },
+        Action {
+            kind: ActionKind::Merge,
+            key: 'm',
+            label: "merge windows",
+            detail: if merging >= 2 {
+                format!("{merging} windows")
+            } else {
+                "needs two or more marked".to_string()
+            },
+            enabled: merging >= 2,
+        },
+        Action {
+            kind: ActionKind::Send,
+            key: 's',
+            label: "send to other session",
+            detail: if windows > 0 && model.live_sessions() != 2 {
+                match model.live_sessions() {
+                    0 | 1 => "no other session".to_string(),
+                    n => format!("{n} sessions — ambiguous"),
+                }
+            } else {
+                windows_detail.clone()
+            },
+            enabled: windows > 0 && model.live_sessions() == 2,
+        },
+        Action {
+            kind: ActionKind::Kill,
+            key: 'k',
+            label: "close",
+            detail: windows_detail,
+            enabled: windows > 0,
+        },
+    ]
+}
+
 /// The TUI's whole state.
 pub struct Model {
     pub rows: Vec<Row>,
@@ -173,6 +283,8 @@ pub struct Model {
     pub status: String,
     /// Set after `J` or `M`, until a destination window is confirmed.
     pub pending_move: Option<PendingMove>,
+    /// True while the `x` menu is open and waiting for the second key.
+    pub menu: bool,
     /// Typed search. Empty means the whole tree is shown.
     pub search: String,
     /// True while the search line is accepting keys.
@@ -202,6 +314,7 @@ impl Model {
             quit: false,
             status: String::new(),
             pending_move: None,
+            menu: false,
             search: String::new(),
             searching: false,
             stale_build: check_build(),
@@ -643,6 +756,41 @@ impl Model {
             .collect();
         out.sort();
         out
+    }
+
+    /// How many panes a pane command would act on: the marked ones, or the
+    /// one under the cursor.
+    pub fn selected_pane_count(&self) -> usize {
+        match self.marked_panes().len() {
+            0 => usize::from(self.current_pane().is_some()),
+            n => n,
+        }
+    }
+
+    /// How many live windows a window command would act on.
+    pub fn selected_window_count(&self) -> usize {
+        match self.marked_live_windows().len() {
+            0 => usize::from(self.current_window().is_some_and(|w| !w.gone)),
+            n => n,
+        }
+    }
+
+    /// Sessions with at least one window still running.
+    ///
+    /// Counted from the tree rather than asked of tmux: the menu is redrawn
+    /// on every keystroke, and a session header can exist for a session that
+    /// only the restore point has.
+    pub fn live_sessions(&self) -> usize {
+        let mut seen: Vec<&str> = Vec::new();
+        for row in &self.rows {
+            if let Row::Window(w) = row
+                && !w.gone
+                && !seen.contains(&w.session.as_str())
+            {
+                seen.push(&w.session);
+            }
+        }
+        seen.len()
     }
 
     /// How many windows and panes are marked, for the header.

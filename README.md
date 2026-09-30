@@ -100,8 +100,8 @@ describing where you already are rather than some other session's first
 window.
 
 `Esc` pops one level each press: a destination filter, then a pending pane
-move, then the search line, then the app. Pressing it twice from where the TUI
-opens leaves.
+move or the `x` menu, then the search line, then the app. Pressing it twice
+from where the TUI opens leaves.
 
 **Searching**
 
@@ -127,28 +127,61 @@ opens leaves.
 | `s` | save a point now |
 | `p` / `P` | next / previous restore point |
 | `l` / `h` | expand a window to its panes / collapse |
-| `b` | break the selected panes out, each into its own window |
-| `J` | choose a destination window for the selected panes |
-| `M` | merge the marked windows into one |
-| `m` / `x` | move the marked windows to the other session / close them |
+| `x` | the window and pane menu, below |
 | `q`, `Esc`, `Ctrl-C` | quit |
 
-**Choosing a destination** (after `J` or `M`)
+**`x` — rearranging tmux**
+
+Everything that moves a window or a pane lives behind `x`, and pressing it
+shows what is on offer:
+
+```
+╭ x  local:14  tmc ──────────────────────────────────╮
+│ b:break out               needs a pane — l expands │
+│ j:join into a window      needs a pane — l expands │
+│ m:merge windows           needs two or more marked │
+│ s:send to other session           no other session │
+│ k:close                                   1 window │
+│                                                    │
+│ esc cancel                                         │
+╰────────────────────────────────────────────────────╯
+```
+
+| | |
+|---|---|
+| `x b` | break the selected panes out, each into its own window |
+| `x j` | join the selected panes into a window you pick |
+| `x m` | merge the marked windows into one |
+| `x s` | send the selected windows to the other session |
+| `x k`, `x x` | close the selected windows |
+
+The title names what the commands would act on — the marked windows and panes,
+or the row under the cursor when nothing is marked. The right column says what
+each one would do with that, or what it is missing, and a greyed row says the
+same thing if you press it anyway. Any other key closes the menu and does
+nothing.
+
+These were five top-level letters until they were not: they are the least
+used keys in the app and had taken the most memorable ones — `x` meant kill,
+and `m` and `M` meant two moves with nothing in common. Nothing is polled while
+the menu is up, so what it says it will act on is still true when the key lands.
+
+**Choosing a destination** (after `x j` or `x m`)
 
 | | |
 |---|---|
 | `j`/`k`, arrows | move among live windows |
 | `/` | narrow them by typing; `Esc` closes the filter |
-| `Enter`, `J`, `M` | confirm |
+| `Enter` | confirm |
 | `Esc` | cancel the move |
 
 ## Marks are a selection, not a queue
 
 `space` marks whatever is under the cursor, and the next command decides what
-that meant: `r` restores the marked windows, `M` merges them, `m` moves them,
-`x` closes them, and with panes marked instead, `b` breaks them out and `J`
-moves them. Only the marks a command consumed are dropped, so windows staged
-for `r` survive a pane move made on the way.
+that meant: `r` restores the marked windows, `x m` merges them, `x s` sends
+them to the other session, `x k` closes them, and with panes marked instead,
+`x b` breaks them out and `x j` moves them. Only the marks a command consumed
+are dropped, so windows staged for `r` survive a pane move made on the way.
 
 With nothing marked, the pane and window commands act on the cursor — the
 one-window case stays one keystroke.
@@ -284,7 +317,8 @@ With 27 windows and 100 paste buffers, a picker that wants the exact letters
 in order is a filter, not a search. Smart case: a lowercase query ignores
 case, an uppercase one means it.
 
-`snapshot --tree` renders the tree instead of the opening search line.
+`snapshot --tree` renders the tree instead of the opening search line, and
+`--menu` draws the `x` menu over it.
 
 `snapshot` renders one frame without an interactive terminal, which is how the
 layout is reviewed. It has already caught a real bug: every window rendering
