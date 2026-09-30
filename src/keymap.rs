@@ -69,6 +69,15 @@ pub fn normalize(code: KeyCode, mods: KeyModifiers) -> KeyCode {
         return code;
     };
     match hangul_to_latin(ch) {
+        // Most keys produce the same jamo shifted or not -- shift+ㅡ is still
+        // `ㅡ` -- so the table can only map them to the unshifted letter and
+        // the shift has to be put back here, or `J`, `M`, `G` and `P` arrive
+        // as their lowercase twins and do the wrong thing. The seven keys that
+        // do have a distinct shifted jamo are already uppercase in the table,
+        // where this is a no-op.
+        Some(latin) if mods.contains(KeyModifiers::SHIFT) => {
+            KeyCode::Char(latin.to_ascii_uppercase())
+        }
         Some(latin) => KeyCode::Char(latin),
         None => code,
     }
@@ -112,6 +121,26 @@ mod tests {
         assert_eq!(
             normalize(KeyCode::Char('ㅃ'), KeyModifiers::SHIFT),
             KeyCode::Char('Q')
+        );
+    }
+
+    #[test]
+    fn shift_survives_a_key_with_no_distinct_shifted_jamo() {
+        // `ㅡ` is what the physical `m` key sends shifted or not, so the shift
+        // is only in the modifiers. Without putting it back, `M` (merge) would
+        // arrive as `m` (move to the other session) -- two very different
+        // things to press by accident.
+        assert_eq!(
+            normalize(KeyCode::Char('ㅡ'), KeyModifiers::SHIFT),
+            KeyCode::Char('M')
+        );
+        assert_eq!(
+            normalize(KeyCode::Char('ㅡ'), KeyModifiers::NONE),
+            KeyCode::Char('m')
+        );
+        assert_eq!(
+            normalize(KeyCode::Char('ㅓ'), KeyModifiers::SHIFT),
+            KeyCode::Char('J')
         );
     }
 

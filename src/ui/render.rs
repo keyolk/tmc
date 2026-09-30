@@ -94,8 +94,15 @@ fn render_header(frame: &mut Frame, area: Rect, model: &Model, now_secs: u64) {
             Style::default().fg(Color::Yellow),
         ));
     }
-    if !model.marks.is_empty() {
-        summary.push(Span::raw(format!("  {} marked", model.marks.len())));
+    // Windows and panes are marked with the same key but act differently —
+    // `M` merges the windows, `J` moves the panes — so the header counts them
+    // apart rather than reporting one number for two selections.
+    let (windows_marked, panes_marked) = model.mark_counts();
+    if windows_marked > 0 {
+        summary.push(Span::raw(format!("  {windows_marked} marked")));
+    }
+    if panes_marked > 0 {
+        summary.push(Span::raw(format!("  {panes_marked} panes marked")));
     }
     // A binary older than the source is invisible otherwise: you notice it by
     // wondering why a feature you just wrote does nothing. Says so rather than
@@ -181,13 +188,20 @@ fn render_row<'a>(row: &'a Row, selected: bool, model: &Model, width: usize) -> 
             // `b`/`J` unambiguous rather than "whichever tmux considers
             // active".
             let cursor = if selected { '>' } else { ' ' };
+            // Same column as a window's mark, so a mixed selection reads as
+            // one list rather than two conventions.
+            let mark = if model.marks.contains(p.target()) {
+                '#'
+            } else {
+                ' '
+            };
             let command = if p.command.is_empty() {
                 "(shell)".to_string()
             } else {
                 p.command.clone()
             };
             Line::from(vec![
-                Span::raw(format!("{cursor}    ")),
+                Span::raw(format!("{cursor}{mark}   ")),
                 Span::styled(
                     format!("{:<5}", p.pane_id),
                     Style::default().fg(Color::DarkGray),
@@ -401,11 +415,20 @@ fn render_preview(frame: &mut Frame, area: Rect, model: &Model, w: &super::model
 }
 
 fn render_keys(frame: &mut Frame, area: Rect, model: &Model) {
-    if let Some(moving) = &model.pane_move {
-        let text = format!(
-            "moving {} from {}   j/k choose window   ⏎/J move   esc cancel   q quit",
-            moving.pane, moving.from,
-        );
+    if let Some(moving) = &model.pending_move {
+        let what = match moving.panes.as_slice() {
+            [(pane, from)] => format!("moving {pane} from {from}"),
+            panes => format!(
+                "moving {} panes from {}",
+                panes.len(),
+                moving.sources().join(", ")
+            ),
+        };
+        let text = if model.searching {
+            format!("{what}   /{}▌   ⏎ confirm   esc filter off", model.search)
+        } else {
+            format!("{what}   j/k window   / filter   ⏎ confirm   esc cancel")
+        };
         frame.render_widget(
             Paragraph::new(truncate(&text, area.width as usize))
                 .style(Style::default().fg(Color::Yellow)),
@@ -442,7 +465,7 @@ fn render_keys(frame: &mut Frame, area: Rect, model: &Model) {
         // like they act on nothing.
         "l/h panes".to_string(),
         "s save  n waiting".to_string(),
-        "b break  J join  m move  x kill".to_string(),
+        "b break  J join  M merge  m move  x kill".to_string(),
         "p/P point".to_string(),
     ];
 

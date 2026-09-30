@@ -11,8 +11,10 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use super::model::{Model, WindowRow};
-use crate::collect::{notify, proc, tmux};
+use std::collections::HashMap;
+
+use super::model::{Model, MoveKind, Row, WindowRow};
+use crate::collect::{cmd, notify, proc, tmux};
 use crate::config;
 use crate::layout::{point, restore, save};
 
@@ -137,26 +139,59 @@ fn handle_key(model: &mut Model, code: KeyCode, mods: KeyModifiers) -> Result<()
         crate::keymap::normalize(code, mods)
     };
 
-    // A pane has been picked and only a destination window is selectable. Deal
+    // Panes have been picked and only a destination window is selectable. Deal
     // with this before the ordinary tree keys so Enter cannot switch windows
     // and Esc cannot quit while the user is in the middle of choosing.
-    if model.pane_move.is_some() {
-        match code {
-            KeyCode::Esc => {
-                model.pane_move = None;
-                model.status = "pane move cancelled".into();
+    if model.pending_move.is_some() {
+        // Typing filters the destinations. With 28 windows open, walking to
+        // one with j/k is the slow half of the move — and the query is thrown
+        // away on the way out, so it never leaks into the tree afterwards.
+        if model.searching {
+            match code {
+                KeyCode::Esc | KeyCode::Tab => model.searching = false,
+                KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => model.quit = true,
+                KeyCode::Char('n') if mods.contains(KeyModifiers::CONTROL) => {
+                    model.move_destination(1);
+                }
+                KeyCode::Char('p') if mods.contains(KeyModifiers::CONTROL) => {
+                    model.move_destination(-1);
+                }
+                KeyCode::Enter => confirm_move(model)?,
+                KeyCode::Down => {
+                    model.move_destination(1);
+                }
+                KeyCode::Up => {
+                    model.move_destination(-1);
+                }
+                KeyCode::Backspace => {
+                    model.search_pop();
+                    // The filter moved the rows under the cursor; land it back
+                    // on a window that can actually receive the panes.
+                    model.move_destination(0);
+                }
+                KeyCode::Char(c) => {
+                    model.search_push(c);
+                    model.move_destination(0);
+                }
+                _ => {}
             }
+            return Ok(());
+        }
+        match code {
+            KeyCode::Esc => cancel_move(model),
             KeyCode::Char('q') => model.quit = true,
             KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => model.quit = true,
+            KeyCode::Char('/') => model.searching = true,
             KeyCode::Char('j') | KeyCode::Down => {
                 model.move_destination(1);
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 model.move_destination(-1);
             }
-            KeyCode::Enter | KeyCode::Char('J') => join_pane(model)?,
+            KeyCode::Enter | KeyCode::Char('J') | KeyCode::Char('M') => confirm_move(model)?,
             _ => {
-                model.status = "choose a window: j/k move, Enter join, Esc cancel".into();
+                model.status =
+                    "choose a window: j/k move, / filter, Enter confirm, Esc cancel".into();
             }
         }
         return Ok(());
@@ -261,10 +296,11 @@ fn handle_key(model: &mut Model, code: KeyCode, mods: KeyModifiers) -> Result<()
             }
         }
 
-        KeyCode::Char('m') => move_window(model)?,
-        KeyCode::Char('b') => break_pane(model)?,
-        KeyCode::Char('J') => join_pane(model)?,
-        KeyCode::Char('x') => kill_window(model)?,
+        KeyCode::Char('m') => move_windows(model)?,
+        KeyCode::Char('b') => break_panes(model)?,
+        KeyCode::Char('J') => move_panes(model)?,
+        KeyCode::Char('M') => merge_windows(model)?,
+        KeyCode::Char('x') => kill_windows(model)?,
 
         KeyCode::Char('R') => reload(model)?,
         _ => {}
@@ -397,76 +433,171 @@ fn restore_marked(model: &mut Model) -> Result<()> {
     Ok(())
 }
 
-/// Move the selected window to the other session.
+/// `session:index` for a live pane.
+fn window_of(p: &tmux::Pane) -> String {
+    format!("{}:{}", p.session, p.window_index)
+}
+
+/// The panes a pane command acts on: the marked ones, or the one under the
+/// cursor.
+///
+/// Marking is how you say "these"; the cursor fallback keeps the single-pane
+/// case one keystroke. Resolved against the live pane list rather than the
+/// tree, because a mark survives collapsing its window and by then the row it
+/// came from is gone.
+fn selected_panes(model: &Model, live: &[tmux::Pane]) -> Vec<(String, String)> {
+    let marked = model.marked_panes();
+    if marked.is_empty() {
+        return model
+            .current_pane()
+            .map(|p| vec![(p.target().to_string(), p.window_target())])
+            .unwrap_or_default();
+    }
+    live.iter()
+        .filter(|p| marked.contains(&p.pane_id))
+        .map(|p| (p.pane_id.clone(), window_of(p)))
+        .collect()
+}
+
+/// The live windows a window command acts on: the marked ones, or the one
+/// under the cursor.
+fn selected_windows(model: &Model) -> Vec<String> {
+    let marked = model.marked_live_windows();
+    if !marked.is_empty() {
+        return marked;
+    }
+    model
+        .current_window()
+        .filter(|w| !w.gone)
+        .map(|w| vec![w.target()])
+        .unwrap_or_default()
+}
+
+/// One status line: what happened, then what did not.
+fn report(done: String, failed: Vec<String>) -> String {
+    if failed.is_empty() {
+        done
+    } else {
+        format!("{done}; failed: {}", failed.join(", "))
+    }
+}
+
+/// Move the selected windows to the other session.
 ///
 /// With two sessions the destination is unambiguous, which is the whole reason
 /// this is one keystroke here and a prompt in tmux.sh. With more, the status
 /// line says what to do instead of guessing.
-fn move_window(model: &mut Model) -> Result<()> {
-    let Some(w) = model.current_window() else {
-        return Ok(());
-    };
-    if w.gone {
+fn move_windows(model: &mut Model) -> Result<()> {
+    let targets = selected_windows(model);
+    if targets.is_empty() {
         model.status = "that window is not running".into();
         return Ok(());
     }
-    let target = w.target();
-    let here = w.session.clone();
 
-    let others: Vec<String> = sessions()?.into_iter().filter(|s| *s != here).collect();
-    match others.as_slice() {
-        [] => model.status = "no other session to move to".into(),
-        [dest] => {
-            crate::collect::cmd::run(
-                "tmux",
-                &["move-window", "-s", &target, "-t", &format!("{dest}:")],
-                crate::collect::cmd::FAST,
-            )?;
-            // move-window leaves a hole; tmux only renumbers on close.
-            let _ = crate::collect::cmd::run(
-                "tmux",
-                &["move-window", "-r", "-t", &here],
-                crate::collect::cmd::FAST,
-            );
-            reload(model)?;
-            model.status = format!("moved {target} to {dest}");
-        }
-        many => {
-            model.status = format!("several destinations ({}); use tmux directly", many.len());
+    let all = sessions()?;
+    if all.len() < 2 {
+        model.status = "no other session to move to".into();
+        return Ok(());
+    }
+    if all.len() > 2 {
+        model.status = format!(
+            "several destinations ({}); use tmux directly",
+            all.len() - 1
+        );
+        return Ok(());
+    }
+
+    let mut moved = 0;
+    let mut failed = Vec::new();
+    let mut emptied: Vec<String> = Vec::new();
+    for target in &targets {
+        let here = target.split(':').next().unwrap_or_default().to_string();
+        let Some(dest) = all.iter().find(|s| **s != here) else {
+            continue;
+        };
+        match cmd::run(
+            "tmux",
+            &["move-window", "-s", target, "-t", &format!("{dest}:")],
+            cmd::FAST,
+        ) {
+            Ok(_) => {
+                moved += 1;
+                if !emptied.contains(&here) {
+                    emptied.push(here);
+                }
+            }
+            Err(e) => failed.push(format!("{target}: {e}")),
         }
     }
+
+    // move-window leaves a hole; tmux only renumbers on close. Deferred until
+    // every window has moved, because renumbering mid-loop would invalidate
+    // the `session:index` targets still waiting their turn.
+    for session in &emptied {
+        let _ = cmd::run("tmux", &["move-window", "-r", "-t", session], cmd::FAST);
+    }
+
+    model.unmark(&targets);
+    reload(model)?;
+    model.status = report(format!("moved {moved} window(s)"), failed);
     Ok(())
 }
 
-/// Break the selected pane into a window of its own.
+/// Break the selected panes out, each into a window of its own.
 ///
-/// Requires a pane to be selected. Addressing this by window — which an
+/// Requires panes to be selected. Addressing this by window — which an
 /// earlier version did — makes tmux use that window's *active* pane, so the
 /// thing that moved was not the thing on screen.
-fn break_pane(model: &mut Model) -> Result<()> {
-    let Some(p) = model.current_pane() else {
-        model.status = "select a pane first — enter expands a window".into();
-        return Ok(());
-    };
-    let pane = p.target().to_string();
-    let from = p.window_target();
-
-    // Breaking the only pane just renames its window.
-    if model.current_window().is_some_and(|w| w.panes < 2) {
-        model.status = "that window has a single pane; nothing to break out".into();
+fn break_panes(model: &mut Model) -> Result<()> {
+    let live = tmux::panes().unwrap_or_default();
+    let chosen = selected_panes(model, &live);
+    if chosen.is_empty() {
+        model.status = "select a pane first — l expands a window, space marks one".into();
         return Ok(());
     }
 
-    // `-d` leaves the focus where it is: this is a popup, and stealing the
-    // client to the new window would drop the user somewhere they did not ask
-    // to be.
-    crate::collect::cmd::run(
-        "tmux",
-        &["break-pane", "-d", "-s", &pane],
-        crate::collect::cmd::FAST,
-    )?;
+    // tmux refuses to break a window's only pane, and rightly: that is a
+    // rename, not a move. Counted down as panes leave, so breaking two of a
+    // window's three still stops at the last one rather than trusting a count
+    // the previous break already invalidated.
+    let mut remaining: HashMap<String, usize> = HashMap::new();
+    for p in &live {
+        *remaining.entry(window_of(p)).or_default() += 1;
+    }
+
+    let mut broken = 0;
+    let mut alone = 0;
+    let mut failed = Vec::new();
+    for (pane, from) in &chosen {
+        let left = remaining.entry(from.clone()).or_insert(1);
+        if *left < 2 {
+            alone += 1;
+            continue;
+        }
+        // `-d` leaves the focus where it is: this is a popup, and stealing the
+        // client to the new window would drop the user somewhere they did not
+        // ask to be.
+        match cmd::run("tmux", &["break-pane", "-d", "-s", pane], cmd::FAST) {
+            Ok(_) => {
+                *left -= 1;
+                broken += 1;
+            }
+            Err(e) => failed.push(format!("{pane}: {e}")),
+        }
+    }
+
+    model.unmark(
+        &chosen
+            .iter()
+            .map(|(pane, _)| pane.clone())
+            .collect::<Vec<_>>(),
+    );
     reload(model)?;
-    model.status = format!("{pane} broken out of {from}");
+    let mut done = format!("broke out {broken} pane(s)");
+    if alone > 0 {
+        done.push_str(&format!(" — {alone} already alone in its window"));
+    }
+    model.status = report(done, failed);
     Ok(())
 }
 
@@ -479,68 +610,201 @@ fn join_pane_args<'a>(pane: &'a str, destination: &'a str) -> [&'a str; 6] {
     ["join-pane", "-d", "-s", pane, "-t", destination]
 }
 
-/// Pick a pane, then move it into an explicitly selected window.
+/// Move one pane, making room first if the destination has none.
 ///
-/// The first `J` remembers the pane and changes the tree into destination
-/// selection mode. The second `J` (or Enter) joins it into the window under the
-/// cursor. A previous version always used `$TMUX_PANE`, which meant "the window
-/// that opened tmc" rather than the window the user actually wanted.
-fn join_pane(model: &mut Model) -> Result<()> {
-    if let Some(moving) = model.pane_move.clone() {
-        let Some(destination) = model.destination_window().map(WindowRow::target) else {
-            model.status = "choose a live window: j/k move, Enter join, Esc cancel".into();
-            return Ok(());
-        };
+/// `join-pane` splits the destination's *active* pane, and `-d` keeps that the
+/// same pane throughout — so each join halves what the last one halved, and a
+/// merge fails partway with "no space for new pane". Tiling and retrying costs
+/// an extra exec only when that actually happens, which leaves a hand-made
+/// layout alone in the ordinary single-pane case.
+fn join_one(pane: &str, destination: &str) -> Result<()> {
+    match cmd::run("tmux", &join_pane_args(pane, destination), cmd::FAST) {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            let _ = cmd::run(
+                "tmux",
+                &["select-layout", "-t", destination, "tiled"],
+                cmd::FAST,
+            );
+            cmd::run("tmux", &join_pane_args(pane, destination), cmd::FAST).map(|_| ())
+        }
+    }
+}
 
-        crate::collect::cmd::run(
-            "tmux",
-            &join_pane_args(&moving.pane, &destination),
-            crate::collect::cmd::FAST,
-        )?;
-        model.pane_move = None;
-        reload(model)?;
-        model.status = format!(
-            "{} moved from {} into {destination}",
-            moving.pane, moving.from
-        );
-        return Ok(());
+/// Pick panes, then move them into an explicitly selected window.
+///
+/// The first `J` remembers them and turns the tree into destination selection;
+/// the second `J` (or Enter) joins. A previous version always used
+/// `$TMUX_PANE`, which meant "the window that opened tmc" rather than the
+/// window the user actually wanted.
+fn move_panes(model: &mut Model) -> Result<()> {
+    if model.pending_move.is_some() {
+        return confirm_move(model);
     }
 
-    let Some(p) = model.current_pane() else {
-        model.status = "select a pane first — l expands a window".into();
+    let live = tmux::panes().unwrap_or_default();
+    let chosen = selected_panes(model, &live);
+    if chosen.is_empty() {
+        model.status = "select a pane first — l expands a window, space marks one".into();
         return Ok(());
+    }
+    let what = match chosen.as_slice() {
+        [(pane, _)] => pane.clone(),
+        many => format!("{} panes", many.len()),
     };
-    let pane = p.target().to_string();
-    let from = p.window_target();
-    if model.begin_pane_move(pane.clone(), from) {
-        model.status = format!("moving {pane}: choose a window, then press Enter or J");
+    if model.begin_move(chosen, MoveKind::Panes) {
+        model.status = format!("moving {what}: choose a window, then Enter or J");
     } else {
-        model.status = "no other live window to move that pane into".into();
+        model.status = "no other live window to move that into".into();
     }
     Ok(())
 }
 
-/// Close the selected window.
+/// Merge the marked windows into one.
+///
+/// tmux has no merge: it is every pane of the sources joined into the window
+/// that is being kept, which the sources then close themselves over, having
+/// nothing left. Which window survives is chosen the same way `J` chooses a
+/// destination — including one of the marked ones, which is the usual
+/// intent — so the answer is never "whichever tmux considered active".
+fn merge_windows(model: &mut Model) -> Result<()> {
+    let sources = model.marked_live_windows();
+    if sources.len() < 2 {
+        model.status = "mark two or more windows with space, then M".into();
+        return Ok(());
+    }
+
+    let live = tmux::panes().unwrap_or_default();
+    let panes: Vec<(String, String)> = live
+        .iter()
+        .filter(|p| sources.contains(&window_of(p)))
+        .map(|p| (p.pane_id.clone(), window_of(p)))
+        .collect();
+    if model.begin_move(panes, MoveKind::Merge) {
+        model.status = format!(
+            "merging {} windows: choose the one to keep, then Enter",
+            sources.len()
+        );
+    } else {
+        model.status = "those windows have no panes to merge".into();
+    }
+    Ok(())
+}
+
+fn cancel_move(model: &mut Model) {
+    model.pending_move = None;
+    model.search.clear();
+    model.searching = false;
+    model.status = "pane move cancelled".into();
+}
+
+/// Carry out the pending move into the window under the cursor.
+fn confirm_move(model: &mut Model) -> Result<()> {
+    let Some(pending) = model.pending_move.clone() else {
+        return Ok(());
+    };
+    let Some(destination) = model.destination_window().map(WindowRow::target) else {
+        model.status = "choose a live window: j/k move, Enter confirm, Esc cancel".into();
+        return Ok(());
+    };
+
+    let mut moved = 0;
+    let mut failed = Vec::new();
+    for (pane, from) in &pending.panes {
+        // The destination may be one of the merged windows; its own panes are
+        // already home.
+        if *from == destination {
+            continue;
+        }
+        match join_one(pane, &destination) {
+            Ok(()) => moved += 1,
+            Err(e) => failed.push(format!("{pane}: {e}")),
+        }
+    }
+
+    // Several panes arriving one at a time stack into ever-thinner slices of
+    // whatever pane was active. Tiling once at the end is the only arrangement
+    // that is readable without guessing what was wanted; a single pane leaves
+    // a hand-made layout alone.
+    if moved > 1 {
+        let _ = cmd::run(
+            "tmux",
+            &["select-layout", "-t", &destination, "tiled"],
+            cmd::FAST,
+        );
+    }
+
+    let sources = pending.sources();
+    let consumed: Vec<String> = pending
+        .panes
+        .iter()
+        .map(|(pane, _)| pane.clone())
+        .chain(sources.iter().map(|w| w.to_string()))
+        .collect();
+    let sources = sources.len();
+    model.pending_move = None;
+    model.search.clear();
+    model.searching = false;
+    model.unmark(&consumed);
+    reload(model)?;
+    model.status = report(
+        match pending.kind {
+            MoveKind::Merge => {
+                format!("merged {sources} windows — {moved} pane(s) into {destination}")
+            }
+            MoveKind::Panes => format!("moved {moved} pane(s) into {destination}"),
+        },
+        failed,
+    );
+    Ok(())
+}
+
+/// Close the selected windows.
 ///
 /// No confirmation prompt: the workspace was snapshotted, and the point of
 /// this tool is that closing something is recoverable. The status line says
 /// how.
-fn kill_window(model: &mut Model) -> Result<()> {
-    let Some(w) = model.current_window() else {
-        return Ok(());
-    };
-    if w.gone {
-        model.status = "that window is already gone".into();
+fn kill_windows(model: &mut Model) -> Result<()> {
+    let targets = selected_windows(model);
+    if targets.is_empty() {
+        model.status = match model.current_window() {
+            Some(_) => "that window is already gone".into(),
+            None => "select a window first".into(),
+        };
         return Ok(());
     }
-    let target = w.target();
-    crate::collect::cmd::run(
-        "tmux",
-        &["kill-window", "-t", &target],
-        crate::collect::cmd::FAST,
-    )?;
+
+    let mut killed = 0;
+    let mut failed = Vec::new();
+    for target in &targets {
+        match cmd::run("tmux", &["kill-window", "-t", target], cmd::FAST) {
+            Ok(_) => killed += 1,
+            Err(e) => failed.push(format!("{target}: {e}")),
+        }
+    }
+
+    model.unmark(&targets);
     reload(model)?;
-    model.status = format!("killed {target} — press r to bring it back");
+
+    // Whether `r` can undo this is a fact about the selected point, not a
+    // promise the tool gets to make. A window created since the last save is
+    // in no point at all, and telling the user to press `r` after closing
+    // several of those is worse than saying nothing.
+    let recoverable = targets
+        .iter()
+        .filter(|t| {
+            model
+                .rows
+                .iter()
+                .any(|r| matches!(r, Row::Window(w) if w.gone && &w.target() == *t))
+        })
+        .count();
+    let recovery = match recoverable {
+        0 => " — not in the restore point, so r cannot bring them back".to_string(),
+        n if n == killed => " — press r to bring them back".to_string(),
+        n => format!(" — r brings back {n} of them"),
+    };
+    model.status = report(format!("killed {killed} window(s){recovery}"), failed);
     Ok(())
 }
 
@@ -616,7 +880,7 @@ fn now_secs() -> u64 {
 mod tests {
     use super::*;
     use crate::layout::diff::Change;
-    use crate::ui::model::{Row, WindowRow};
+    use crate::ui::model::WindowRow;
 
     fn model_with_window() -> Model {
         let mut m = Model::new(Vec::new());
@@ -685,9 +949,9 @@ mod tests {
         // The level below the tree still has to be popped first, or a cancel
         // costs the whole session.
         let mut m = model_with_window();
-        m.pane_move = Some(crate::ui::model::PaneMove {
-            pane: "%1084".into(),
-            from: "projects:2".into(),
+        m.pending_move = Some(crate::ui::model::PendingMove {
+            panes: vec![("%1084".into(), "projects:2".into())],
+            kind: MoveKind::Panes,
             destination: None,
         });
 
@@ -792,17 +1056,116 @@ mod tests {
     #[test]
     fn esc_cancels_a_pane_move_without_quitting() {
         let mut m = model_with_window();
-        m.pane_move = Some(crate::ui::model::PaneMove {
-            pane: "%1084".into(),
-            from: "projects:2".into(),
-            destination: Some("tooling:3".into()),
-        });
+        m.pending_move = Some(pending_move());
 
         let _ = handle_key(&mut m, KeyCode::Esc, KeyModifiers::NONE);
 
-        assert!(m.pane_move.is_none(), "the pending move is gone");
+        assert!(m.pending_move.is_none(), "the pending move is gone");
         assert!(!m.quit, "Esc cancels the mode, not the program");
         assert_eq!(m.status, "pane move cancelled");
+    }
+
+    /// Two live windows, so the destination picker has something to offer.
+    fn model_with_two_windows() -> Model {
+        let mut m = model_with_window();
+        m.rows.push(Row::Window(WindowRow {
+            session: "projects".into(),
+            index: 2,
+            name: "beta".into(),
+            panes: 1,
+            state: String::new(),
+            cc_session: String::new(),
+            waiting: false,
+            running_claude: false,
+            change: Change::Same,
+            reasons: Vec::new(),
+            gone: false,
+        }));
+        m
+    }
+
+    #[test]
+    fn merge_says_what_it_needs_rather_than_guessing() {
+        // One window is not a merge, and picking a second for the user would
+        // be picking which of 28 to close.
+        let mut m = model_with_two_windows();
+        m.marks.insert("projects:1".into());
+
+        press(&mut m, 'M', KeyModifiers::NONE);
+
+        assert!(m.pending_move.is_none(), "nothing was started");
+        assert!(m.status.contains("two or more"), "status: {}", m.status);
+    }
+
+    #[test]
+    fn slash_filters_the_destinations_instead_of_cancelling() {
+        let mut m = model_with_two_windows();
+        assert!(m.begin_move(vec![("%11".into(), "projects:1".into())], MoveKind::Panes));
+
+        press(&mut m, '/', KeyModifiers::NONE);
+        assert!(m.searching, "typing now narrows the choices");
+        assert!(m.pending_move.is_some(), "the move is still pending");
+
+        // `x` kills a window in the tree. Inside the filter it is a letter.
+        press(&mut m, 'x', KeyModifiers::NONE);
+        assert_eq!(m.search, "x");
+        assert!(m.pending_move.is_some());
+
+        let _ = handle_key(&mut m, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!m.searching, "Esc closes the filter");
+        assert!(
+            m.pending_move.is_some(),
+            "and only the filter — the move survives one more Esc",
+        );
+    }
+
+    #[test]
+    fn cancelling_a_move_takes_its_filter_with_it() {
+        // The query was typed to find a destination; leaving it applied to
+        // the tree would hide most of the workspace with no obvious cause.
+        let mut m = model_with_two_windows();
+        assert!(m.begin_move(vec![("%11".into(), "projects:1".into())], MoveKind::Panes));
+        m.searching = true;
+        m.search_push('b');
+
+        let _ = handle_key(&mut m, KeyCode::Esc, KeyModifiers::NONE);
+        let _ = handle_key(&mut m, KeyCode::Esc, KeyModifiers::NONE);
+
+        assert!(m.pending_move.is_none());
+        assert!(m.search.is_empty(), "search: {:?}", m.search);
+        assert!(!m.quit, "cancelling is not leaving");
+    }
+
+    #[test]
+    fn a_window_command_prefers_the_marked_windows_over_the_cursor() {
+        let mut m = model_with_two_windows();
+        m.cursor = 0; // projects:1
+        m.marks.insert("projects:2".into());
+
+        assert_eq!(
+            selected_windows(&m),
+            vec!["projects:2".to_string()],
+            "a selection is an explicit answer; the cursor is only a fallback",
+        );
+
+        m.clear_marks();
+        assert_eq!(selected_windows(&m), vec!["projects:1".to_string()]);
+    }
+
+    #[test]
+    fn a_pane_command_leaves_the_restore_selection_alone() {
+        // Windows staged for `r` and panes staged for `J` coexist in one set.
+        // A move that cleared everything would quietly undo the staging.
+        let mut m = model_with_two_windows();
+        m.marks.insert("projects:1".into());
+        m.marks.insert("%11".into());
+
+        m.unmark(&["%11".to_string()]);
+
+        assert_eq!(
+            m.marks.iter().cloned().collect::<Vec<_>>(),
+            vec!["projects:1".to_string()],
+        );
     }
 
     #[test]
@@ -899,10 +1262,10 @@ mod tests {
         assert!(!m.quit);
     }
 
-    fn pending_move() -> crate::ui::model::PaneMove {
-        crate::ui::model::PaneMove {
-            pane: "%1084".into(),
-            from: "projects:2".into(),
+    fn pending_move() -> crate::ui::model::PendingMove {
+        crate::ui::model::PendingMove {
+            panes: vec![("%1084".into(), "projects:2".into())],
+            kind: MoveKind::Panes,
             destination: Some("tooling:3".into()),
         }
     }
@@ -913,13 +1276,13 @@ mod tests {
     fn hangul_moves_the_destination_cursor_in_pane_move() {
         let mut with_jamo = model_with_window();
         with_jamo.searching = false;
-        with_jamo.pane_move = Some(pending_move());
+        with_jamo.pending_move = Some(pending_move());
         // `ㅓ` is the physical `j`.
         press(&mut with_jamo, 'ㅓ', KeyModifiers::NONE);
 
         let mut with_latin = model_with_window();
         with_latin.searching = false;
-        with_latin.pane_move = Some(pending_move());
+        with_latin.pending_move = Some(pending_move());
         press(&mut with_latin, 'j', KeyModifiers::NONE);
 
         // j is a bound navigation key, so it leaves no "choose a window" hint;

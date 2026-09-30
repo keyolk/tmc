@@ -100,24 +100,66 @@ impl WindowRow {
     }
 }
 
-/// A pane waiting for the user to choose its destination window.
+/// Why panes are being moved. Once a destination is chosen the two are the
+/// same operation; this is what the prompt and the report say about it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveKind {
+    /// Panes picked with the cursor, or marked one by one across windows.
+    Panes,
+    /// Every pane of the marked windows. tmux has no merge command — a window
+    /// whose last pane leaves closes itself, and that is what makes one.
+    Merge,
+}
+
+/// Panes waiting for the user to choose their destination window.
 #[derive(Clone, Debug, PartialEq)]
-pub struct PaneMove {
-    /// `%N`, stable even if another pane disappears while choosing.
-    pub pane: String,
-    /// The window it currently belongs to; selecting this is never useful.
-    pub from: String,
+pub struct PendingMove {
+    /// `(%N, session:index)` per pane. The id is stable even if a neighbour
+    /// disappears while choosing; the window is what the report names and
+    /// what `sole_source` drops from the choices.
+    pub panes: Vec<(String, String)>,
+    pub kind: MoveKind,
     /// The exact live window chosen, kept separately from the row number so a
     /// polling refresh cannot silently turn the same cursor position into a
     /// different destination.
     pub destination: Option<String>,
 }
 
+impl PendingMove {
+    /// The one window every pane already sits in, when there is one.
+    ///
+    /// Offering it as a destination would be a no-op, so it drops out. With
+    /// panes from several windows there is no such window, and excluding all
+    /// the sources would be wrong: merging `A` and `B` into `B` is the
+    /// ordinary case, and that would put the useful answer out of reach.
+    pub fn sole_source(&self) -> Option<&str> {
+        let first = self.panes.first()?.1.as_str();
+        self.panes
+            .iter()
+            .all(|(_, window)| window == first)
+            .then_some(first)
+    }
+
+    /// The source windows, once each, in the order the panes are listed.
+    pub fn sources(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for (_, window) in &self.panes {
+            if !out.contains(&window.as_str()) {
+                out.push(window);
+            }
+        }
+        out
+    }
+}
+
 /// The TUI's whole state.
 pub struct Model {
     pub rows: Vec<Row>,
     pub cursor: usize,
-    /// Targets marked for restore.
+    /// The selection, as window targets (`session:index`) and pane ids
+    /// (`%N`). One set rather than two: a mark says "this one", and which
+    /// command you press next says what to do with it — restore, merge,
+    /// move, break or kill.
     pub marks: HashSet<String>,
     /// The restore point being compared against, and its position in the list.
     pub points: Vec<point::Point>,
@@ -129,8 +171,8 @@ pub struct Model {
     pub switch_to: Option<String>,
     pub quit: bool,
     pub status: String,
-    /// Set after `J` on a pane, until a destination window is confirmed.
-    pub pane_move: Option<PaneMove>,
+    /// Set after `J` or `M`, until a destination window is confirmed.
+    pub pending_move: Option<PendingMove>,
     /// Typed search. Empty means the whole tree is shown.
     pub search: String,
     /// True while the search line is accepting keys.
@@ -159,7 +201,7 @@ impl Model {
             switch_to: None,
             quit: false,
             status: String::new(),
-            pane_move: None,
+            pending_move: None,
             search: String::new(),
             searching: false,
             stale_build: check_build(),
@@ -231,31 +273,73 @@ impl Model {
             .filter(|r| matches!(r, Row::Window(w) if w.waiting))
             .count();
 
+        self.prune_marks(panes);
+
         // A polling refresh may insert, remove or reorder rows while a pane
         // destination is being chosen. Follow the remembered target rather
         // than leaving the same numeric cursor on a different window.
         if let Some(target) = self
-            .pane_move
+            .pending_move
             .as_ref()
             .and_then(|moving| moving.destination.clone())
         {
-            if let Some(row) = self
+            let visible = self.visible();
+            let shown = visible.iter().position(
+                |&i| matches!(&self.rows[i], Row::Window(w) if !w.gone && w.target() == target),
+            );
+            if let Some(pos) = shown {
+                self.cursor = pos;
+            } else if self
                 .rows
                 .iter()
-                .position(|r| matches!(r, Row::Window(w) if !w.gone && w.target() == target))
+                .any(|r| matches!(r, Row::Window(w) if !w.gone && w.target() == target))
             {
-                self.cursor = row;
+                // Still there, only filtered out of view by the query typed
+                // while choosing. The move is still valid, so leave it be.
+                self.clamp_cursor();
             } else {
                 // Never substitute another window after the user picked one.
                 // A refresh can remove or renumber it; silently keeping the row
                 // number would move the pane somewhere they did not choose.
-                self.pane_move = None;
+                self.pending_move = None;
                 self.status = format!("pane move cancelled — {target} is no longer available");
                 self.clamp_cursor();
             }
         } else {
             self.clamp_cursor();
         }
+    }
+
+    /// Drop marks whose window or pane no longer exists.
+    ///
+    /// A mark outlives a refresh, but must not outlive the thing it points
+    /// at: panes swallowed by a merge and windows closed elsewhere would
+    /// otherwise keep counting towards `x`, `M` and the header. Window marks
+    /// are checked against the tree, which still lists the ones that exist
+    /// only in the restore point — those are exactly what `r` brings back.
+    ///
+    /// Skipped on an empty tree, so one failed tmux read cannot clear a
+    /// selection the user spent a minute building.
+    fn prune_marks(&mut self, panes: &[tmux::Pane]) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let live: HashSet<&str> = panes.iter().map(|p| p.pane_id.as_str()).collect();
+        let known: HashSet<String> = self
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Window(w) => Some(w.target()),
+                _ => None,
+            })
+            .collect();
+        self.marks.retain(|mark| {
+            if mark.starts_with('%') {
+                live.contains(mark.as_str())
+            } else {
+                known.contains(mark)
+            }
+        });
     }
 
     /// A cheap value that changes exactly when the display would.
@@ -439,64 +523,132 @@ impl Model {
         }
     }
 
-    /// Remember a pane and put the cursor on the first usable destination.
-    pub fn begin_pane_move(&mut self, pane: String, from: String) -> bool {
+    /// Remember the panes and put the cursor on a usable destination.
+    ///
+    /// The tree filter is dropped, because a query typed to find the *source*
+    /// has no business narrowing the destinations. The cursor stays where it
+    /// is when that is already a candidate: after marking windows to merge
+    /// you are standing on the one you mean to keep, and snapping to the top
+    /// of the tree would make you walk all the way back.
+    pub fn begin_move(&mut self, panes: Vec<(String, String)>, kind: MoveKind) -> bool {
+        if panes.is_empty() {
+            return false;
+        }
         self.search.clear();
         self.searching = false;
-        self.pane_move = Some(PaneMove {
-            pane,
-            from,
+        self.pending_move = Some(PendingMove {
+            panes,
+            kind,
             destination: None,
         });
-        self.cursor = 0;
-        if self.move_destination(1) {
+        if self.move_destination(0) {
             true
         } else {
-            self.pane_move = None;
+            self.pending_move = None;
             false
         }
     }
 
-    /// Move among live window rows while choosing a pane destination.
+    /// Move among live window rows while choosing a destination.
+    ///
+    /// A `delta` of 0 snaps to a valid candidate without moving off one, which
+    /// is what entering the mode and typing a filter both need.
     pub fn move_destination(&mut self, delta: isize) -> bool {
-        let Some(from) = self.pane_move.as_ref().map(|moving| moving.from.clone()) else {
+        let Some(pending) = self.pending_move.as_ref() else {
             return false;
         };
-        let candidates: Vec<(usize, String)> = self
-            .rows
+        let excluded = pending.sole_source().map(str::to_string);
+
+        // Positions in `visible`, not row indices: a filter can be typed while
+        // choosing, and the cursor counts visible rows. Conflating the two put
+        // the cursor on one window and the pane in another.
+        let visible = self.visible();
+        let candidates: Vec<(usize, String)> = visible
             .iter()
             .enumerate()
-            .filter_map(|(i, row)| match row {
-                Row::Window(w) if !w.gone && w.target() != from => Some((i, w.target())),
+            .filter_map(|(pos, &i)| match &self.rows[i] {
+                Row::Window(w) if !w.gone && Some(w.target()) != excluded => {
+                    Some((pos, w.target()))
+                }
                 _ => None,
             })
             .collect();
         if candidates.is_empty() {
+            // Nothing to point at — forget the old choice rather than let a
+            // refresh chase a destination that is no longer on offer.
+            if let Some(moving) = &mut self.pending_move {
+                moving.destination = None;
+            }
             return false;
         }
 
-        // Search is cleared when this mode starts, so visible positions and row
-        // indices are identical. From a non-candidate row, choose the first one;
-        // thereafter j/k wrap only across candidate windows.
-        let next = match candidates.iter().position(|(i, _)| *i == self.cursor) {
-            Some(pos) => (pos as isize + delta).rem_euclid(candidates.len() as isize) as usize,
+        // From a non-candidate row, choose the first one; thereafter j/k wrap
+        // only across candidate windows.
+        let next = match candidates.iter().position(|(pos, _)| *pos == self.cursor) {
+            Some(at) => (at as isize + delta).rem_euclid(candidates.len() as isize) as usize,
             None => 0,
         };
         self.cursor = candidates[next].0;
-        if let Some(moving) = &mut self.pane_move {
+        if let Some(moving) = &mut self.pending_move {
             moving.destination = Some(candidates[next].1.clone());
         }
         true
     }
 
-    /// Mark or unmark the window under the cursor.
+    /// Mark or unmark whatever is under the cursor.
+    ///
+    /// On a pane row that is the pane, not its window. `b` and `J` take pane
+    /// ids, so marking the parent instead left expanding a window good for
+    /// nothing but reading — you could see the three claudes and still only
+    /// act on all of them at once.
     pub fn toggle_mark(&mut self) {
-        if let Some(w) = self.current_window() {
-            let target = w.target();
-            if !self.marks.remove(&target) {
-                self.marks.insert(target);
-            }
+        let key = match self.cursor_row().and_then(|i| self.rows.get(i)) {
+            Some(Row::Pane(p)) => p.target().to_string(),
+            _ => match self.current_window() {
+                Some(w) => w.target(),
+                None => return,
+            },
+        };
+        if !self.marks.remove(&key) {
+            self.marks.insert(key);
         }
+    }
+
+    /// Marked windows that are actually running, in tree order.
+    ///
+    /// Restore reads `marks` directly, because a window that exists only in
+    /// the point is precisely what it brings back. Merge, move and kill need
+    /// a live one.
+    pub fn marked_live_windows(&self) -> Vec<String> {
+        self.rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Window(w) if !w.gone && self.marks.contains(&w.target()) => Some(w.target()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Marked pane ids. Sorted so two runs report the same order.
+    ///
+    /// Not taken from the rows: a mark survives collapsing its window, and by
+    /// then the row it came from is gone. The caller pairs these with their
+    /// current window from the live pane list.
+    pub fn marked_panes(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .marks
+            .iter()
+            .filter(|m| m.starts_with('%'))
+            .cloned()
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// How many windows and panes are marked, for the header.
+    pub fn mark_counts(&self) -> (usize, usize) {
+        let panes = self.marks.iter().filter(|m| m.starts_with('%')).count();
+        (self.marks.len() - panes, panes)
     }
 
     /// Mark every window that differs from the point — the usual intent when
@@ -513,6 +665,17 @@ impl Model {
 
     pub fn clear_marks(&mut self) {
         self.marks.clear();
+    }
+
+    /// Drop just the marks a command has consumed.
+    ///
+    /// Not `clear_marks`: a selection can hold windows staged for `r` and
+    /// panes staged for `J` at once, and a pane move that wiped the restore
+    /// selection would undo work the user had no reason to expect to lose.
+    pub fn unmark(&mut self, keys: &[String]) {
+        for key in keys {
+            self.marks.remove(key);
+        }
     }
 
     /// Move to the next or previous restore point.
@@ -1363,14 +1526,14 @@ mod tests {
             window("tooling", 1, "second", false),
         ]);
 
-        assert!(m.begin_pane_move("%11".into(), "projects:1".into()));
+        assert!(m.begin_move(vec![("%11".into(), "projects:1".into())], MoveKind::Panes));
         assert_eq!(
             m.destination_window().map(WindowRow::target),
             Some("projects:2".into()),
             "the source, its pane row and the gone window are skipped",
         );
         assert_eq!(
-            m.pane_move
+            m.pending_move
                 .as_ref()
                 .and_then(|moving| moving.destination.as_deref()),
             Some("projects:2"),
@@ -1384,7 +1547,7 @@ mod tests {
             "a window in another session is a valid destination",
         );
         assert_eq!(
-            m.pane_move
+            m.pending_move
                 .as_ref()
                 .and_then(|moving| moving.destination.as_deref()),
             Some("tooling:1"),
@@ -1395,6 +1558,197 @@ mod tests {
             Some("projects:2".into()),
             "destination selection wraps",
         );
+    }
+
+    /// A session, two of its windows and a pane in each — enough to mark
+    /// across windows and merge them.
+    fn two_windows_with_panes() -> Model {
+        let window = |index: u32, name: &str| {
+            Row::Window(WindowRow {
+                session: "projects".into(),
+                index,
+                name: name.into(),
+                panes: 1,
+                state: String::new(),
+                cc_session: String::new(),
+                waiting: false,
+                running_claude: false,
+                change: Change::Same,
+                reasons: Vec::new(),
+                gone: false,
+            })
+        };
+        let pane = |window_index: u32, id: &str| {
+            Row::Pane(PaneRow {
+                session: "projects".into(),
+                window_index,
+                index: 1,
+                pane_id: id.into(),
+                command: "claude".into(),
+                path: "/src".into(),
+                active: true,
+            })
+        };
+        model_with(vec![
+            Row::Session {
+                name: "projects".into(),
+                windows: 2,
+            },
+            window(1, "alpha"),
+            pane(1, "%11"),
+            window(2, "beta"),
+            pane(2, "%22"),
+        ])
+    }
+
+    #[test]
+    fn a_mark_on_a_pane_row_selects_the_pane_not_its_window() {
+        // `b` and `J` take pane ids. Marking the parent window instead made
+        // expanding good for nothing but reading.
+        let mut m = two_windows_with_panes();
+        m.cursor = 2; // the pane under projects:1
+        m.toggle_mark();
+
+        assert_eq!(m.marked_panes(), vec!["%11".to_string()]);
+        assert!(
+            m.marked_live_windows().is_empty(),
+            "the window it lives in was not marked"
+        );
+        assert_eq!(m.mark_counts(), (0, 1));
+
+        m.toggle_mark();
+        assert!(m.marks.is_empty(), "the same key unmarks it");
+    }
+
+    #[test]
+    fn a_mark_on_a_window_row_still_selects_the_window() {
+        let mut m = two_windows_with_panes();
+        m.cursor = 1;
+        m.toggle_mark();
+
+        assert_eq!(m.marked_live_windows(), vec!["projects:1".to_string()]);
+        assert!(m.marked_panes().is_empty());
+    }
+
+    #[test]
+    fn a_gone_window_is_marked_for_restore_but_never_for_surgery() {
+        // `r` exists to bring back a window the server does not have; merge,
+        // move and kill have nothing to act on.
+        let mut m = two_windows_with_panes();
+        if let Row::Window(w) = &mut m.rows[1] {
+            w.gone = true;
+        }
+        m.cursor = 1;
+        m.toggle_mark();
+
+        assert!(m.marks.contains("projects:1"), "restore still sees it");
+        assert!(m.marked_live_windows().is_empty());
+    }
+
+    #[test]
+    fn merging_can_keep_one_of_the_marked_windows() {
+        // The usual intent: "fold alpha into beta". Excluding every source —
+        // right for a single pane, where its own window is a no-op — would
+        // put the only useful destination out of reach.
+        let mut m = two_windows_with_panes();
+        let panes = vec![
+            ("%11".to_string(), "projects:1".to_string()),
+            ("%22".to_string(), "projects:2".to_string()),
+        ];
+        assert!(m.begin_move(panes, MoveKind::Merge));
+
+        let mut offered = vec![m.destination_window().map(WindowRow::target)];
+        m.move_destination(1);
+        offered.push(m.destination_window().map(WindowRow::target));
+
+        assert_eq!(
+            offered,
+            vec![Some("projects:1".into()), Some("projects:2".into())],
+            "both sources are on offer as the window to keep",
+        );
+    }
+
+    #[test]
+    fn a_move_starts_on_the_window_the_cursor_is_already_on() {
+        // You mark the windows, walk to the one you want to keep, then press
+        // M. Snapping back to the top of the tree would undo that walk.
+        let mut m = two_windows_with_panes();
+        m.cursor = 3; // projects:2
+
+        assert!(m.begin_move(
+            vec![
+                ("%11".into(), "projects:1".into()),
+                ("%22".into(), "projects:2".into()),
+            ],
+            MoveKind::Merge
+        ));
+        assert_eq!(
+            m.destination_window().map(WindowRow::target),
+            Some("projects:2".into()),
+        );
+    }
+
+    #[test]
+    fn destinations_can_be_narrowed_by_typing() {
+        // With 28 windows open, walking to the destination with j/k is the
+        // slow half of the move. The cursor counts *visible* rows, so a
+        // filter that shifts them must not leave the choice pointing at a
+        // different window than the one under the cursor.
+        let mut m = two_windows_with_panes();
+        assert!(m.begin_move(vec![("%11".into(), "projects:1".into())], MoveKind::Panes));
+
+        for c in "beta".chars() {
+            m.search_push(c);
+        }
+        m.move_destination(0);
+
+        assert_eq!(
+            m.destination_window().map(WindowRow::target),
+            Some("projects:2".into()),
+            "the cursor is on the window the filter left",
+        );
+        assert_eq!(
+            m.pending_move
+                .as_ref()
+                .and_then(|moving| moving.destination.as_deref()),
+            Some("projects:2"),
+            "and the remembered target agrees with it",
+        );
+    }
+
+    #[test]
+    fn a_refresh_forgets_marks_whose_pane_or_window_is_gone() {
+        // Merging a window away, or killing one elsewhere, must not leave a
+        // mark behind counting towards the next `x`.
+        let mut m = Model::new(Vec::new());
+        m.marks.insert("projects:1".into());
+        m.marks.insert("projects:9".into());
+        m.marks.insert("%11".into());
+        m.marks.insert("%99".into());
+
+        let panes = vec![live_pane("projects", 1, "alpha", "", "")];
+        let saved = Vec::new();
+        let tree = empty_tree();
+        m.refresh(&panes, &saved, &tree, &HashMap::new());
+
+        // `live_pane` numbers its pane `%<window>`, so `%1` is the live one.
+        assert!(m.marks.contains("projects:1"), "the window is still there");
+        assert!(!m.marks.contains("projects:9"), "that window is not");
+        assert!(!m.marks.contains("%11"), "nor is that pane");
+        assert!(!m.marks.contains("%99"));
+    }
+
+    #[test]
+    fn an_empty_tree_never_clears_the_selection() {
+        // One failed tmux read must not discard a selection that took a
+        // minute to build.
+        let mut m = Model::new(Vec::new());
+        m.marks.insert("projects:1".into());
+        m.marks.insert("%11".into());
+
+        m.refresh(&[], &[], &empty_tree(), &HashMap::new());
+
+        assert_eq!(m.marks.len(), 2);
     }
 
     #[test]
@@ -1413,9 +1767,9 @@ mod tests {
             gone: false,
         })]);
 
-        assert!(!m.begin_pane_move("%11".into(), "projects:1".into()));
+        assert!(!m.begin_move(vec![("%11".into(), "projects:1".into())], MoveKind::Panes));
         assert!(
-            m.pane_move.is_none(),
+            m.pending_move.is_none(),
             "no half-entered selection mode remains"
         );
     }

@@ -99,8 +99,9 @@ The cursor starts on the window it was summoned from, so the panel opens
 describing where you already are rather than some other session's first
 window.
 
-`Esc` pops one level each press: a pending pane move, then the search line,
-then the app. Pressing it twice from where the TUI opens leaves.
+`Esc` pops one level each press: a destination filter, then a pending pane
+move, then the search line, then the app. Pressing it twice from where the TUI
+opens leaves.
 
 **Searching**
 
@@ -120,16 +121,52 @@ then the app. Pressing it twice from where the TUI opens leaves.
 | `g`/`G` | first / last |
 | `Enter` | switch to the window and exit |
 | `n` | next window waiting on you |
-| `space` | mark for restore |
+| `space` | mark the window — or, on a pane row, the pane |
 | `a` / `c` | mark everything changed / clear |
 | `r` | restore marked (or, with none marked, the missing windows) |
 | `s` | save a point now |
 | `p` / `P` | next / previous restore point |
 | `l` / `h` | expand a window to its panes / collapse |
-| `b` | break the selected pane out into its own window |
-| `J` | choose a destination window for the selected pane; `j`/`k`, then `Enter`/`J` |
-| `m` / `x` | move window to the other session / close it |
+| `b` | break the selected panes out, each into its own window |
+| `J` | choose a destination window for the selected panes |
+| `M` | merge the marked windows into one |
+| `m` / `x` | move the marked windows to the other session / close them |
 | `q`, `Esc`, `Ctrl-C` | quit |
+
+**Choosing a destination** (after `J` or `M`)
+
+| | |
+|---|---|
+| `j`/`k`, arrows | move among live windows |
+| `/` | narrow them by typing; `Esc` closes the filter |
+| `Enter`, `J`, `M` | confirm |
+| `Esc` | cancel the move |
+
+## Marks are a selection, not a queue
+
+`space` marks whatever is under the cursor, and the next command decides what
+that meant: `r` restores the marked windows, `M` merges them, `m` moves them,
+`x` closes them, and with panes marked instead, `b` breaks them out and `J`
+moves them. Only the marks a command consumed are dropped, so windows staged
+for `r` survive a pane move made on the way.
+
+With nothing marked, the pane and window commands act on the cursor — the
+one-window case stays one keystroke.
+
+Marking a pane requires expanding its window (`l`), which is also what makes
+the selection honest: `break-pane` and `join-pane` take a pane, and a window
+target makes tmux use whichever pane it considers active rather than the one
+you were looking at.
+
+`M` is the one command tmux has no verb for. Merging is every pane of the
+marked windows joined into the one you keep, which the sources then close
+themselves over, having nothing left. The window that receives them is picked
+in the same step — and it can be one of the marked ones, since "fold `alpha`
+into `beta`" is the usual reason to ask.
+
+Panes arriving one at a time each split whatever pane was active, so a merge
+of more than one is tiled at the end. A single pane leaves a hand-made layout
+alone; when tmux runs out of room mid-move, tiling is what makes room.
 
 ## State
 
