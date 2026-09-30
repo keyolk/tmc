@@ -352,8 +352,54 @@ mod tests {
         // that an unrelated test failure.
         let wide = render(&model(), 160, 12, 0);
         let narrow = render(&model(), 70, 12, 0);
-        assert!(wide.contains("x kill"), "{wide}");
-        assert!(!narrow.contains("x kill"), "dropped when it will not fit");
+        assert!(wide.contains("x window/pane"), "{wide}");
+        assert!(
+            !narrow.contains("x window/pane"),
+            "dropped when it will not fit"
+        );
+    }
+
+    #[test]
+    fn the_x_menu_names_its_target_and_every_command() {
+        let mut m = model();
+        m.menu = true;
+        let out = render(&m, 100, 20, 0);
+
+        for key in ["b:break out", "j:join", "m:merge", "s:send", "k:close"] {
+            assert!(out.contains(key), "missing {key}:\n{out}");
+        }
+        assert!(out.contains("esc cancel"), "{out}");
+        // The cursor sits on projects:8, and nothing is marked, so that is
+        // what the commands would act on and what the title must say.
+        assert!(
+            out.contains("projects:8"),
+            "the title names the target:\n{out}"
+        );
+    }
+
+    #[test]
+    fn the_menu_title_follows_the_selection_not_the_cursor() {
+        // The commands prefer marks over the cursor, so a title naming the
+        // row under the cursor would name a window they will not touch.
+        let mut m = model();
+        m.menu = true;
+        m.marks.insert("projects:12".into());
+        m.marks.insert("projects:1".into());
+
+        let out = render(&m, 100, 20, 0);
+        assert!(out.contains("2 windows marked"), "{out}");
+    }
+
+    #[test]
+    fn an_unavailable_command_is_shown_with_what_it_is_missing() {
+        // Greyed rather than hidden: with five commands the reason is the
+        // useful part, and a menu that changes shape teaches nothing.
+        let mut m = model();
+        m.menu = true;
+        let out = render(&m, 100, 20, 0);
+
+        assert!(out.contains("needs two or more marked"), "merge:\n{out}");
+        assert!(out.contains("needs a pane"), "break:\n{out}");
     }
 
     #[test]
@@ -411,6 +457,27 @@ mod tests {
         assert!(hint.contains("projects:1"), "[{hint}]");
         assert!(hint.contains("/ filter"), "the way to narrow it: [{hint}]");
         assert!(hint.contains("esc cancel"), "[{hint}]");
+    }
+
+    #[test]
+    fn the_menu_marks_a_detail_it_had_to_cut() {
+        // The box is capped by the terminal, so on a narrow one the detail is
+        // what gives. Clipping silently reads as a typo.
+        let mut m = model();
+        m.menu = true;
+        let out = render(&m, 50, 16, 0);
+
+        assert!(out.contains('…'), "nothing was marked as cut:\n{out}");
+        assert!(
+            !out.contains("l expan "),
+            "cut mid-word with no mark:\n{out}"
+        );
+        for line in out.lines() {
+            assert!(
+                line.width() <= 50,
+                "the box overflowed at 50 columns: [{line}]"
+            );
+        }
     }
 
     #[test]
