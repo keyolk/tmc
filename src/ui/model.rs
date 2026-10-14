@@ -296,6 +296,10 @@ pub struct Model {
     pub search: String,
     /// True while the search line is accepting keys.
     pub searching: bool,
+    /// The query was restored from the last session and not yet touched.
+    /// Shown selected: the first letter typed replaces it rather than being
+    /// appended to it, Backspace clears it, and Enter or a move accepts it.
+    pub search_selected: bool,
     /// Set when the running binary predates the checked-out source.
     pub stale_build: Option<String>,
     /// Windows whose panes are listed, by target.
@@ -328,6 +332,7 @@ impl Model {
             live: Vec::new(),
             search: String::new(),
             searching: false,
+            search_selected: false,
             stale_build: check_build(),
             expanded: std::collections::HashSet::new(),
             preview: None,

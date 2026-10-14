@@ -352,9 +352,9 @@ mod tests {
         // that an unrelated test failure.
         let wide = render(&model(), 160, 12, 0);
         let narrow = render(&model(), 70, 12, 0);
-        assert!(wide.contains("x window/pane"), "{wide}");
+        assert!(wide.contains("p/P point"), "{wide}");
         assert!(
-            !narrow.contains("x window/pane"),
+            !narrow.contains("p/P point"),
             "dropped when it will not fit"
         );
     }
@@ -406,7 +406,7 @@ mod tests {
     fn expanding_survives_narrower_than_the_rare_commands_do() {
         // `l` is how you reach a pane at all; dropping it before `b`/`J` would
         // leave those looking like they act on nothing.
-        let out = render(&model(), 100, 12, 0);
+        let out = render(&model(), 110, 12, 0);
         assert!(out.contains("l/h panes"), "{out}");
         assert!(
             !out.contains("x kill"),
@@ -598,5 +598,45 @@ mod tests {
         let m = model();
         let out = render(&m, 120, 20, 0);
         assert!(!out.contains("nothing on screen"), "{out}");
+    }
+
+    #[test]
+    fn at_80_columns_the_most_used_group_and_help_survive() {
+        // The common popup width. Whatever is dropped, navigation, search,
+        // the x menu and the way to the rest (`?`) and out must remain.
+        let out = render(&model(), 80, 12, 0);
+        let last = out.lines().last().unwrap_or_default();
+        assert_eq!(
+            last,
+            "/ search  j/k move  ⏎ switch  x menu   ? help   esc/q quit",
+        );
+        let mut searching = model();
+        searching.searching = true;
+        let out = render(&searching, 80, 12, 0);
+        let last = out.lines().last().unwrap_or_default();
+        assert!(last.contains("tab/esc commands"), "{last}");
+        assert!(last.contains("ctrl-c quit"), "{last}");
+    }
+
+    #[test]
+    fn a_restored_query_is_drawn_selected() {
+        let mut m = model();
+        m.searching = true;
+        m.search = "foo".into();
+        m.search_selected = true;
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        terminal
+            .draw(|f| crate::ui::render::draw(f, &m, 0))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let x = (0..100u16)
+            .find(|&x| buf[(x, 0)].symbol() == "f")
+            .expect("query in the header");
+        assert!(
+            buf[(x, 0)]
+                .modifier
+                .contains(ratatui::style::Modifier::REVERSED),
+            "selected, so typing visibly replaces it"
+        );
     }
 }

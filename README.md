@@ -145,6 +145,8 @@ too rather than cutting it off halfway.
 **Remembered between runs.** Expanded windows, the last query and the restore
 point being compared against are kept in `$XDG_STATE_HOME/tmc/ui.json`
 (`~/.local/state/tmc/ui.json` by default) and put back on the next open.
+The restored query is shown selected: the first letter typed replaces it,
+Backspace clears it, and Enter or a move keeps it.
 
 **`x` — rearranging tmux**
 

@@ -106,6 +106,9 @@ impl UiState {
     pub fn restore(&self, model: &mut Model) {
         model.expanded = self.expanded.iter().cloned().collect();
         model.search = self.search.clone();
+        // A query from last time is a suggestion, not something to append
+        // to: typing `b` after a restored `foo` means `b`, not `foob`.
+        model.search_selected = !self.search.is_empty();
         // A point that has since been pruned falls back to the newest, which
         // is what a first run compares against too.
         if let Some(name) = &self.point

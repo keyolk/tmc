@@ -398,6 +398,18 @@ pub(super) fn handle_key(model: &mut Model, code: KeyCode, mods: KeyModifiers) -
         return Effect::None;
     };
 
+    // A restored query is shown selected until the first key on the search
+    // line decides what happens to it. Any other key accepts it as it is.
+    if ctx == Ctx::Search && std::mem::take(&mut model.search_selected) {
+        match key {
+            Key::Char(_) | Key::Backspace => model.search_clear(),
+            _ => {}
+        }
+        if key == Key::Backspace {
+            return Effect::None;
+        }
+    }
+
     // The menu is one-shot by construction: closed before anything is
     // matched, so Esc, an unknown letter and a command that ran all leave it
     // closed without an arm each.
@@ -1296,5 +1308,64 @@ mod tests {
         let mut m = model_with_window();
         press(&mut m, 'x', KeyModifiers::NONE);
         assert!(m.menu, "x is the menu, as the hint says");
+    }
+
+    // --- a restored query ---------------------------------------------------
+
+    fn restored(query: &str) -> Model {
+        let mut m = model_with_window();
+        crate::ui::state::UiState {
+            search: query.into(),
+            ..Default::default()
+        }
+        .restore(&mut m);
+        m
+    }
+
+    #[test]
+    fn typing_after_a_restored_query_replaces_it() {
+        let mut m = restored("foo");
+        press(&mut m, '/', KeyModifiers::NONE);
+        press(&mut m, 'b', KeyModifiers::NONE);
+        assert_eq!(m.search, "b");
+        press(&mut m, 'a', KeyModifiers::NONE);
+        assert_eq!(m.search, "ba", "only the first key replaces");
+    }
+
+    #[test]
+    fn enter_accepts_a_restored_query_as_it_is() {
+        let mut m = restored("foo");
+        press(&mut m, '/', KeyModifiers::NONE);
+        let _ = handle_key(&mut m, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(m.search, "foo");
+        assert!(!m.search_selected);
+    }
+
+    #[test]
+    fn a_move_accepts_a_restored_query_and_later_typing_appends() {
+        let mut m = restored("foo");
+        m.searching = true; // the popup opens on the search line
+        let _ = handle_key(&mut m, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut m, 'd', KeyModifiers::NONE);
+        assert_eq!(m.search, "food");
+    }
+
+    #[test]
+    fn backspace_clears_a_restored_query_whole() {
+        let mut m = restored("foo");
+        m.searching = true;
+        let _ = handle_key(&mut m, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(m.search, "");
+        assert!(m.searching);
+    }
+
+    #[test]
+    fn a_restored_query_still_filters_the_tree_until_searched() {
+        // Out on the tree, tree keys keep their meaning and the selection
+        // waits for the search line.
+        let mut m = restored("foo");
+        press(&mut m, 'j', KeyModifiers::NONE);
+        assert!(m.search_selected);
+        assert_eq!(m.search, "foo");
     }
 }

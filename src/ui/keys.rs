@@ -216,6 +216,11 @@ pub static BINDINGS: &[Binding] = &[
     b(Ctx::Tree, Key::Down, Cmd::Down, Hidden, "", "down"),
     b(Ctx::Tree, Key::Up, Cmd::Up, Hidden, "", "up"),
     b(Ctx::Tree, Key::Enter, Cmd::Switch, Group(1), "switch", "switch to the window"),
+    // The menu sits in the first group: it is the way to every command that
+    // rearranges tmux, and the menu behind it is self-describing, so one
+    // short word is enough. At 80 columns this group and `? help` are what
+    // survive; the help names everything the row had to drop.
+    b(Ctx::Tree, C('x'), Cmd::Menu, Group(1), "menu", "window and pane commands"),
     b(Ctx::Tree, C(' '), Cmd::Mark, Group(2), "mark", "mark the window or pane"),
     b(Ctx::Tree, C('a'), Cmd::MarkAll, Group(2), "all", "mark every changed window"),
     b(Ctx::Tree, C('r'), Cmd::Restore, Group(2), "restore", "restore the marked windows, or every missing one"),
@@ -228,9 +233,6 @@ pub static BINDINGS: &[Binding] = &[
     b(Ctx::Tree, Key::Left, Cmd::Collapse, Hidden, "", "hide the window's panes"),
     b(Ctx::Tree, C('s'), Cmd::Save, Group(4), "save", "save a restore point"),
     b(Ctx::Tree, C('n'), Cmd::NextWaiting, Group(4), "waiting", "next window waiting for you"),
-    // One entry for everything that rearranges tmux: the menu behind it is
-    // self-describing.
-    b(Ctx::Tree, C('x'), Cmd::Menu, Group(5), "window/pane", "window and pane commands"),
     b(Ctx::Tree, C('p'), Cmd::PointNext, Group(6), "point", "older restore point"),
     b(Ctx::Tree, C('P'), Cmd::PointPrev, Group(6), "point", "newer restore point"),
     b(Ctx::Tree, C('c'), Cmd::ClearMarks, Hidden, "", "clear the marks"),

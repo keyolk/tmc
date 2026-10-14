@@ -205,11 +205,19 @@ fn render_header(frame: &mut Frame, area: Rect, model: &Model, now_secs: u64) {
     // most important thing on screen while typing, and a mode line that
     // appears and disappears makes the tree jump.
     if model.searching {
+        summary.push(Span::raw("   "));
+        // A restored query is drawn selected, the way a GUI search box
+        // shows last time's text: typing replaces it.
+        let style = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
         summary.push(Span::styled(
-            format!("   {}", model.search),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            model.search.clone(),
+            if model.search_selected {
+                style.add_modifier(Modifier::REVERSED)
+            } else {
+                style
+            },
         ));
         summary.push(Span::styled("▌", Style::default().fg(Color::Yellow)));
     } else if !model.search.is_empty() {
