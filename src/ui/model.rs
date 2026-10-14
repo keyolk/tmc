@@ -208,58 +208,55 @@ pub fn actions(model: &Model) -> Vec<Action> {
         n => format!("{n} windows"),
     };
 
-    vec![
-        Action {
-            kind: ActionKind::Break,
-            key: 'b',
-            label: "break out",
-            detail: panes_detail.clone(),
-            enabled: panes > 0,
-        },
-        Action {
-            kind: ActionKind::Join,
-            key: 'j',
-            label: "join into a window",
-            detail: if panes > 0 && live_windows < 2 {
-                "no other window".to_string()
-            } else {
-                panes_detail
-            },
-            enabled: panes > 0 && live_windows >= 2,
-        },
-        Action {
-            kind: ActionKind::Merge,
-            key: 'm',
-            label: "merge windows",
-            detail: if merging >= 2 {
-                format!("{merging} windows")
-            } else {
-                "needs two or more marked".to_string()
-            },
-            enabled: merging >= 2,
-        },
-        Action {
-            kind: ActionKind::Send,
-            key: 's',
-            label: "send to other session",
-            detail: if windows > 0 && model.live_sessions() != 2 {
-                match model.live_sessions() {
-                    0 | 1 => "no other session".to_string(),
-                    n => format!("{n} sessions — ambiguous"),
-                }
-            } else {
-                windows_detail.clone()
-            },
-            enabled: windows > 0 && model.live_sessions() == 2,
-        },
-        Action {
-            kind: ActionKind::Kill,
-            key: 'k',
-            label: "close",
-            detail: windows_detail,
-            enabled: windows > 0,
-        },
-    ]
+    let resolve = |kind: ActionKind| -> (String, bool) {
+        match kind {
+            ActionKind::Break => (panes_detail.clone(), panes > 0),
+            ActionKind::Join => (
+                if panes > 0 && live_windows < 2 {
+                    "no other window".to_string()
+                } else {
+                    panes_detail.clone()
+                },
+                panes > 0 && live_windows >= 2,
+            ),
+            ActionKind::Merge => (
+                if merging >= 2 {
+                    format!("{merging} windows")
+                } else {
+                    "needs two or more marked".to_string()
+                },
+                merging >= 2,
+            ),
+            ActionKind::Send => (
+                if windows > 0 && model.live_sessions() != 2 {
+                    match model.live_sessions() {
+                        0 | 1 => "no other session".to_string(),
+                        n => format!("{n} sessions — ambiguous"),
+                    }
+                } else {
+                    windows_detail.clone()
+                },
+                windows > 0 && model.live_sessions() == 2,
+            ),
+            ActionKind::Kill => (windows_detail.clone(), windows > 0),
+        }
+    };
+
+    // Keys, labels and order come from the binding table, so the menu cannot
+    // offer a letter that dispatch does not answer to.
+    super::keys::menu_rows()
+        .into_iter()
+        .map(|(kind, key, label)| {
+            let (detail, enabled) = resolve(kind);
+            Action {
+                kind,
+                key,
+                label,
+                detail,
+                enabled,
+            }
+        })
+        .collect()
 }
 
 /// The TUI's whole state.
@@ -285,10 +282,24 @@ pub struct Model {
     pub pending_move: Option<PendingMove>,
     /// True while the `x` menu is open and waiting for the second key.
     pub menu: bool,
+    /// True while the `?` overlay is up, and how far it is scrolled.
+    pub help: bool,
+    pub help_scroll: usize,
+    /// What a background command is doing, while one runs. Navigation stays
+    /// live meanwhile; commands that change tmux wait their turn.
+    pub busy: Option<&'static str>,
+    /// The panes as of the last reload. Commands resolve marks against this
+    /// rather than asking tmux again on the input thread; it is also what
+    /// was on screen when the command was chosen.
+    pub live: Vec<tmux::Pane>,
     /// Typed search. Empty means the whole tree is shown.
     pub search: String,
     /// True while the search line is accepting keys.
     pub searching: bool,
+    /// The query was restored from the last session and not yet touched.
+    /// Shown selected: the first letter typed replaces it rather than being
+    /// appended to it, Backspace clears it, and Enter or a move accepts it.
+    pub search_selected: bool,
     /// Set when the running binary predates the checked-out source.
     pub stale_build: Option<String>,
     /// Windows whose panes are listed, by target.
@@ -315,8 +326,13 @@ impl Model {
             status: String::new(),
             pending_move: None,
             menu: false,
+            help: false,
+            help_scroll: 0,
+            busy: None,
+            live: Vec::new(),
             search: String::new(),
             searching: false,
+            search_selected: false,
             stale_build: check_build(),
             expanded: std::collections::HashSet::new(),
             preview: None,
@@ -379,6 +395,7 @@ impl Model {
     ) {
         let diff = crate::layout::diff::compare(panes, saved, tree);
         self.counts = diff.counts();
+        self.live = panes.to_vec();
         self.rows = build_rows(panes, &diff, pending, tree, &self.expanded);
         self.waiting = self
             .rows
@@ -504,6 +521,14 @@ impl Model {
 
     pub fn search_pop(&mut self) {
         self.search.pop();
+        self.cursor = 0;
+        self.skip_header(1);
+    }
+
+    /// Drop the whole query — the way out of a long one, and of a query
+    /// restored from the last session that is not what this one is for.
+    pub fn search_clear(&mut self) {
+        self.search.clear();
         self.cursor = 0;
         self.skip_header(1);
     }

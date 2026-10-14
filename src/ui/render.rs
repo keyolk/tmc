@@ -7,6 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
+use super::keys::{self, Ctx};
 use super::model::{Model, Row, actions};
 use crate::clock;
 use crate::layout::diff::Change;
@@ -55,6 +56,9 @@ pub fn draw(frame: &mut Frame, model: &Model, now_secs: u64) {
     if model.menu {
         render_menu(frame, rows[1], model);
     }
+    if model.help {
+        render_help(frame, rows[1], model.help_scroll);
+    }
 }
 
 /// The `x` menu: every window and pane command, with what each would act on.
@@ -65,6 +69,7 @@ pub fn draw(frame: &mut Frame, model: &Model, now_secs: u64) {
 fn render_menu(frame: &mut Frame, body: Rect, model: &Model) {
     let entries = actions(model);
     let title = format!(" x  {} ", menu_target(model));
+    let footer = keys::footer(Ctx::Menu, model, usize::MAX);
 
     // Sized to its contents: the detail column is right-aligned, so the box
     // has to know the widest row before it can place anything.
@@ -77,7 +82,7 @@ fn render_menu(frame: &mut Frame, body: Rect, model: &Model) {
     const GAP: usize = 3;
     let inner = (widest_key + GAP + widest_detail)
         .max(title.width())
-        .max("esc cancel".width());
+        .max(footer.width());
     // +2 for the border, +2 for a column of padding either side.
     let width = (inner as u16 + 4).min(body.width);
     // One row per action, one for the footer, one blank above it.
@@ -122,10 +127,7 @@ fn render_menu(frame: &mut Frame, body: Rect, model: &Model) {
         })
         .collect();
     lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "esc cancel",
-        Style::default().fg(Color::DarkGray),
-    ));
+    lines.push(Line::styled(footer, Style::default().fg(Color::DarkGray)));
 
     frame.render_widget(Clear, area);
     frame.render_widget(
@@ -203,11 +205,19 @@ fn render_header(frame: &mut Frame, area: Rect, model: &Model, now_secs: u64) {
     // most important thing on screen while typing, and a mode line that
     // appears and disappears makes the tree jump.
     if model.searching {
+        summary.push(Span::raw("   "));
+        // A restored query is drawn selected, the way a GUI search box
+        // shows last time's text: typing replaces it.
+        let style = Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD);
         summary.push(Span::styled(
-            format!("   {}", model.search),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            model.search.clone(),
+            if model.search_selected {
+                style.add_modifier(Modifier::REVERSED)
+            } else {
+                style
+            },
         ));
         summary.push(Span::styled("▌", Style::default().fg(Color::Yellow)));
     } else if !model.search.is_empty() {
@@ -492,7 +502,7 @@ fn render_preview(frame: &mut Frame, area: Rect, model: &Model, w: &super::model
         return;
     }
 
-    // Keyed by whatever `app::refresh_preview` captured: the pane id when one
+    // Keyed by whatever `app::preview_target` asked for: the pane id when one
     // is selected, the window otherwise. Asking by window while a pane is
     // selected silently rendered "(nothing on screen)".
     let key = match model.current_pane() {
@@ -511,7 +521,18 @@ fn render_preview(frame: &mut Frame, area: Rect, model: &Model, w: &super::model
             );
             return;
         }
-        None => "",
+        // Still being captured. An empty body would say "(nothing on
+        // screen)" for the moment it takes, which is a claim, not a wait.
+        None => {
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    "─ output ".to_string() + &"─".repeat(area.width.saturating_sub(9) as usize),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                area,
+            );
+            return;
+        }
     };
 
     let mut lines: Vec<Line> = vec![Line::styled(
@@ -554,18 +575,14 @@ fn render_keys(frame: &mut Frame, area: Rect, model: &Model) {
         return;
     }
 
-    // While the menu is up its letters mean the menu's commands. Leaving the
-    // tree's hints on screen would advertise `j/k move` at the moment `j`
-    // joins panes into a window.
-    if model.menu {
-        frame.render_widget(
-            Paragraph::new("a letter runs it   esc cancel")
-                .style(Style::default().fg(Color::DarkGray)),
-            area,
-        );
-        return;
-    }
+    let width = area.width as usize;
+    let ctx = keys::context(model);
+    let dim = Style::default().fg(Color::DarkGray);
 
+    // The hints are derived from the binding table for whatever context is
+    // live: while the menu is up its letters mean the menu's commands, and
+    // leaving the tree's hints on screen would advertise `j/k move` at the
+    // moment `j` joins panes into a window.
     if let Some(moving) = &model.pending_move {
         let what = match moving.panes.as_slice() {
             [(pane, from)] => format!("moving {pane} from {from}"),
@@ -575,73 +592,110 @@ fn render_keys(frame: &mut Frame, area: Rect, model: &Model) {
                 moving.sources().join(", ")
             ),
         };
-        let text = if model.searching {
-            format!("{what}   /{}▌   ⏎ confirm   esc filter off", model.search)
+        let what = if model.searching {
+            format!("{what}   /{}▌", model.search)
         } else {
-            format!("{what}   j/k window   / filter   ⏎ confirm   esc cancel")
+            what
         };
+        let room = width.saturating_sub(what.width() + 3);
+        let text = format!("{what}   {}", keys::footer(ctx, model, room));
         frame.render_widget(
-            Paragraph::new(truncate(&text, area.width as usize))
-                .style(Style::default().fg(Color::Yellow)),
+            Paragraph::new(truncate(&text, width)).style(Style::default().fg(Color::Yellow)),
             area,
         );
         return;
     }
 
-    // Searching is where the TUI starts, so its hint has to name the way out
-    // and the way to everything else — otherwise the other twelve keys are
-    // undiscoverable from the screen you land on.
-    if model.searching {
-        let text = "type to search   ↑↓ move   ⏎ switch   tab/esc commands   ctrl-c quit";
-        frame.render_widget(
-            Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
-            area,
-        );
-        return;
-    }
-
-    let restore = if model.marks.is_empty() {
-        "r restore all"
-    } else {
-        "r restore marked"
+    // A command running on the worker says so ahead of the hints, which stay:
+    // navigation still works while it runs.
+    let mut lead = match model.busy {
+        Some(label) => format!("{label}…   "),
+        None => String::new(),
     };
-    // Ordered by how often each is reached for. A truncated hint line is
-    // worse than a short one — it cuts mid-word and hides `q quit` — so the
-    // tail is dropped group by group until it fits.
-    let groups = [
-        "/ search  j/k move  ⏎ switch".to_string(),
-        format!("space mark  a all  {restore}"),
-        // Expanding comes before the rarer commands: it is how you reach a
-        // pane at all, and a hint that drops it first leaves `b`/`J` looking
-        // like they act on nothing.
-        "l/h panes".to_string(),
-        "s save  n waiting".to_string(),
-        // One entry now, because the menu behind it is self-describing --
-        // and because a hint line that spelled all five was the thing that
-        // pushed `p/P point` off the end of a narrow terminal.
-        "x window/pane".to_string(),
-        "p/P point".to_string(),
-    ];
-
-    let mut text = String::new();
-    for group in &groups {
-        let candidate = if text.is_empty() {
-            group.clone()
-        } else {
-            format!("{text}   {group}")
-        };
-        // Leave room for the quit hint, which is always shown: leaving without
-        // a visible way out is the one thing the hint line must never do.
-        const QUIT: &str = "   esc/q quit";
-        if candidate.width() + QUIT.width() > area.width as usize {
-            break;
-        }
-        text = candidate;
+    match ctx {
+        Ctx::Menu => lead.push_str("a letter runs it   "),
+        // Searching is where the TUI starts, so its hint has to name the way
+        // out and the way to everything else.
+        Ctx::Search => lead.push_str("type to search   "),
+        _ => {}
     }
-    text.push_str("   esc/q quit");
+    let room = width.saturating_sub(lead.width());
+    let text = format!("{lead}{}", keys::footer(ctx, model, room));
+    let style = if model.busy.is_some() {
+        Style::default().fg(Color::Yellow)
+    } else {
+        dim
+    };
+    frame.render_widget(Paragraph::new(truncate(&text, width)).style(style), area);
+}
 
+/// `?` help, derived from the binding table: every context, every key.
+///
+/// Drawn over the body like the `x` menu, so the tree it describes stays in
+/// view around it. Scrolled with j/k on a short terminal rather than
+/// squeezed; the hint row below names both.
+fn render_help(frame: &mut Frame, body: Rect, scroll: usize) {
+    let sections = keys::help_lines();
+    let widest_keys = sections
+        .iter()
+        .flat_map(|(_, lines)| lines.iter().map(|(k, _)| k.width()))
+        .max()
+        .unwrap_or(0);
+    let widest_help = sections
+        .iter()
+        .flat_map(|(_, lines)| lines.iter().map(|(_, h)| h.width()))
+        .max()
+        .unwrap_or(0);
+    let width = ((widest_keys + 2 + widest_help) as u16 + 4).min(body.width);
+    let rows: usize = sections.iter().map(|(_, l)| l.len() + 2).sum();
+    let height = (rows as u16 + 2).min(body.height);
+    let area = centred(body, width, height);
+    let usable = area.width.saturating_sub(4) as usize;
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (title, entries) in &sections {
+        if !lines.is_empty() {
+            lines.push(Line::raw(""));
+        }
+        lines.push(Line::styled(
+            title.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        for (k, h) in entries {
+            let pad = widest_keys.saturating_sub(k.width()) + 2;
+            let help = truncate(h, usable.saturating_sub(widest_keys + 2));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    k.clone(),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" ".repeat(pad)),
+                Span::raw(help),
+            ]));
+        }
+    }
+
+    // Past the end would scroll the box empty; stop with the last line at
+    // the bottom.
+    let inner = area.height.saturating_sub(2) as usize;
+    let scroll = scroll.min(lines.len().saturating_sub(inner));
+    let lines: Vec<Line> = lines.into_iter().skip(scroll).collect();
+
+    frame.render_widget(Clear, area);
     frame.render_widget(
-        Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(Span::styled(
+                    " keys ",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ))
+                .padding(ratatui::widgets::Padding::horizontal(1)),
+        ),
         area,
     );
 }
