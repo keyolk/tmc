@@ -496,6 +496,39 @@ mod tests {
     }
 
     #[test]
+    fn the_status_is_visible_at_any_width() {
+        // A popup narrower than the detail panel's threshold, and a search
+        // that matches nothing, both lose the panel; the status must not go
+        // with it.
+        let mut m = model();
+        m.status = "killed 2 window(s)".into();
+        for width in [60u16, 70, 89, 110] {
+            let out = render(&m, width, 12, 0);
+            let last = out.lines().last().unwrap_or_default();
+            assert!(
+                last.contains("killed 2 window(s)"),
+                "at {width} columns: [{last}]"
+            );
+        }
+
+        for c in "zzz".chars() {
+            m.search_push(c);
+        }
+        let out = render(&m, 110, 12, 0);
+        assert!(out.contains("killed 2 window(s)"), "no selection:\n{out}");
+    }
+
+    #[test]
+    fn a_long_status_is_cut_not_overflowed() {
+        let mut m = model();
+        m.status = "reload failed: ps timed out after 3s; ".repeat(5);
+        let out = render(&m, 60, 12, 0);
+        let last = out.lines().last().unwrap_or_default();
+        assert!(last.width() <= 60, "[{last}]");
+        assert!(last.ends_with('…'), "the cut is marked: [{last}]");
+    }
+
+    #[test]
     fn the_key_hint_names_what_r_will_actually_do() {
         let mut m = model();
         let plain = render(&m, 100, 14, 0);

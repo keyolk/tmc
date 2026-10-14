@@ -474,13 +474,6 @@ fn render_detail(frame: &mut Frame, area: Rect, model: &Model) {
             ),
         ]));
     }
-    if !model.status.is_empty() {
-        head.push(Line::styled(
-            model.status.clone(),
-            Style::default().fg(Color::Yellow),
-        ));
-    }
-
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -546,6 +539,21 @@ fn render_preview(frame: &mut Frame, area: Rect, model: &Model, w: &super::model
 }
 
 fn render_keys(frame: &mut Frame, area: Rect, model: &Model) {
+    // The status takes the key row while it is set. It used to live in the
+    // detail panel, which is dropped below 90 columns and empty when no window
+    // is selected -- exactly the popup sizes and the empty search where a
+    // "killed 2 window(s)" or a failed reload most needs saying. The row is
+    // always on screen, and any key clears the status, so the hints it covers
+    // come back on the next keystroke.
+    if !model.status.is_empty() {
+        frame.render_widget(
+            Paragraph::new(truncate(&model.status, area.width as usize))
+                .style(Style::default().fg(Color::Yellow)),
+            area,
+        );
+        return;
+    }
+
     // While the menu is up its letters mean the menu's commands. Leaving the
     // tree's hints on screen would advertise `j/k move` at the moment `j`
     // joins panes into a window.
