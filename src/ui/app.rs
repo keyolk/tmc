@@ -79,7 +79,13 @@ fn event_loop(terminal: &mut Term, model: &mut Model, focus: Option<String>) -> 
     // screen.
     terminal.draw(|frame| super::render::draw(frame, model, now_secs()))?;
 
-    reload(model)?;
+    // A reload failure is reported, not fatal: the tick below retries it, and
+    // a popup that closes on its own because `ps` was slow once reads as a
+    // crash. `reload_error` remembers what was put on screen so a later good
+    // reload can take it down again.
+    let mut reload_error = None;
+    let result = reload(model);
+    settle_reload(model, result, &mut reload_error);
     // The window this was summoned from is the context the user is already in,
     // so it is what the panel should describe first.
     if let Some(target) = &focus {
@@ -103,7 +109,13 @@ fn event_loop(terminal: &mut Term, model: &mut Model, focus: Option<String>) -> 
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
-                handle_key(model, key.code, key.modifiers)?;
+                // A failed command says so and leaves the TUI up. The commands
+                // shell out to tmux and ps, and an error there is about that
+                // one action -- quitting would throw away the selection and
+                // the marks along with it.
+                if let Err(e) = handle_key(model, key.code, key.modifiers) {
+                    model.status = format!("{e:#}");
+                }
                 if model.quit || model.switch_to.is_some() {
                     return Ok(());
                 }
@@ -126,9 +138,11 @@ fn event_loop(terminal: &mut Term, model: &mut Model, focus: Option<String>) -> 
         if model.menu {
             continue;
         }
-        reload(model)?;
+        let before = model.status.clone();
+        let result = reload(model);
+        settle_reload(model, result, &mut reload_error);
         let current = model.fingerprint();
-        if current != last {
+        if current != last || model.status != before {
             last = current;
             needs_redraw = true;
         }
@@ -350,9 +364,13 @@ fn handle_key(model: &mut Model, code: KeyCode, mods: KeyModifiers) -> Result<()
 }
 
 /// Re-read tmux, the process table, the queue and the selected point.
+///
+/// All or nothing: the model is only touched once every read has succeeded.
+/// A failed `tmux list-panes` used to read as "no panes", which wiped the tree
+/// and marked every window in the point as gone until the next tick.
 fn reload(model: &mut Model) -> Result<()> {
-    let panes = tmux::panes().unwrap_or_default();
-    let tree = proc::Tree::capture_with_args()?;
+    let panes = tmux::panes().context("list tmux panes")?;
+    let tree = proc::Tree::capture_with_args().context("read the process table")?;
     let pending = notify::load();
     let saved = match model.current_point() {
         Some(p) => point::read(&p.reference).unwrap_or_default(),
@@ -360,6 +378,26 @@ fn reload(model: &mut Model) -> Result<()> {
     };
     model.refresh(&panes, &saved, &tree, &pending);
     Ok(())
+}
+
+/// Put a reload's outcome on screen. A failure keeps the last good tree and
+/// says why; the next success takes that message down, but only if it is
+/// still the one showing -- a status the user caused since then stays.
+fn settle_reload(model: &mut Model, result: Result<()>, shown: &mut Option<String>) {
+    match result {
+        Ok(()) => {
+            if let Some(msg) = shown.take()
+                && model.status == msg
+            {
+                model.status.clear();
+            }
+        }
+        Err(e) => {
+            let msg = format!("reload failed: {e:#}");
+            model.status = msg.clone();
+            *shown = Some(msg);
+        }
+    }
 }
 
 fn save_point(model: &mut Model) -> Result<()> {
@@ -958,6 +996,31 @@ mod tests {
     /// their own modules.
     fn press(model: &mut Model, c: char, mods: KeyModifiers) {
         let _ = handle_key(model, KeyCode::Char(c), mods);
+    }
+
+    #[test]
+    fn a_failed_reload_keeps_the_tree_and_says_why() {
+        let mut m = model_with_window();
+        let mut shown = None;
+        settle_reload(&mut m, Err(anyhow::anyhow!("ps timed out")), &mut shown);
+
+        assert_eq!(m.rows.len(), 1, "the last good tree stays on screen");
+        assert!(m.status.contains("ps timed out"), "{}", m.status);
+        assert!(!m.quit, "a transient failure does not close the popup");
+
+        settle_reload(&mut m, Ok(()), &mut shown);
+        assert!(m.status.is_empty(), "recovery takes the error down");
+    }
+
+    #[test]
+    fn recovery_leaves_a_newer_status_alone() {
+        let mut m = model_with_window();
+        let mut shown = None;
+        settle_reload(&mut m, Err(anyhow::anyhow!("tmux gone")), &mut shown);
+        m.status = "saved 2 session(s)".into();
+
+        settle_reload(&mut m, Ok(()), &mut shown);
+        assert_eq!(m.status, "saved 2 session(s)");
     }
 
     #[test]
