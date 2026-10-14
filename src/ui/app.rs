@@ -56,10 +56,29 @@ pub fn run(search: bool) -> Result<Outcome> {
 type Term = Terminal<CrosstermBackend<io::Stdout>>;
 
 fn setup() -> Result<Term> {
+    restore_terminal_on_panic();
     enable_raw_mode()?;
     let mut out = io::stdout();
     crossterm::execute!(out, EnterAlternateScreen)?;
     Ok(Terminal::new(CrosstermBackend::new(out))?)
+}
+
+/// Put the terminal back before a panic message is printed.
+///
+/// A panic unwinds past `teardown`, so without this the shell is left in raw
+/// mode on the alternate screen: the message is drawn into a screen that is
+/// about to vanish, and the popup's pane is unusable until `reset`. The
+/// previous hook still runs afterwards, so the message and backtrace are
+/// unchanged -- they just land on the normal screen.
+fn restore_terminal_on_panic() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Errors are ignored on purpose: this is already the failure path, and
+        // there is nowhere left to report a terminal that will not reset.
+        let _ = disable_raw_mode();
+        let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+        previous(info);
+    }));
 }
 
 fn teardown(terminal: &mut Term) -> Result<()> {
