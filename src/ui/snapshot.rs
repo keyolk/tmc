@@ -339,7 +339,7 @@ mod tests {
                 "at {width} columns the quit keys vanished: [{last}]",
             );
             assert!(
-                last.chars().count() <= width as usize,
+                last.width() <= width as usize,
                 "at {width} columns the hint overflowed: [{last}]",
             );
         }
@@ -478,6 +478,21 @@ mod tests {
                 "the box overflowed at 50 columns: [{line}]"
             );
         }
+    }
+
+    #[test]
+    fn a_korean_window_name_fits_the_menu_title() {
+        // The box is sized to its widest line. Measured in characters, a
+        // Korean name counts half its columns, the box comes out too narrow
+        // and the border clips the very name the title is there to show.
+        let name = "한글로된아주아주아주아주긴윈도우이름입니다하하하하하";
+        let mut m = model();
+        if let Row::Window(w) = &mut m.rows[2] {
+            w.name = name.into();
+        }
+        m.menu = true;
+        let out = render(&m, 120, 20, 0);
+        assert!(out.contains(name), "the title was clipped:\n{out}");
     }
 
     #[test]

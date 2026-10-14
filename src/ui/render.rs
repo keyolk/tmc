@@ -5,6 +5,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use unicode_width::UnicodeWidthStr;
 
 use super::model::{Model, Row, actions};
 use crate::clock;
@@ -71,16 +72,12 @@ fn render_menu(frame: &mut Frame, body: Rect, model: &Model) {
         .iter()
         .map(|a| format!("{}:{}", a.key, a.label))
         .collect();
-    let widest_key = keys.iter().map(|k| k.chars().count()).max().unwrap_or(0);
-    let widest_detail = entries
-        .iter()
-        .map(|a| a.detail.chars().count())
-        .max()
-        .unwrap_or(0);
+    let widest_key = keys.iter().map(|k| k.width()).max().unwrap_or(0);
+    let widest_detail = entries.iter().map(|a| a.detail.width()).max().unwrap_or(0);
     const GAP: usize = 3;
     let inner = (widest_key + GAP + widest_detail)
-        .max(title.chars().count())
-        .max("esc cancel".len());
+        .max(title.width())
+        .max("esc cancel".width());
     // +2 for the border, +2 for a column of padding either side.
     let width = (inner as u16 + 4).min(body.width);
     // One row per action, one for the footer, one blank above it.
@@ -97,9 +94,7 @@ fn render_menu(frame: &mut Frame, body: Rect, model: &Model) {
         .zip(&keys)
         .map(|(action, key)| {
             let detail = truncate(&action.detail, budget);
-            let pad = usable
-                .saturating_sub(widest_key + detail.chars().count())
-                .max(1);
+            let pad = usable.saturating_sub(widest_key + detail.width()).max(1);
             let (key_style, label_style) = if action.enabled {
                 (
                     Style::default()
@@ -121,7 +116,7 @@ fn render_menu(frame: &mut Frame, body: Rect, model: &Model) {
             Line::from(vec![
                 Span::styled(k.to_string(), key_style),
                 Span::styled(label.to_string(), label_style),
-                Span::raw(" ".repeat(widest_key - key.chars().count() + pad)),
+                Span::raw(" ".repeat(widest_key - key.width() + pad)),
                 Span::styled(detail, Style::default().fg(Color::DarkGray)),
             ])
         })
@@ -630,7 +625,7 @@ fn render_keys(frame: &mut Frame, area: Rect, model: &Model) {
         // Leave room for the quit hint, which is always shown: leaving without
         // a visible way out is the one thing the hint line must never do.
         const QUIT: &str = "   esc/q quit";
-        if candidate.chars().count() + QUIT.chars().count() > area.width as usize {
+        if candidate.width() + QUIT.width() > area.width as usize {
             break;
         }
         text = candidate;
@@ -658,7 +653,7 @@ fn style_for(change: Change) -> Style {
 /// character, so counting characters overflows the panel by up to double.
 /// Window names and captured output here are routinely Korean.
 fn truncate(s: &str, width: usize) -> String {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    use unicode_width::UnicodeWidthChar;
 
     if s.width() <= width {
         return s.to_string();
@@ -681,7 +676,6 @@ fn truncate(s: &str, width: usize) -> String {
 
 /// Pad to `width` terminal columns.
 fn pad(s: &str, width: usize) -> String {
-    use unicode_width::UnicodeWidthStr;
     let mut out = s.to_string();
     out.push_str(&" ".repeat(width.saturating_sub(s.width())));
     out
