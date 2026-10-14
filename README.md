@@ -17,7 +17,7 @@ saved:20260830T150700Z  (33m ago)   ~19 +3 -3
                                                     │  test result: ok. 166 passed
                                                     │  ❯
 
-type to search   ↑↓ move   ⏎ switch   tab/esc commands   ctrl-c quit
+type to search   ↑/↓ move  ⏎ switch  tab/esc commands   ctrl-u clear   ctrl-c quit
 ```
 
 Replaces `tmux.sh`, `twm` and the `tmux-fzf` plugin.
@@ -111,6 +111,7 @@ from where the TUI opens leaves.
 | `↑`/`↓`, `Ctrl-n`/`Ctrl-p` | move |
 | `Enter` | switch to the window and exit |
 | `Tab`, `Esc` | keep the filter, return to normal/tree mode |
+| `Ctrl-u` | clear the query |
 
 **Tree**
 
@@ -128,7 +129,22 @@ from where the TUI opens leaves.
 | `p` / `P` | next / previous restore point |
 | `l` / `h` | expand a window to its panes / collapse |
 | `x` | the window and pane menu, below |
+| `R` | re-read tmux now |
+| `?` | every key, in every mode |
 | `q`, `Esc`, `Ctrl-C` | quit |
+
+The hint row, the `x` menu, `?` and the key dispatch are all read off one
+table (`src/ui/keys.rs`), so a key cannot be advertised and not answer, or
+answer and not be listed.
+
+Reloads, previews and every command that changes tmux run off the input
+thread. Navigation and `Esc` keep answering while a restore brings windows up;
+another tmux-changing command waits until it finishes, and leaving waits for it
+too rather than cutting it off halfway.
+
+**Remembered between runs.** Expanded windows, the last query and the restore
+point being compared against are kept in `$XDG_STATE_HOME/tmc/ui.json`
+(`~/.local/state/tmc/ui.json` by default) and put back on the next open.
 
 **`x` — rearranging tmux**
 
