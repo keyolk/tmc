@@ -6,6 +6,10 @@
 
 pub mod app;
 pub mod clipboard;
+mod commands;
+pub mod keys;
 pub mod model;
 pub mod render;
 pub mod snapshot;
+pub mod state;
+mod worker;

@@ -539,4 +539,64 @@ mod tests {
         assert!(marked.contains("restore marked"), "{marked}");
         assert!(marked.contains("1 marked"), "{marked}");
     }
+
+    #[test]
+    fn help_lists_every_key_the_table_binds() {
+        let mut m = model();
+        m.help = true;
+        let out = render(&m, 120, 80, 0);
+        for title in ["search line", "tree", "x menu", "choosing a destination"] {
+            assert!(out.contains(title), "{title}:\n{out}");
+        }
+        // Keys that never appear in the hint row are still documented here.
+        assert!(out.contains("re-read tmux now"), "{out}");
+        assert!(out.contains("clear the marks"), "{out}");
+        assert!(out.contains("g/home"), "{out}");
+    }
+
+    #[test]
+    fn help_on_a_short_terminal_is_cut_not_overflowed() {
+        let mut m = model();
+        m.help = true;
+        let out = render(&m, 60, 14, 0);
+        assert_eq!(out.lines().count(), 14);
+        assert!(out.lines().all(|l| l.width() <= 60), "{out}");
+    }
+
+    #[test]
+    fn help_scrolls_to_its_last_line_and_no_further() {
+        let mut m = model();
+        m.help = true;
+        m.help_scroll = 10_000;
+        let out = render(&m, 100, 20, 0);
+        assert!(
+            out.contains("ctrl-c"),
+            "the last section is reachable:\n{out}"
+        );
+        assert!(out.contains("╰"), "the box is still drawn:\n{out}");
+    }
+
+    #[test]
+    fn the_hint_row_offers_help() {
+        let out = render(&model(), 100, 12, 0);
+        let last = out.lines().last().unwrap_or_default();
+        assert!(last.contains("? help"), "{last}");
+    }
+
+    #[test]
+    fn a_running_command_is_named_while_the_hints_stay() {
+        let mut m = model();
+        m.busy = Some("restoring");
+        let out = render(&m, 120, 12, 0);
+        let last = out.lines().last().unwrap_or_default();
+        assert!(last.starts_with("restoring…"), "{last}");
+        assert!(last.contains("esc/q quit"), "{last}");
+    }
+
+    #[test]
+    fn a_preview_still_being_captured_does_not_claim_an_empty_screen() {
+        let m = model();
+        let out = render(&m, 120, 20, 0);
+        assert!(!out.contains("nothing on screen"), "{out}");
+    }
 }

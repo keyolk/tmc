@@ -1,4 +1,9 @@
 //! The terminal loop: poll, redraw only on change, handle keys.
+//!
+//! The loop owns the terminal and the model and never shells out. Reloads,
+//! previews and the commands that change tmux run on `worker` threads and
+//! come back as replies; the loop drains them between keys, so Esc answers
+//! while a restore is still bringing windows up.
 
 use std::io;
 use std::time::{Duration, Instant};
@@ -11,17 +16,24 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use std::collections::HashMap;
-
-use super::model::{ActionKind, Model, MoveKind, Row, WindowRow, actions};
-use crate::collect::{cmd, notify, proc, tmux};
-use crate::config;
-use crate::layout::{point, restore, save};
+use super::commands::{cancel_move, confirm_move, restore_marked, run_action, save_point};
+use super::keys::{self, Cmd, Ctx, Key};
+use super::model::{Model, actions};
+use super::state;
+use super::worker::{Job, Reply, Snapshot, Workers};
+use crate::layout::point::{self, Ref};
+use crate::layout::save;
 
 /// How often the world is re-read. tmux exposes no event stream a foreign
 /// process can subscribe to, so this polls; `fingerprint` keeps the redraw
 /// from happening when nothing moved.
 const TICK: Duration = Duration::from_secs(2);
+
+/// How often the loop looks for a worker's reply while one is outstanding.
+/// crossterm cannot wait on a channel and the terminal at once, so the loop
+/// polls the terminal in short slices until the reply lands — and only then:
+/// with nothing outstanding it sleeps until the next tick.
+const REPLY_POLL: Duration = Duration::from_millis(15);
 
 /// What the caller should do once the terminal is restored.
 pub enum Outcome {
@@ -42,9 +54,24 @@ pub fn run(search: bool) -> Result<Outcome> {
     let mut model = Model::new(points);
     model.searching = search;
 
+    // The last session's expanded windows, query and point. A broken file is
+    // said, not fatal: it is replaced on the way out.
+    let state_path = state::path();
+    match state::load(&state_path) {
+        Ok(saved) => saved.restore(&mut model),
+        Err(e) => model.status = format!("{e:#}"),
+    }
+
+    let focus = summoning_window();
     let mut terminal = setup().context("enter alternate screen")?;
-    let result = event_loop(&mut terminal, &mut model, summoning_window());
+    let result = event_loop(&mut terminal, &mut model, focus);
     teardown(&mut terminal)?;
+
+    // After the terminal is back, so a failure can be printed where it will
+    // be read, and so the write never holds up a keypress.
+    if let Err(e) = state::save(&state_path, &state::UiState::capture(&model)) {
+        eprintln!("tmc: could not save UI state: {e:#}");
+    }
     result?;
 
     Ok(match model.switch_to {
@@ -70,9 +97,18 @@ fn setup() -> Result<Term> {
 /// about to vanish, and the popup's pane is unusable until `reset`. The
 /// previous hook still runs afterwards, so the message and backtrace are
 /// unchanged -- they just land on the normal screen.
+///
+/// Only for the input thread. A worker's panic is caught and shown in the
+/// status line while the UI carries on; restoring the terminal for it would
+/// drop the alternate screen out from under a running TUI, and printing it
+/// would scribble over the frame.
 fn restore_terminal_on_panic() {
+    let ui = std::thread::current().id();
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().id() != ui {
+            return;
+        }
         // Errors are ignored on purpose: this is already the failure path, and
         // there is nowhere left to report a terminal that will not reset.
         let _ = disable_raw_mode();
@@ -88,263 +124,365 @@ fn teardown(terminal: &mut Term) -> Result<()> {
     Ok(())
 }
 
+/// What a key asks of the loop beyond changing the model.
+pub(super) enum Effect {
+    None,
+    /// Re-read the world (a different restore point, or `R`).
+    Reload,
+    /// Rebuild the tree from the last reading: expanding a window changes
+    /// which rows exist, not what tmux says.
+    Rebuild,
+    /// Run a command on the worker.
+    Job(Job),
+}
+
+/// The loop's side of the workers: what is outstanding and what came back.
+struct Io {
+    workers: Workers,
+    /// The newest reload or command requested. A reload reply from an older
+    /// one is superseded and dropped.
+    generation: u64,
+    /// Reload replies still to come. The tick starts no reload while one is
+    /// out, so a slow `ps` cannot stack a queue of them.
+    reloads: usize,
+    /// The restore point the running command's re-read will compare against.
+    job_point: Option<Ref>,
+    /// The pane capture asked for and not yet answered.
+    preview: Option<String>,
+    /// The last good reading, for `Effect::Rebuild`.
+    snapshot: Option<Snapshot>,
+    /// The reload error on screen, so a later good reload can take it down.
+    reload_error: Option<String>,
+    /// Where the cursor goes once the first reading lands.
+    focus: Option<String>,
+}
+
+impl Io {
+    fn new(focus: Option<String>) -> Self {
+        Self {
+            workers: Workers::start(),
+            generation: 0,
+            reloads: 0,
+            job_point: None,
+            preview: None,
+            snapshot: None,
+            reload_error: None,
+            focus,
+        }
+    }
+
+    fn outstanding(&self, model: &Model) -> bool {
+        self.reloads > 0 || self.preview.is_some() || model.busy.is_some()
+    }
+
+    fn reload(&mut self, model: &Model) {
+        // A running command re-reads the world when it ends; a reload queued
+        // behind it would only supersede that reading.
+        if model.busy.is_some() {
+            return;
+        }
+        self.generation += 1;
+        self.reloads += 1;
+        self.workers.reload(
+            self.generation,
+            model.current_point().map(|p| p.reference.clone()),
+        );
+    }
+
+    fn run(&mut self, model: &mut Model, effect: Effect) {
+        match effect {
+            Effect::None => {}
+            Effect::Reload => self.reload(model),
+            Effect::Rebuild => match &self.snapshot {
+                Some(s) => s.apply(model),
+                None => self.reload(model),
+            },
+            Effect::Job(job) => {
+                self.generation += 1;
+                model.busy = Some(job.label);
+                self.job_point = model.current_point().map(|p| p.reference.clone());
+                self.workers
+                    .job(self.generation, self.job_point.clone(), job);
+            }
+        }
+    }
+
+    /// Ask for the capture the panel needs, one at a time. A held-down `j`
+    /// would otherwise queue a `capture-pane` per row it passes.
+    fn want_preview(&mut self, model: &mut Model) {
+        let Some(target) = preview_target(model) else {
+            model.preview = None;
+            return;
+        };
+        if self.preview.is_some() || model.preview_for(&target).is_some() {
+            return;
+        }
+        self.preview = Some(target.clone());
+        self.workers.capture(target);
+    }
+
+    /// Take one reply into the model. Returns whether the screen changed.
+    fn apply(&mut self, model: &mut Model, reply: Reply) -> bool {
+        match reply {
+            Reply::Reloaded {
+                generation,
+                snapshot,
+            } => {
+                self.reloads = self.reloads.saturating_sub(1);
+                if generation != self.generation {
+                    return false;
+                }
+                // Not while the `x` menu is up. It names what it would act on
+                // -- "2 panes", "3 windows" -- and a reload landing between
+                // the prompt and the keypress would move the cursor or drop a
+                // mark, so the command would act on something other than what
+                // was on screen. The next tick reads again.
+                if model.menu {
+                    return false;
+                }
+                let before = (model.fingerprint(), model.status.clone());
+                self.settle(model, snapshot);
+                before != (model.fingerprint(), model.status.clone())
+            }
+            Reply::JobDone {
+                generation,
+                done,
+                snapshot,
+            } => {
+                model.busy = None;
+                let mut used = self.job_point.take();
+                if let Ok(d) = &done
+                    && let Some(points) = &d.points
+                {
+                    used = points.first().map(|p| p.reference.clone());
+                    model.points = points.clone();
+                    model.point_index = 0;
+                }
+                if generation == self.generation {
+                    self.settle(model, snapshot);
+                }
+                match done {
+                    Ok(d) => (d.finish)(model),
+                    Err(e) => model.status = format!("{e:#}"),
+                }
+                // `p` pressed while the command ran: its re-read compared
+                // against the old point.
+                if model.current_point().map(|p| &p.reference) != used.as_ref() {
+                    self.reload(model);
+                }
+                true
+            }
+            Reply::Preview { target, body } => {
+                self.preview = None;
+                if preview_target(model).as_deref() == Some(target.as_str()) {
+                    model.preview = Some((target, body));
+                    true
+                } else {
+                    // The cursor moved on while this was captured.
+                    self.want_preview(model);
+                    false
+                }
+            }
+        }
+    }
+
+    fn settle(&mut self, model: &mut Model, snapshot: Result<Snapshot>) {
+        match snapshot {
+            Ok(s) => {
+                s.apply(model);
+                self.snapshot = Some(s);
+                settle_reload(model, Ok(()), &mut self.reload_error);
+                // The window this was summoned from is the context the user
+                // is already in, so it is what the panel describes first.
+                if let Some(target) = self.focus.take() {
+                    model.focus(&target);
+                }
+            }
+            Err(e) => settle_reload(model, Err(e), &mut self.reload_error),
+        }
+    }
+}
+
 fn event_loop(terminal: &mut Term, model: &mut Model, focus: Option<String>) -> Result<()> {
     // Paint the chrome before reading the world. This runs as a popup, and the
     // first reload costs ~0.1s of `ps` and `tmux` before it can say anything;
-    // drawing after it meant the popup sat blank for that whole time and read
-    // as slow to open. The frame drawn here is the real one with an empty
-    // tree — the search line, the header and the panel are all already in
-    // place, so the reload below fills the rows in rather than replacing the
-    // screen.
+    // the frame drawn here is the real one with an empty tree, so the reply
+    // fills the rows in rather than replacing the screen.
     terminal.draw(|frame| super::render::draw(frame, model, now_secs()))?;
 
-    // A reload failure is reported, not fatal: the tick below retries it, and
-    // a popup that closes on its own because `ps` was slow once reads as a
-    // crash. `reload_error` remembers what was put on screen so a later good
-    // reload can take it down again.
-    let mut reload_error = None;
-    let result = reload(model);
-    settle_reload(model, result, &mut reload_error);
-    // The window this was summoned from is the context the user is already in,
-    // so it is what the panel should describe first.
-    if let Some(target) = &focus {
-        model.focus(target);
-    }
-    let mut last = model.fingerprint();
-    let mut needs_redraw = true;
+    let mut io = Io::new(focus);
+    io.reload(model);
+    let mut needs_redraw = false;
     let mut next_tick = Instant::now() + TICK;
 
     loop {
         if needs_redraw {
-            refresh_preview(model);
+            io.want_preview(model);
             let now = now_secs();
             terminal.draw(|frame| super::render::draw(frame, model, now))?;
             needs_redraw = false;
         }
 
-        let wait = next_tick.saturating_duration_since(Instant::now());
+        let until_tick = next_tick.saturating_duration_since(Instant::now());
+        let wait = if io.outstanding(model) {
+            until_tick.min(REPLY_POLL)
+        } else {
+            until_tick
+        };
         if event::poll(wait)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    let effect = handle_key(model, key.code, key.modifiers);
+                    io.run(model, effect);
+                    if model.quit || model.switch_to.is_some() {
+                        return finish_running_command(terminal, model, &mut io);
+                    }
+                    needs_redraw = true;
                 }
-                // A failed command says so and leaves the TUI up. The commands
-                // shell out to tmux and ps, and an error there is about that
-                // one action -- quitting would throw away the selection and
-                // the marks along with it.
-                if let Err(e) = handle_key(model, key.code, key.modifiers) {
-                    model.status = format!("{e:#}");
-                }
-                if model.quit || model.switch_to.is_some() {
-                    return Ok(());
-                }
-                needs_redraw = true;
-            } else {
-                needs_redraw = true; // resize
+                Event::Key(_) => {}
+                _ => needs_redraw = true, // resize
             }
-            continue;
         }
 
-        // Tick: re-read the world, but only redraw when the display would
-        // differ. On an idle workspace this leaves the app at 0 fps.
-        next_tick = Instant::now() + TICK;
-        // Not while the `x` menu is up. It names what it would act on -- "2
-        // panes", "3 windows" -- and a poll landing between the prompt and the
-        // keypress would move the cursor or drop a mark, so the command would
-        // act on something other than what was on screen when it was chosen.
-        // The menu is a momentary mode; a stale tree for a second is the
-        // cheaper of the two.
-        if model.menu {
-            continue;
+        while let Some(reply) = io.workers.try_recv() {
+            needs_redraw |= io.apply(model, reply);
         }
-        let before = model.status.clone();
-        let result = reload(model);
-        settle_reload(model, result, &mut reload_error);
-        let current = model.fingerprint();
-        if current != last || model.status != before {
-            last = current;
-            needs_redraw = true;
+
+        // Tick: re-read the world. The reply redraws only when the display
+        // would differ, so an idle workspace stays at 0 fps.
+        if Instant::now() >= next_tick {
+            next_tick = Instant::now() + TICK;
+            if io.reloads == 0 && !model.menu {
+                io.reload(model);
+            }
         }
     }
 }
 
-fn handle_key(model: &mut Model, code: KeyCode, mods: KeyModifiers) -> Result<()> {
+/// Leaving while a command runs waits for it.
+///
+/// The process exiting would kill the worker mid-command: a restore stopped
+/// between `new-window` and `send-keys` leaves windows with no command in
+/// them, a merge stops with half the panes moved. Every tmux call has its own
+/// timeout, so this wait is bounded.
+fn finish_running_command(terminal: &mut Term, model: &mut Model, io: &mut Io) -> Result<()> {
+    let Some(label) = model.busy else {
+        return Ok(());
+    };
+    model.status = format!("waiting for {label} to finish…");
+    terminal.draw(|frame| super::render::draw(frame, model, now_secs()))?;
+    while model.busy.is_some() {
+        let Some(reply) = io.workers.recv() else {
+            break; // the worker is gone; nothing left to wait for
+        };
+        io.apply(model, reply);
+    }
+    Ok(())
+}
+
+/// Turn a key into a change to the model, through the binding table.
+pub(super) fn handle_key(model: &mut Model, code: KeyCode, mods: KeyModifiers) -> Effect {
     model.status.clear();
+    let ctx = keys::context(model);
 
     // Under a Korean input source the shortcut keys arrive as jamo (`q` -> `ㅂ`)
     // and do nothing until the input source is switched back. Rewrite them to
-    // the Latin key at the same physical position -- but not while searching,
-    // where letters type and the jamo IS the input.
-    let code = if model.searching {
+    // the Latin key at the same physical position -- but not where letters
+    // type, since there the jamo IS the input.
+    let code = if ctx.types() {
         code
     } else {
         crate::keymap::normalize(code, mods)
     };
+    let Some(key) = Key::from_event(code, mods) else {
+        return Effect::None;
+    };
 
-    // Panes have been picked and only a destination window is selectable. Deal
-    // with this before the ordinary tree keys so Enter cannot switch windows
-    // and Esc cannot quit while the user is in the middle of choosing.
-    if model.pending_move.is_some() {
-        // Typing filters the destinations. With 28 windows open, walking to
-        // one with j/k is the slow half of the move — and the query is thrown
-        // away on the way out, so it never leaks into the tree afterwards.
-        if model.searching {
-            match code {
-                KeyCode::Esc | KeyCode::Tab => model.searching = false,
-                KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => model.quit = true,
-                KeyCode::Char('n') if mods.contains(KeyModifiers::CONTROL) => {
-                    model.move_destination(1);
-                }
-                KeyCode::Char('p') if mods.contains(KeyModifiers::CONTROL) => {
-                    model.move_destination(-1);
-                }
-                KeyCode::Enter => confirm_move(model)?,
-                KeyCode::Down => {
-                    model.move_destination(1);
-                }
-                KeyCode::Up => {
-                    model.move_destination(-1);
-                }
-                KeyCode::Backspace => {
-                    model.search_pop();
-                    // The filter moved the rows under the cursor; land it back
-                    // on a window that can actually receive the panes.
-                    model.move_destination(0);
-                }
-                KeyCode::Char(c) => {
-                    model.search_push(c);
-                    model.move_destination(0);
-                }
-                _ => {}
-            }
-            return Ok(());
-        }
-        match code {
-            KeyCode::Esc => cancel_move(model),
-            KeyCode::Char('q') => model.quit = true,
-            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => model.quit = true,
-            KeyCode::Char('/') => model.searching = true,
-            KeyCode::Char('j') | KeyCode::Down => {
-                model.move_destination(1);
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                model.move_destination(-1);
-            }
-            KeyCode::Enter => confirm_move(model)?,
-            _ => {
-                model.status =
-                    "choose a window: j/k move, / filter, Enter confirm, Esc cancel".into();
-            }
-        }
-        return Ok(());
-    }
-
-    // The `x` menu is waiting for its second key. It sits above the tree keys
-    // so `b`, `j`, `m`, `s` and `k` mean the menu's commands here and their
-    // ordinary selves outside it.
-    if model.menu {
-        // Cleared before anything is matched, so the menu is one-shot by
-        // construction: Esc, an unknown letter and a command that ran all
-        // leave it closed without an arm each.
+    // The menu is one-shot by construction: closed before anything is
+    // matched, so Esc, an unknown letter and a command that ran all leave it
+    // closed without an arm each.
+    if ctx == Ctx::Menu {
         model.menu = false;
-        match code {
-            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => model.quit = true,
-            // The prefix again is the old `x`: one tap opens the menu, the
-            // second lands on the command `x` alone used to be. The muscle
-            // memory still works, and in two keystrokes rather than one.
-            // Routed through the table like any other key, so it reports an
-            // unavailable close the same way `k` does.
-            KeyCode::Char(c) => match actions(model)
-                .into_iter()
-                .find(|a| a.key == if c == 'x' { 'k' } else { c })
-            {
-                Some(action) if action.enabled => run_action(model, action.kind)?,
-                // A greyed row already says what is missing; pressing it
-                // should say the same thing rather than close in silence.
-                Some(action) => model.status = format!("{} — {}", action.label, action.detail),
-                // Never offered, so it does nothing. A complaint here would
-                // be noise on the screen that was showing the answer.
-                None => {}
-            },
-            _ => {}
-        }
-        return Ok(());
     }
 
-    // While searching, letters type. This is where the TUI starts, so the way
-    // out has to be obvious and the way back cheap.
-    if model.searching {
-        match code {
-            // Esc is a mode change, never an exit. Keep the query as a visible
-            // filter, just as Tab does, so backing out does not discard typing.
-            KeyCode::Esc => model.searching = false,
-            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => model.quit = true,
-            // Step out to the tree, keeping the filter. The single-key
-            // commands (mark, restore, save, window surgery) live there.
-            KeyCode::Tab => model.searching = false,
-            // Control chords come before the catch-all: a `Char` arm placed
-            // first swallows them and types the letter instead.
-            KeyCode::Char('n') if mods.contains(KeyModifiers::CONTROL) => model.move_cursor(1),
-            KeyCode::Char('p') if mods.contains(KeyModifiers::CONTROL) => model.move_cursor(-1),
-            KeyCode::Backspace => model.search_pop(),
-            KeyCode::Char(c) => model.search_push(c),
-            KeyCode::Enter => {
-                model.searching = false;
-                if let Some(w) = model.current_window()
-                    && !w.gone
-                {
-                    model.switch_to = Some(w.target());
-                }
+    match keys::lookup(ctx, key) {
+        Some(binding) => run_cmd(model, binding.cmd),
+        None => {
+            unbound(model, ctx, key);
+            Effect::None
+        }
+    }
+}
+
+/// A key no binding claims: typing where letters type, a reminder where
+/// only a few keys mean anything, silence elsewhere.
+fn unbound(model: &mut Model, ctx: Ctx, key: Key) {
+    match (ctx, key) {
+        (Ctx::Search, Key::Char(c)) => model.search_push(c),
+        (Ctx::MoveSearch, Key::Char(c)) => {
+            model.search_push(c);
+            // The filter moved the rows under the cursor; land it back on a
+            // window that can actually receive the panes.
+            model.move_destination(0);
+        }
+        (Ctx::Move, _) => {
+            model.status = format!(
+                "choose a window: {}",
+                keys::footer(Ctx::Move, model, usize::MAX)
+            );
+        }
+        // An unknown letter after `x` is a slip, and a complaint about it
+        // would be noise on the screen that was showing the answer.
+        _ => {}
+    }
+}
+
+/// Whether a command changes tmux or the points, and so runs on the worker.
+fn uses_worker(cmd: Cmd) -> bool {
+    use super::model::ActionKind;
+    matches!(
+        cmd,
+        Cmd::Save
+            | Cmd::Restore
+            | Cmd::Confirm
+            | Cmd::Run(ActionKind::Break | ActionKind::Send | ActionKind::Kill)
+    )
+}
+
+fn run_cmd(model: &mut Model, cmd: Cmd) -> Effect {
+    // One command at a time. Two would race on the same windows, and the
+    // second was chosen against a tree the first is busy changing.
+    if uses_worker(cmd)
+        && let Some(label) = model.busy
+    {
+        model.status = format!("still {label} — try again when it finishes");
+        return Effect::None;
+    }
+
+    let job = |j: Option<Job>| j.map_or(Effect::None, Effect::Job);
+    match cmd {
+        Cmd::Quit => model.quit = true,
+        Cmd::Search => model.searching = true,
+        Cmd::ToTree | Cmd::FilterOff => model.searching = false,
+        Cmd::SearchPop => {
+            model.search_pop();
+            if model.pending_move.is_some() {
+                model.move_destination(0);
             }
-            KeyCode::Down => model.move_cursor(1),
-            KeyCode::Up => model.move_cursor(-1),
-            _ => {}
         }
-        return Ok(());
-    }
-
-    match code {
-        KeyCode::Char('/') => model.searching = true,
-        // Esc pops one level: the pane-move choice, then the search line, then
-        // the app. Making it do nothing at the root meant the key that got you
-        // out of everything else stopped working exactly once, which reads as
-        // the popup being stuck rather than as a rule.
-        KeyCode::Char('q') | KeyCode::Esc => model.quit = true,
-        KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => model.quit = true,
-
-        KeyCode::Char('j') | KeyCode::Down => model.move_cursor(1),
-        KeyCode::Char('k') | KeyCode::Up => model.move_cursor(-1),
-        KeyCode::Char('g') | KeyCode::Home => {
+        Cmd::SearchClear => model.search_clear(),
+        Cmd::Down => model.move_cursor(1),
+        Cmd::Up => model.move_cursor(-1),
+        Cmd::Top => {
             model.cursor = 0;
             model.move_cursor(0);
         }
-        KeyCode::Char('G') | KeyCode::End => {
+        Cmd::Bottom => {
             model.cursor = model.rows.len().saturating_sub(1);
             model.move_cursor(-1);
         }
-
-        KeyCode::Char(' ') => model.toggle_mark(),
-        KeyCode::Char('a') => model.mark_all_changed(),
-        KeyCode::Char('c') => model.clear_marks(),
-
-        KeyCode::Char('n') => model.jump_waiting(),
-
-        // p/P walk the restore points; the diff follows immediately.
-        KeyCode::Char('p') => {
-            if model.cycle_point(1) {
-                reload(model)?;
-            }
-        }
-        KeyCode::Char('P') => {
-            if model.cycle_point(-1) {
-                reload(model)?;
-            }
-        }
-
-        KeyCode::Char('s') => save_point(model)?,
-        KeyCode::Char('r') => restore_marked(model)?,
-
-        KeyCode::Enter => {
+        Cmd::Switch => {
+            model.searching = false;
             if let Some(w) = model.current_window() {
                 if w.gone {
                     // Nothing to switch to; the window only exists in the point.
@@ -354,49 +492,47 @@ fn handle_key(model: &mut Model, code: KeyCode, mods: KeyModifiers) -> Result<()
                 }
             }
         }
-        // Window-level surgery, replacing `tmux.sh move/join/break`. These
-        // act on the window under the cursor, which is what the tree is for —
-        // tmux.sh made you pick from a second fzf list first.
-        // Expand a window to its panes. `b` and `J` need a pane, and this is
-        // how you get one.
-        KeyCode::Char('l') | KeyCode::Right => {
-            if model.set_expanded(Some(true)) {
-                reload(model)?;
-            }
+        Cmd::Mark => model.toggle_mark(),
+        Cmd::MarkAll => model.mark_all_changed(),
+        Cmd::ClearMarks => model.clear_marks(),
+        Cmd::NextWaiting => model.jump_waiting(),
+        // p/P walk the restore points; the diff follows.
+        Cmd::PointNext if model.cycle_point(1) => return Effect::Reload,
+        Cmd::PointPrev if model.cycle_point(-1) => return Effect::Reload,
+        Cmd::PointNext | Cmd::PointPrev => {}
+        Cmd::Save => return Effect::Job(save_point()),
+        Cmd::Restore => return job(restore_marked(model)),
+        Cmd::Expand if model.set_expanded(Some(true)) => return Effect::Rebuild,
+        Cmd::Collapse if model.set_expanded(Some(false)) => return Effect::Rebuild,
+        Cmd::Expand | Cmd::Collapse => {}
+        Cmd::Menu => model.menu = true,
+        Cmd::CloseMenu => model.menu = false,
+        Cmd::Run(kind) => match actions(model).into_iter().find(|a| a.kind == kind) {
+            Some(action) if action.enabled => return job(run_action(model, kind)),
+            // A greyed row already says what is missing; pressing it should
+            // say the same thing rather than close in silence.
+            Some(action) => model.status = format!("{} — {}", action.label, action.detail),
+            None => {}
+        },
+        Cmd::Reload => return Effect::Reload,
+        Cmd::Help => {
+            model.help = true;
+            model.help_scroll = 0;
         }
-        KeyCode::Char('h') | KeyCode::Left => {
-            if model.set_expanded(Some(false)) {
-                reload(model)?;
-            }
+        Cmd::CloseHelp => model.help = false,
+        // Clamped by the renderer, which knows how tall the box is.
+        Cmd::HelpDown => model.help_scroll += 1,
+        Cmd::HelpUp => model.help_scroll = model.help_scroll.saturating_sub(1),
+        Cmd::DestDown => {
+            model.move_destination(1);
         }
-
-        // Everything that rearranges tmux lives behind `x`. As five top-level
-        // letters they were the least used keys in the app and had taken the
-        // most memorable ones: `x` meant kill, and `m` and `M` meant two
-        // moves with nothing in common.
-        KeyCode::Char('x') => model.menu = true,
-
-        KeyCode::Char('R') => reload(model)?,
-        _ => {}
+        Cmd::DestUp => {
+            model.move_destination(-1);
+        }
+        Cmd::Confirm => return job(confirm_move(model)),
+        Cmd::CancelMove => cancel_move(model),
     }
-    Ok(())
-}
-
-/// Re-read tmux, the process table, the queue and the selected point.
-///
-/// All or nothing: the model is only touched once every read has succeeded.
-/// A failed `tmux list-panes` used to read as "no panes", which wiped the tree
-/// and marked every window in the point as gone until the next tick.
-fn reload(model: &mut Model) -> Result<()> {
-    let panes = tmux::panes().context("list tmux panes")?;
-    let tree = proc::Tree::capture_with_args().context("read the process table")?;
-    let pending = notify::load();
-    let saved = match model.current_point() {
-        Some(p) => point::read(&p.reference).unwrap_or_default(),
-        None => Vec::new(),
-    };
-    model.refresh(&panes, &saved, &tree, &pending);
-    Ok(())
+    Effect::None
 }
 
 /// Put a reload's outcome on screen. A failure keeps the last good tree and
@@ -419,540 +555,17 @@ fn settle_reload(model: &mut Model, result: Result<()>, shown: &mut Option<Strin
     }
 }
 
-fn save_point(model: &mut Model) -> Result<()> {
-    let panes = tmux::panes().unwrap_or_default();
-    if panes.is_empty() {
-        model.status = "no tmux panes to save".into();
-        return Ok(());
-    }
-    let tree = proc::Tree::capture_with_args()?;
-    let now = crate::clock::now();
-    let sessions = save::snapshot(&panes, &tree, &now.timestamp);
-    let dir = save::layout_dir().join(&now.compact);
-
-    for session in &sessions {
-        save::write(session, &dir.join(format!("{}.json", session.session)))?;
-    }
-
-    // The new point becomes the one being compared against, which is almost
-    // always what the user wants next: they saved because this state is worth
-    // keeping, so the diff should now read as empty.
-    model.points = point::list(&save::layout_dir());
-    model.point_index = 0;
-    reload(model)?;
-    model.status = format!("saved {} session(s) as {}", sessions.len(), now.compact);
-    Ok(())
-}
-
-fn restore_marked(model: &mut Model) -> Result<()> {
-    let Some(p) = model.current_point() else {
-        model.status = "no restore point selected".into();
-        return Ok(());
-    };
-    let saved = point::read(&p.reference)?;
-
-    // With nothing marked, restore what is missing — the windows the point has
-    // and the live server does not. Restoring everything would mean recreating
-    // windows that are already open.
-    let targets: Vec<String> = if model.marks.is_empty() {
-        model
-            .rows
-            .iter()
-            .filter_map(|r| match r {
-                super::model::Row::Window(w) if w.gone => Some(w.target()),
-                _ => None,
-            })
-            .collect()
-    } else {
-        model.marks.iter().cloned().collect()
-    };
-
-    if targets.is_empty() {
-        model.status = "nothing to restore — mark a window with space".into();
-        return Ok(());
-    }
-
-    // A config error stops the restore rather than the app: `r` is one
-    // keystroke inside a popup, and quitting the TUI to report a typo in a
-    // file the user can fix in the next pane is the wrong trade.
-    let autorun = match config::load() {
-        Ok(cfg) => cfg.restore,
-        Err(e) => {
-            model.status = format!("{}: {e:#}", config::path().display());
-            return Ok(());
-        }
-    };
-    let mut server = restore::Server;
-    let mut windows = 0;
-    let mut ran = 0;
-    let mut notes = Vec::new();
-
-    for session in &saved {
-        let indices: Vec<u32> = targets
-            .iter()
-            .filter_map(|t| t.strip_prefix(&format!("{}:", session.session)))
-            .filter_map(|i| i.parse().ok())
-            .collect();
-        if indices.is_empty() {
-            continue;
-        }
-        let report = restore::session(
-            &mut server,
-            session,
-            restore::Selection {
-                windows: Some(&indices),
-            },
-            &autorun,
-            false,
-            // Never forced from the TUI: `r` here restores windows the point
-            // has and the server does not, so there is nothing live to
-            // displace. Closing a running session is a CLI decision, with the
-            // diff and confirmation that come with it.
-            false,
-        )?;
-        windows += report.windows;
-        ran += report.commands_run;
-        notes.extend(report.notes);
-    }
-
-    model.marks.clear();
-    reload(model)?;
-    model.status = if notes.is_empty() {
-        let mut line = format!("restored {windows} window(s)");
-        // Worth a word even in a one-line status: the panes that started on
-        // their own are the ones the user did not press a key for.
-        if ran > 0 {
-            line.push_str(&format!(", ran {ran} command(s)"));
-        }
-        line
-    } else {
-        notes.join("; ")
-    };
-    Ok(())
-}
-
-/// Run a menu command. Exhaustive over `ActionKind`, which is what keeps the
-/// menu and the commands from drifting apart.
-fn run_action(model: &mut Model, kind: ActionKind) -> Result<()> {
-    match kind {
-        ActionKind::Break => break_panes(model),
-        ActionKind::Join => move_panes(model),
-        ActionKind::Merge => merge_windows(model),
-        ActionKind::Send => move_windows(model),
-        ActionKind::Kill => kill_windows(model),
+/// The pane the panel previews: a pane row previews that pane, a window row
+/// its active one. Without this, expanding a window of three identical
+/// claude commands shows the same output whichever you select — and the
+/// whole reason to expand is to tell them apart.
+fn preview_target(model: &Model) -> Option<String> {
+    match (model.current_pane(), model.current_window()) {
+        (Some(p), _) => Some(p.target().to_string()),
+        (None, Some(w)) if !w.gone => Some(w.target()),
+        _ => None,
     }
 }
-
-/// `session:index` for a live pane.
-fn window_of(p: &tmux::Pane) -> String {
-    format!("{}:{}", p.session, p.window_index)
-}
-
-/// The panes a pane command acts on: the marked ones, or the one under the
-/// cursor.
-///
-/// Marking is how you say "these"; the cursor fallback keeps the single-pane
-/// case one keystroke. Resolved against the live pane list rather than the
-/// tree, because a mark survives collapsing its window and by then the row it
-/// came from is gone.
-fn selected_panes(model: &Model, live: &[tmux::Pane]) -> Vec<(String, String)> {
-    let marked = model.marked_panes();
-    if marked.is_empty() {
-        return model
-            .current_pane()
-            .map(|p| vec![(p.target().to_string(), p.window_target())])
-            .unwrap_or_default();
-    }
-    live.iter()
-        .filter(|p| marked.contains(&p.pane_id))
-        .map(|p| (p.pane_id.clone(), window_of(p)))
-        .collect()
-}
-
-/// The live windows a window command acts on: the marked ones, or the one
-/// under the cursor.
-fn selected_windows(model: &Model) -> Vec<String> {
-    let marked = model.marked_live_windows();
-    if !marked.is_empty() {
-        return marked;
-    }
-    model
-        .current_window()
-        .filter(|w| !w.gone)
-        .map(|w| vec![w.target()])
-        .unwrap_or_default()
-}
-
-/// One status line: what happened, then what did not.
-fn report(done: String, failed: Vec<String>) -> String {
-    if failed.is_empty() {
-        done
-    } else {
-        format!("{done}; failed: {}", failed.join(", "))
-    }
-}
-
-/// Move the selected windows to the other session.
-///
-/// With two sessions the destination is unambiguous, which is the whole reason
-/// this is one keystroke here and a prompt in tmux.sh. With more, the status
-/// line says what to do instead of guessing.
-fn move_windows(model: &mut Model) -> Result<()> {
-    let targets = selected_windows(model);
-    if targets.is_empty() {
-        model.status = "that window is not running".into();
-        return Ok(());
-    }
-
-    let all = sessions()?;
-    if all.len() < 2 {
-        model.status = "no other session to move to".into();
-        return Ok(());
-    }
-    if all.len() > 2 {
-        model.status = format!(
-            "several destinations ({}); use tmux directly",
-            all.len() - 1
-        );
-        return Ok(());
-    }
-
-    let mut moved = 0;
-    let mut failed = Vec::new();
-    let mut emptied: Vec<String> = Vec::new();
-    for target in &targets {
-        let here = target.split(':').next().unwrap_or_default().to_string();
-        let Some(dest) = all.iter().find(|s| **s != here) else {
-            continue;
-        };
-        match cmd::run(
-            "tmux",
-            &["move-window", "-s", target, "-t", &format!("{dest}:")],
-            cmd::FAST,
-        ) {
-            Ok(_) => {
-                moved += 1;
-                if !emptied.contains(&here) {
-                    emptied.push(here);
-                }
-            }
-            Err(e) => failed.push(format!("{target}: {e}")),
-        }
-    }
-
-    // move-window leaves a hole; tmux only renumbers on close. Deferred until
-    // every window has moved, because renumbering mid-loop would invalidate
-    // the `session:index` targets still waiting their turn.
-    for session in &emptied {
-        let _ = cmd::run("tmux", &["move-window", "-r", "-t", session], cmd::FAST);
-    }
-
-    model.unmark(&targets);
-    reload(model)?;
-    model.status = report(format!("moved {moved} window(s)"), failed);
-    Ok(())
-}
-
-/// Break the selected panes out, each into a window of its own.
-///
-/// Requires panes to be selected. Addressing this by window — which an
-/// earlier version did — makes tmux use that window's *active* pane, so the
-/// thing that moved was not the thing on screen.
-fn break_panes(model: &mut Model) -> Result<()> {
-    let live = tmux::panes().unwrap_or_default();
-    let chosen = selected_panes(model, &live);
-    if chosen.is_empty() {
-        model.status = "select a pane first — l expands a window, space marks one".into();
-        return Ok(());
-    }
-
-    // tmux refuses to break a window's only pane, and rightly: that is a
-    // rename, not a move. Counted down as panes leave, so breaking two of a
-    // window's three still stops at the last one rather than trusting a count
-    // the previous break already invalidated.
-    let mut remaining: HashMap<String, usize> = HashMap::new();
-    for p in &live {
-        *remaining.entry(window_of(p)).or_default() += 1;
-    }
-
-    let mut broken = 0;
-    let mut alone = 0;
-    let mut failed = Vec::new();
-    for (pane, from) in &chosen {
-        let left = remaining.entry(from.clone()).or_insert(1);
-        if *left < 2 {
-            alone += 1;
-            continue;
-        }
-        // `-d` leaves the focus where it is: this is a popup, and stealing the
-        // client to the new window would drop the user somewhere they did not
-        // ask to be.
-        match cmd::run("tmux", &["break-pane", "-d", "-s", pane], cmd::FAST) {
-            Ok(_) => {
-                *left -= 1;
-                broken += 1;
-            }
-            Err(e) => failed.push(format!("{pane}: {e}")),
-        }
-    }
-
-    model.unmark(
-        &chosen
-            .iter()
-            .map(|(pane, _)| pane.clone())
-            .collect::<Vec<_>>(),
-    );
-    reload(model)?;
-    let mut done = format!("broke out {broken} pane(s)");
-    if alone > 0 {
-        done.push_str(&format!(" — {alone} already alone in its window"));
-    }
-    model.status = report(done, failed);
-    Ok(())
-}
-
-/// Arguments that move one exact pane into one exact window.
-///
-/// `join-pane` calls its target a dst-pane, but tmux accepts a window target and
-/// resolves that to the window's active pane. That gives the requested window
-/// without relying on whichever pane launched the popup.
-fn join_pane_args<'a>(pane: &'a str, destination: &'a str) -> [&'a str; 6] {
-    ["join-pane", "-d", "-s", pane, "-t", destination]
-}
-
-/// Move one pane, making room first if the destination has none.
-///
-/// `join-pane` splits the destination's *active* pane, and `-d` keeps that the
-/// same pane throughout — so each join halves what the last one halved, and a
-/// merge fails partway with "no space for new pane". Tiling and retrying costs
-/// an extra exec only when that actually happens, which leaves a hand-made
-/// layout alone in the ordinary single-pane case.
-fn join_one(pane: &str, destination: &str) -> Result<()> {
-    match cmd::run("tmux", &join_pane_args(pane, destination), cmd::FAST) {
-        Ok(_) => Ok(()),
-        Err(_) => {
-            let _ = cmd::run(
-                "tmux",
-                &["select-layout", "-t", destination, "tiled"],
-                cmd::FAST,
-            );
-            cmd::run("tmux", &join_pane_args(pane, destination), cmd::FAST).map(|_| ())
-        }
-    }
-}
-
-/// Pick panes, then move them into an explicitly selected window.
-///
-/// The first `J` remembers them and turns the tree into destination selection;
-/// the second `J` (or Enter) joins. A previous version always used
-/// `$TMUX_PANE`, which meant "the window that opened tmc" rather than the
-/// window the user actually wanted.
-fn move_panes(model: &mut Model) -> Result<()> {
-    if model.pending_move.is_some() {
-        return confirm_move(model);
-    }
-
-    let live = tmux::panes().unwrap_or_default();
-    let chosen = selected_panes(model, &live);
-    if chosen.is_empty() {
-        model.status = "select a pane first — l expands a window, space marks one".into();
-        return Ok(());
-    }
-    let what = match chosen.as_slice() {
-        [(pane, _)] => pane.clone(),
-        many => format!("{} panes", many.len()),
-    };
-    if model.begin_move(chosen, MoveKind::Panes) {
-        model.status = format!("moving {what}: choose a window, then Enter");
-    } else {
-        model.status = "no other live window to move that into".into();
-    }
-    Ok(())
-}
-
-/// Merge the marked windows into one.
-///
-/// tmux has no merge: it is every pane of the sources joined into the window
-/// that is being kept, which the sources then close themselves over, having
-/// nothing left. Which window survives is chosen the same way `J` chooses a
-/// destination — including one of the marked ones, which is the usual
-/// intent — so the answer is never "whichever tmux considered active".
-fn merge_windows(model: &mut Model) -> Result<()> {
-    let sources = model.marked_live_windows();
-    if sources.len() < 2 {
-        model.status = "mark two or more windows with space, then x m".into();
-        return Ok(());
-    }
-
-    let live = tmux::panes().unwrap_or_default();
-    let panes: Vec<(String, String)> = live
-        .iter()
-        .filter(|p| sources.contains(&window_of(p)))
-        .map(|p| (p.pane_id.clone(), window_of(p)))
-        .collect();
-    if model.begin_move(panes, MoveKind::Merge) {
-        model.status = format!(
-            "merging {} windows: choose the one to keep, then Enter",
-            sources.len()
-        );
-    } else {
-        model.status = "those windows have no panes to merge".into();
-    }
-    Ok(())
-}
-
-fn cancel_move(model: &mut Model) {
-    model.pending_move = None;
-    model.search.clear();
-    model.searching = false;
-    model.status = "pane move cancelled".into();
-}
-
-/// Carry out the pending move into the window under the cursor.
-fn confirm_move(model: &mut Model) -> Result<()> {
-    let Some(pending) = model.pending_move.clone() else {
-        return Ok(());
-    };
-    let Some(destination) = model.destination_window().map(WindowRow::target) else {
-        model.status = "choose a live window: j/k move, Enter confirm, Esc cancel".into();
-        return Ok(());
-    };
-
-    let mut moved = 0;
-    let mut failed = Vec::new();
-    for (pane, from) in &pending.panes {
-        // The destination may be one of the merged windows; its own panes are
-        // already home.
-        if *from == destination {
-            continue;
-        }
-        match join_one(pane, &destination) {
-            Ok(()) => moved += 1,
-            Err(e) => failed.push(format!("{pane}: {e}")),
-        }
-    }
-
-    // Several panes arriving one at a time stack into ever-thinner slices of
-    // whatever pane was active. Tiling once at the end is the only arrangement
-    // that is readable without guessing what was wanted; a single pane leaves
-    // a hand-made layout alone.
-    if moved > 1 {
-        let _ = cmd::run(
-            "tmux",
-            &["select-layout", "-t", &destination, "tiled"],
-            cmd::FAST,
-        );
-    }
-
-    let sources = pending.sources();
-    let consumed: Vec<String> = pending
-        .panes
-        .iter()
-        .map(|(pane, _)| pane.clone())
-        .chain(sources.iter().map(|w| w.to_string()))
-        .collect();
-    let sources = sources.len();
-    model.pending_move = None;
-    model.search.clear();
-    model.searching = false;
-    model.unmark(&consumed);
-    reload(model)?;
-    model.status = report(
-        match pending.kind {
-            MoveKind::Merge => {
-                format!("merged {sources} windows — {moved} pane(s) into {destination}")
-            }
-            MoveKind::Panes => format!("moved {moved} pane(s) into {destination}"),
-        },
-        failed,
-    );
-    Ok(())
-}
-
-/// Close the selected windows.
-///
-/// No confirmation prompt: the workspace was snapshotted, and the point of
-/// this tool is that closing something is recoverable. The status line says
-/// how.
-fn kill_windows(model: &mut Model) -> Result<()> {
-    let targets = selected_windows(model);
-    if targets.is_empty() {
-        model.status = match model.current_window() {
-            Some(_) => "that window is already gone".into(),
-            None => "select a window first".into(),
-        };
-        return Ok(());
-    }
-
-    let mut killed = 0;
-    let mut failed = Vec::new();
-    for target in &targets {
-        match cmd::run("tmux", &["kill-window", "-t", target], cmd::FAST) {
-            Ok(_) => killed += 1,
-            Err(e) => failed.push(format!("{target}: {e}")),
-        }
-    }
-
-    model.unmark(&targets);
-    reload(model)?;
-
-    // Whether `r` can undo this is a fact about the selected point, not a
-    // promise the tool gets to make. A window created since the last save is
-    // in no point at all, and telling the user to press `r` after closing
-    // several of those is worse than saying nothing.
-    let recoverable = targets
-        .iter()
-        .filter(|t| {
-            model
-                .rows
-                .iter()
-                .any(|r| matches!(r, Row::Window(w) if w.gone && &w.target() == *t))
-        })
-        .count();
-    let recovery = match recoverable {
-        0 => " — not in the restore point, so r cannot bring them back".to_string(),
-        n if n == killed => " — press r to bring them back".to_string(),
-        n => format!(" — r brings back {n} of them"),
-    };
-    model.status = report(format!("killed {killed} window(s){recovery}"), failed);
-    Ok(())
-}
-
-fn sessions() -> Result<Vec<String>> {
-    Ok(crate::collect::cmd::run(
-        "tmux",
-        &["list-sessions", "-F", "#{session_name}"],
-        crate::collect::cmd::FAST,
-    )?
-    .lines()
-    .map(str::to_string)
-    .collect())
-}
-
-/// Fetch the capture for whatever the cursor is on, if we do not have it.
-///
-/// Done at draw time rather than on every keystroke: a held-down `j` would
-/// otherwise shell out once per repeat for panes that scroll past unseen.
-fn refresh_preview(model: &mut Model) {
-    // A pane row previews that pane; a window row previews its active one.
-    // Without this, expanding a window of three identical claude commands
-    // shows the same output whichever you select — and the whole reason to
-    // expand is to tell them apart.
-    let target = match (model.current_pane(), model.current_window()) {
-        (Some(p), _) => p.target().to_string(),
-        (None, Some(w)) if !w.gone => w.target(),
-        _ => {
-            model.preview = None;
-            return;
-        }
-    };
-    if model.preview_for(&target).is_some() {
-        return;
-    }
-    let body = tmux::capture_pane(&target, 40).unwrap_or_default();
-    model.preview = Some((target, body));
-}
-
 /// The window that ran this, as `session:index`.
 ///
 /// Public so `tmc snapshot` renders the same frame the TUI opens on — a
@@ -990,7 +603,9 @@ fn now_secs() -> u64 {
 mod tests {
     use super::*;
     use crate::layout::diff::Change;
-    use crate::ui::model::WindowRow;
+    use crate::ui::commands::{join_pane_args, selected_windows};
+    use crate::ui::model::{ActionKind, MoveKind, Row, WindowRow};
+    use crate::ui::worker::Done;
 
     fn model_with_window() -> Model {
         let mut m = Model::new(Vec::new());
@@ -1495,5 +1110,191 @@ mod tests {
             with_jamo.status, with_latin.status,
             "ㅓ must reach the same handler j does"
         );
+    }
+
+    // --- off the input thread ----------------------------------------------
+
+    fn reloaded(generation: u64, window: u32) -> Reply {
+        Reply::Reloaded {
+            generation,
+            snapshot: Ok(Snapshot::for_test("projects", window)),
+        }
+    }
+
+    fn has_window(m: &Model, target: &str) -> bool {
+        m.rows
+            .iter()
+            .any(|r| matches!(r, Row::Window(w) if w.target() == target))
+    }
+
+    #[test]
+    fn a_superseded_reload_is_dropped() {
+        // A slow tick that started before `p` must not paint the old point's
+        // reading over the new one.
+        let mut io = Io::new(None);
+        let mut m = Model::new(Vec::new());
+        io.generation = 2;
+        io.reloads = 2;
+
+        assert!(!io.apply(&mut m, reloaded(1, 1)), "nothing drawn");
+        assert!(m.rows.is_empty(), "the stale reading was not applied");
+        assert_eq!(io.reloads, 1, "but it no longer counts as outstanding");
+
+        assert!(io.apply(&mut m, reloaded(2, 5)), "the current one redraws");
+        assert!(has_window(&m, "projects:5"));
+        assert_eq!(io.reloads, 0, "so the tick may start the next one");
+    }
+
+    #[test]
+    fn an_unchanged_reload_does_not_redraw() {
+        // The fingerprint gate: an idle workspace stays at 0 fps.
+        let mut io = Io::new(None);
+        let mut m = Model::new(Vec::new());
+        io.generation = 1;
+        assert!(io.apply(&mut m, reloaded(1, 1)));
+        io.generation = 2;
+        assert!(!io.apply(&mut m, reloaded(2, 1)), "same tree, no frame");
+    }
+
+    #[test]
+    fn a_reload_waits_while_the_menu_is_up() {
+        let mut io = Io::new(None);
+        let mut m = Model::new(Vec::new());
+        m.menu = true;
+        io.generation = 1;
+        assert!(!io.apply(&mut m, reloaded(1, 1)));
+        assert!(m.rows.is_empty(), "the menu's target did not move under it");
+    }
+
+    #[test]
+    fn a_failed_reply_keeps_the_tree_and_the_popup() {
+        let mut io = Io::new(None);
+        let mut m = Model::new(Vec::new());
+        io.generation = 1;
+        io.apply(&mut m, reloaded(1, 1));
+        io.generation = 2;
+        io.apply(
+            &mut m,
+            Reply::Reloaded {
+                generation: 2,
+                snapshot: Err(anyhow::anyhow!("ps timed out")),
+            },
+        );
+        assert!(has_window(&m, "projects:1"), "last good tree stays");
+        assert!(m.status.contains("ps timed out"), "{}", m.status);
+        assert!(!m.quit);
+    }
+
+    #[test]
+    fn a_finished_command_reports_after_the_tree_is_re_read() {
+        let mut io = Io::new(None);
+        let mut m = Model::new(Vec::new());
+        io.run(
+            &mut m,
+            Effect::Job(Job::new("closing", || Ok(Done::status("unused")))),
+        );
+        assert_eq!(m.busy, Some("closing"));
+        let generation = io.generation;
+        // Drain the real worker's reply so its thread is not left sending
+        // into a dropped channel; then feed a controlled one.
+        let _ = io.workers.recv();
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let witness = seen.clone();
+        let changed = io.apply(
+            &mut m,
+            Reply::JobDone {
+                generation,
+                done: Ok(Done::then(move |m: &mut Model| {
+                    *witness.lock().unwrap() = has_window(m, "projects:3");
+                    m.status = "killed 1 window(s)".into();
+                })),
+                snapshot: Ok(Snapshot::for_test("projects", 3)),
+            },
+        );
+        assert!(changed);
+        assert!(*seen.lock().unwrap(), "finish saw the re-read tree");
+        assert_eq!(m.busy, None);
+        assert_eq!(m.status, "killed 1 window(s)");
+    }
+
+    #[test]
+    fn keys_stay_live_while_a_command_runs() {
+        let mut m = model_with_two_windows();
+        m.busy = Some("restoring");
+
+        press(&mut m, 'j', KeyModifiers::NONE);
+        assert_eq!(m.cursor, 1, "navigation is not blocked");
+
+        assert!(matches!(
+            handle_key(&mut m, KeyCode::Char('s'), KeyModifiers::NONE),
+            Effect::None
+        ));
+        assert!(m.status.contains("still restoring"), "{}", m.status);
+
+        let _ = handle_key(&mut m, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(m.quit, "Esc answers; the loop then waits for the restore");
+    }
+
+    #[test]
+    fn expanding_rebuilds_from_the_last_reading_without_shelling_out() {
+        let mut m = model_with_window();
+        assert!(matches!(
+            handle_key(&mut m, KeyCode::Char('l'), KeyModifiers::NONE),
+            Effect::Rebuild
+        ));
+        assert!(m.expanded.contains("projects:1"));
+    }
+
+    // --- one table ----------------------------------------------------------
+
+    #[test]
+    fn question_mark_opens_help_and_esc_closes_it_without_quitting() {
+        let mut m = model_with_window();
+        press(&mut m, '?', KeyModifiers::NONE);
+        assert!(m.help);
+        // `j` means nothing in help; it must not move the tree behind it.
+        press(&mut m, 'j', KeyModifiers::NONE);
+        assert_eq!(m.cursor, 0);
+        let _ = handle_key(&mut m, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!m.help);
+        assert!(!m.quit);
+    }
+
+    #[test]
+    fn question_mark_types_on_the_search_line() {
+        let mut m = model_with_window();
+        m.searching = true;
+        press(&mut m, '?', KeyModifiers::NONE);
+        assert_eq!(m.search, "?");
+        assert!(!m.help);
+    }
+
+    #[test]
+    fn ctrl_u_drops_a_restored_query() {
+        let mut m = model_with_window();
+        m.searching = true;
+        m.search = "old query".into();
+        press(&mut m, 'u', KeyModifiers::CONTROL);
+        assert!(m.search.is_empty());
+        assert!(m.searching, "still on the search line");
+    }
+
+    #[test]
+    fn every_tree_binding_dispatches_to_its_command() {
+        // The hint row and help are read off the table; dispatch must agree
+        // with them key for key. Checked by effect for the keys whose effect
+        // is visible on a bare model.
+        for b in keys::BINDINGS.iter().filter(|b| b.ctx == Ctx::Tree) {
+            assert_eq!(
+                keys::lookup(Ctx::Tree, b.key).map(|x| x.cmd),
+                Some(b.cmd),
+                "{:?}",
+                b.key
+            );
+        }
+        let mut m = model_with_window();
+        press(&mut m, 'x', KeyModifiers::NONE);
+        assert!(m.menu, "x is the menu, as the hint says");
     }
 }
