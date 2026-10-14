@@ -29,6 +29,10 @@ pub fn run(program: &str, args: &[&str], timeout: Duration) -> Result<String> {
     let stderr = child.stderr.take().map(drain);
 
     let deadline = Instant::now() + timeout;
+    // std has no wait-with-timeout, so this polls. Most commands here finish
+    // in a few ms, so the first checks are quick; a slow one backs off to a
+    // check every 20 ms instead of spinning 200 times a second for 3 s.
+    let mut nap = Duration::from_millis(1);
     let status = loop {
         match child.try_wait()? {
             Some(status) => break Some(status),
@@ -37,7 +41,10 @@ pub fn run(program: &str, args: &[&str], timeout: Duration) -> Result<String> {
                 let _ = child.wait();
                 break None;
             }
-            None => std::thread::sleep(Duration::from_millis(5)),
+            None => {
+                std::thread::sleep(nap);
+                nap = (nap * 2).min(Duration::from_millis(20));
+            }
         }
     };
 
