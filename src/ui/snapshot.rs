@@ -339,7 +339,7 @@ mod tests {
                 "at {width} columns the quit keys vanished: [{last}]",
             );
             assert!(
-                last.chars().count() <= width as usize,
+                last.width() <= width as usize,
                 "at {width} columns the hint overflowed: [{last}]",
             );
         }
@@ -478,6 +478,54 @@ mod tests {
                 "the box overflowed at 50 columns: [{line}]"
             );
         }
+    }
+
+    #[test]
+    fn a_korean_window_name_fits_the_menu_title() {
+        // The box is sized to its widest line. Measured in characters, a
+        // Korean name counts half its columns, the box comes out too narrow
+        // and the border clips the very name the title is there to show.
+        let name = "한글로된아주아주아주아주긴윈도우이름입니다하하하하하";
+        let mut m = model();
+        if let Row::Window(w) = &mut m.rows[2] {
+            w.name = name.into();
+        }
+        m.menu = true;
+        let out = render(&m, 120, 20, 0);
+        assert!(out.contains(name), "the title was clipped:\n{out}");
+    }
+
+    #[test]
+    fn the_status_is_visible_at_any_width() {
+        // A popup narrower than the detail panel's threshold, and a search
+        // that matches nothing, both lose the panel; the status must not go
+        // with it.
+        let mut m = model();
+        m.status = "killed 2 window(s)".into();
+        for width in [60u16, 70, 89, 110] {
+            let out = render(&m, width, 12, 0);
+            let last = out.lines().last().unwrap_or_default();
+            assert!(
+                last.contains("killed 2 window(s)"),
+                "at {width} columns: [{last}]"
+            );
+        }
+
+        for c in "zzz".chars() {
+            m.search_push(c);
+        }
+        let out = render(&m, 110, 12, 0);
+        assert!(out.contains("killed 2 window(s)"), "no selection:\n{out}");
+    }
+
+    #[test]
+    fn a_long_status_is_cut_not_overflowed() {
+        let mut m = model();
+        m.status = "reload failed: ps timed out after 3s; ".repeat(5);
+        let out = render(&m, 60, 12, 0);
+        let last = out.lines().last().unwrap_or_default();
+        assert!(last.width() <= 60, "[{last}]");
+        assert!(last.ends_with('…'), "the cut is marked: [{last}]");
     }
 
     #[test]
