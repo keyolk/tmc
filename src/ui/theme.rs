@@ -11,6 +11,8 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 
+use super::status::Level;
+
 /// Every symbol drawn outside plain text.
 ///
 /// Only the ones that need a fallback live here. Columns that must line up
@@ -37,6 +39,9 @@ pub struct Glyphs {
     /// and off under a CJK locale: the arrows are East Asian Ambiguous, and
     /// the `?` help lines its descriptions up after them.
     pub key_glyphs: bool,
+    /// Before a status message, by level (info, success, warn, error). The
+    /// level is in the words as well as the colour, so it survives NO_COLOR.
+    pub levels: [&'static str; 4],
 }
 
 impl Glyphs {
@@ -48,6 +53,7 @@ impl Glyphs {
         session: "▾",
         border: border::ROUNDED,
         key_glyphs: true,
+        levels: ["i", "✓", "!", "✗"],
     };
 
     /// For consoles that mangle box drawing (SSH into a minimal image, a
@@ -70,6 +76,7 @@ impl Glyphs {
             horizontal_bottom: "-",
         },
         key_glyphs: false,
+        levels: ["info:", "ok:", "warn:", "error:"],
     };
 }
 
@@ -93,6 +100,17 @@ impl Default for Theme {
 }
 
 impl Theme {
+    /// The prefix and style a status of `level` is drawn with.
+    pub fn status(&self, level: Level) -> (&'static str, Style) {
+        let [info, success, warn, error] = self.glyphs.levels;
+        match level {
+            Level::Info => (info, self.info()),
+            Level::Success => (success, self.success()),
+            Level::Warn => (warn, self.warn()),
+            Level::Error => (error, self.error()),
+        }
+    }
+
     /// The theme the environment asks for.
     pub fn detect() -> Self {
         Self::from_env(|k| std::env::var(k).ok())
@@ -163,6 +181,9 @@ impl Theme {
     }
     pub fn info(&self) -> Style {
         self.fg(Color::Cyan)
+    }
+    pub fn success(&self) -> Style {
+        self.fg(Color::Green)
     }
     pub fn warn(&self) -> Style {
         self.fg(Color::Yellow)
@@ -286,6 +307,12 @@ mod tests {
         ] {
             assert_eq!(x.width(), y.width(), "{x:?} vs {y:?}");
             assert!(y.is_ascii());
+        }
+        for (x, y) in u.levels.iter().zip(a.levels) {
+            assert!(y.is_ascii(), "{y:?}");
+            // Only the Unicode prefix has to be one cell; the words are
+            // longer on purpose and nothing is aligned after them.
+            assert_eq!(x.width(), 1, "{x:?}");
         }
     }
 }

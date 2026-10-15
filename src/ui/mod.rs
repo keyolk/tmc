@@ -12,5 +12,6 @@ pub mod model;
 pub mod render;
 pub mod snapshot;
 pub mod state;
+pub mod status;
 pub mod theme;
 mod worker;

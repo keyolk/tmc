@@ -537,8 +537,10 @@ fn render_keys(frame: &mut Frame, area: Rect, model: &Model) {
     // always on screen, and any key clears the status, so the hints it covers
     // come back on the next keystroke.
     if !model.status.is_empty() {
+        let (prefix, style) = t.status(model.status.level());
+        let text = format!("{prefix} {}", model.status.text());
         frame.render_widget(
-            Paragraph::new(truncate(&model.status, area.width as usize, ell)).style(t.warn()),
+            Paragraph::new(truncate(&text, area.width as usize, ell)).style(style),
             area,
         );
         return;

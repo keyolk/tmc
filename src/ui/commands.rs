@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 
 use super::model::{ActionKind, Model, MoveKind, Row, WindowRow};
+use super::status::{Level, Status};
 use super::worker::{Done, Job};
 use crate::collect::{cmd, proc, tmux};
 use crate::config;
@@ -80,12 +81,13 @@ pub(super) fn selected_windows(model: &Model) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// One status line: what happened, then what did not.
-fn report(done: String, failed: Vec<String>) -> String {
+/// One status line: what happened, then what did not. A partial failure is
+/// a warning: something did happen, and the user has to look at what did not.
+fn report(status: &mut Status, done: String, failed: Vec<String>) {
     if failed.is_empty() {
-        done
+        status.success(done);
     } else {
-        format!("{done}; failed: {}", failed.join(", "))
+        status.warn(format!("{done}; failed: {}", failed.join(", ")));
     }
 }
 
@@ -93,7 +95,7 @@ pub(super) fn save_point() -> Job {
     Job::new("saving", || {
         let panes = tmux::panes().unwrap_or_default();
         if panes.is_empty() {
-            return Ok(Done::status("no tmux panes to save"));
+            return Ok(Done::status(Level::Warn, "no tmux panes to save"));
         }
         let tree = proc::Tree::capture_with_args()?;
         let now = crate::clock::now();
@@ -108,7 +110,8 @@ pub(super) fn save_point() -> Job {
         let points = point::list(&save::layout_dir());
         let n = sessions.len();
         let mut done = Done::then(move |m: &mut Model| {
-            m.status = format!("saved {n} session(s) as {}", now.compact);
+            m.status
+                .success(format!("saved {n} session(s) as {}", now.compact));
         });
         done.points = Some(points);
         Ok(done)
@@ -117,7 +120,7 @@ pub(super) fn save_point() -> Job {
 
 pub(super) fn restore_marked(model: &mut Model) -> Option<Job> {
     let Some(p) = model.current_point() else {
-        model.status = "no restore point selected".into();
+        model.status.warn("no restore point selected");
         return None;
     };
     let reference = p.reference.clone();
@@ -138,7 +141,9 @@ pub(super) fn restore_marked(model: &mut Model) -> Option<Job> {
         model.marks.iter().cloned().collect()
     };
     if targets.is_empty() {
-        model.status = "nothing to restore — mark a window with space".into();
+        model
+            .status
+            .warn("nothing to restore — mark a window with space");
         return None;
     }
 
@@ -150,7 +155,10 @@ pub(super) fn restore_marked(model: &mut Model) -> Option<Job> {
         let autorun = match config::load() {
             Ok(cfg) => cfg.restore,
             Err(e) => {
-                return Ok(Done::status(format!("{}: {e:#}", config::path().display())));
+                return Ok(Done::status(
+                    Level::Error,
+                    format!("{}: {e:#}", config::path().display()),
+                ));
             }
         };
         let mut server = restore::Server;
@@ -189,7 +197,7 @@ pub(super) fn restore_marked(model: &mut Model) -> Option<Job> {
             // Only what this restore used: a mark placed while it ran is a
             // new selection, not part of this one.
             m.unmark(&targets);
-            m.status = if notes.is_empty() {
+            if notes.is_empty() {
                 let mut line = format!("restored {windows} window(s)");
                 // Worth a word even in a one-line status: the panes that
                 // started on their own are the ones the user did not press a
@@ -197,10 +205,10 @@ pub(super) fn restore_marked(model: &mut Model) -> Option<Job> {
                 if ran > 0 {
                     line.push_str(&format!(", ran {ran} command(s)"));
                 }
-                line
+                m.status.success(line);
             } else {
-                notes.join("; ")
-            };
+                m.status.warn(notes.join("; "));
+            }
         }))
     }))
 }
@@ -213,20 +221,23 @@ pub(super) fn restore_marked(model: &mut Model) -> Option<Job> {
 fn move_windows(model: &mut Model) -> Option<Job> {
     let targets = selected_windows(model);
     if targets.is_empty() {
-        model.status = "that window is not running".into();
+        model.status.warn("that window is not running");
         return None;
     }
 
     Some(Job::new("moving", move || {
         let all = sessions()?;
         if all.len() < 2 {
-            return Ok(Done::status("no other session to move to"));
+            return Ok(Done::status(Level::Warn, "no other session to move to"));
         }
         if all.len() > 2 {
-            return Ok(Done::status(format!(
-                "several destinations ({}); use tmux directly",
-                all.len() - 1
-            )));
+            return Ok(Done::status(
+                Level::Warn,
+                format!(
+                    "several destinations ({}); use tmux directly",
+                    all.len() - 1
+                ),
+            ));
         }
 
         let mut moved = 0;
@@ -264,7 +275,7 @@ fn move_windows(model: &mut Model) -> Option<Job> {
 
         Ok(Done::then(move |m: &mut Model| {
             m.unmark(&targets);
-            m.status = report(format!("moved {moved} window(s)"), failed);
+            report(&mut m.status, format!("moved {moved} window(s)"), failed);
         }))
     }))
 }
@@ -277,7 +288,9 @@ fn move_windows(model: &mut Model) -> Option<Job> {
 fn break_panes(model: &mut Model) -> Option<Job> {
     let chosen = selected_panes(model);
     if chosen.is_empty() {
-        model.status = "select a pane first — l expands a window, space marks one".into();
+        model
+            .status
+            .warn("select a pane first — l expands a window, space marks one");
         return None;
     }
 
@@ -319,7 +332,7 @@ fn break_panes(model: &mut Model) -> Option<Job> {
             if alone > 0 {
                 done.push_str(&format!(" — {alone} already alone in its window"));
             }
-            m.status = report(done, failed);
+            report(&mut m.status, done, failed);
         }))
     }))
 }
@@ -364,7 +377,9 @@ fn join_one(pane: &str, destination: &str) -> Result<()> {
 fn move_panes(model: &mut Model) {
     let chosen = selected_panes(model);
     if chosen.is_empty() {
-        model.status = "select a pane first — l expands a window, space marks one".into();
+        model
+            .status
+            .warn("select a pane first — l expands a window, space marks one");
         return;
     }
     let what = match chosen.as_slice() {
@@ -372,9 +387,11 @@ fn move_panes(model: &mut Model) {
         many => format!("{} panes", many.len()),
     };
     if model.begin_move(chosen, MoveKind::Panes) {
-        model.status = format!("moving {what}: choose a window, then Enter");
+        model
+            .status
+            .info(format!("moving {what}: choose a window, then Enter"));
     } else {
-        model.status = "no other live window to move that into".into();
+        model.status.warn("no other live window to move that into");
     }
 }
 
@@ -388,7 +405,9 @@ fn move_panes(model: &mut Model) {
 fn merge_windows(model: &mut Model) {
     let sources = model.marked_live_windows();
     if sources.len() < 2 {
-        model.status = "mark two or more windows with space, then x m".into();
+        model
+            .status
+            .warn("mark two or more windows with space, then x m");
         return;
     }
 
@@ -399,12 +418,12 @@ fn merge_windows(model: &mut Model) {
         .map(|p| (p.pane_id.clone(), window_of(p)))
         .collect();
     if model.begin_move(panes, MoveKind::Merge) {
-        model.status = format!(
+        model.status.info(format!(
             "merging {} windows: choose the one to keep, then Enter",
             sources.len()
-        );
+        ));
     } else {
-        model.status = "those windows have no panes to merge".into();
+        model.status.warn("those windows have no panes to merge");
     }
 }
 
@@ -412,17 +431,15 @@ pub(super) fn cancel_move(model: &mut Model) {
     model.pending_move = None;
     model.search.clear();
     model.searching = false;
-    model.status = "pane move cancelled".into();
+    model.status.info("pane move cancelled");
 }
 
 /// Carry out the pending move into the window under the cursor.
 pub(super) fn confirm_move(model: &mut Model) -> Option<Job> {
     let pending = model.pending_move.clone()?;
     let Some(destination) = model.destination_window().map(WindowRow::target) else {
-        model.status = format!(
-            "choose a live window: {}",
-            super::keys::footer(super::keys::Ctx::Move, model, usize::MAX)
-        );
+        let hint = super::keys::footer(super::keys::Ctx::Move, model, usize::MAX);
+        model.status.warn(format!("choose a live window: {hint}"));
         return None;
     };
     // The choice is made; the tree is the tree again while tmux catches up.
@@ -470,7 +487,8 @@ pub(super) fn confirm_move(model: &mut Model) -> Option<Job> {
         let kind = pending.kind;
         Ok(Done::then(move |m: &mut Model| {
             m.unmark(&consumed);
-            m.status = report(
+            report(
+                &mut m.status,
                 match kind {
                     MoveKind::Merge => {
                         format!("merged {n_sources} windows — {moved} pane(s) into {destination}")
@@ -491,10 +509,10 @@ pub(super) fn confirm_move(model: &mut Model) -> Option<Job> {
 fn kill_windows(model: &mut Model) -> Option<Job> {
     let targets = selected_windows(model);
     if targets.is_empty() {
-        model.status = match model.current_window() {
-            Some(_) => "that window is already gone".into(),
-            None => "select a window first".into(),
-        };
+        model.status.warn(match model.current_window() {
+            Some(_) => "that window is already gone",
+            None => "select a window first",
+        });
         return None;
     }
 
@@ -528,7 +546,11 @@ fn kill_windows(model: &mut Model) -> Option<Job> {
                 n if n == killed => " — press r to bring them back".to_string(),
                 n => format!(" — r brings back {n} of them"),
             };
-            m.status = report(format!("killed {killed} window(s){recovery}"), failed);
+            report(
+                &mut m.status,
+                format!("killed {killed} window(s){recovery}"),
+                failed,
+            );
         }))
     }))
 }

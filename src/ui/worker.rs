@@ -102,9 +102,9 @@ pub struct Done {
 }
 
 impl Done {
-    pub fn status(msg: impl Into<String>) -> Self {
+    pub fn status(level: super::status::Level, msg: impl Into<String>) -> Self {
         let msg = msg.into();
-        Self::then(move |m| m.status = msg)
+        Self::then(move |m| m.status.set(level, msg))
     }
 
     pub fn then(f: impl FnOnce(&mut Model) + Send + 'static) -> Self {
@@ -289,7 +289,13 @@ mod tests {
     #[test]
     fn a_job_reply_comes_back_tagged_with_its_generation() {
         let w = Workers::start();
-        w.job(7, None, Job::new("testing", || Ok(Done::status("done"))));
+        w.job(
+            7,
+            None,
+            Job::new("testing", || {
+                Ok(Done::status(super::super::status::Level::Success, "done"))
+            }),
+        );
         match w.recv() {
             Some(Reply::JobDone {
                 generation, done, ..

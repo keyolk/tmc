@@ -508,7 +508,7 @@ mod tests {
         // that matches nothing, both lose the panel; the status must not go
         // with it.
         let mut m = model();
-        m.status = "killed 2 window(s)".into();
+        m.status.success("killed 2 window(s)");
         for width in [60u16, 70, 89, 110] {
             let out = render(&m, width, 12, 0);
             let last = out.lines().last().unwrap_or_default();
@@ -528,7 +528,8 @@ mod tests {
     #[test]
     fn a_long_status_is_cut_not_overflowed() {
         let mut m = model();
-        m.status = "reload failed: ps timed out after 3s; ".repeat(5);
+        m.status
+            .error("reload failed: ps timed out after 3s; ".repeat(5));
         let out = render(&m, 60, 12, 0);
         let last = out.lines().last().unwrap_or_default();
         assert!(last.width() <= 60, "[{last}]");
@@ -715,5 +716,59 @@ mod tests {
         let foreign: String = out.chars().filter(|c| !c.is_ascii()).collect();
         assert!(foreign.is_empty(), "non-ASCII {foreign:?} in\n{out}");
         assert!(out.contains("enter"), "{out}");
+    }
+
+    #[test]
+    fn a_success_gives_the_hints_back_once_it_expires() {
+        use crate::ui::status::{Level, TTL};
+        use std::time::{Duration, Instant};
+
+        let mut m = model();
+        let t0 = Instant::now();
+        m.status
+            .set_at_time(Level::Success, "saved 2 session(s)", t0);
+        let shown = render(&m, 100, 14, 0);
+        let last = shown.lines().last().unwrap_or_default();
+        assert_eq!(last, "✓ saved 2 session(s)", "prefix and text");
+
+        // Not yet: the loop is not woken early, and nothing changes.
+        assert!(!m.status.expire(t0 + TTL - Duration::from_millis(1)));
+        assert_eq!(render(&m, 100, 14, 0), shown);
+
+        // At the deadline the status goes and the hints come back -- one
+        // change, so one redraw; a second check finds nothing to do.
+        assert!(m.status.expire(t0 + TTL));
+        let after = render(&m, 100, 14, 0);
+        assert!(
+            after.lines().last().unwrap_or_default().contains("quit"),
+            "{after}"
+        );
+        assert!(!m.status.expire(t0 + TTL * 2));
+    }
+
+    #[test]
+    fn an_error_stays_and_says_so_without_colour() {
+        use crate::ui::status::TTL;
+        use crate::ui::theme::{Glyphs, Theme};
+        use std::time::Instant;
+
+        let mut m = model();
+        m.theme = Theme {
+            no_color: true,
+            glyphs: Glyphs::ASCII,
+        };
+        m.status.error("reload failed: ps timed out");
+        assert!(
+            !m.status.expire(Instant::now() + TTL * 10),
+            "errors wait for a key"
+        );
+        let out = render(&m, 100, 14, 0);
+        let last = out.lines().last().unwrap_or_default();
+        // The level is in the words: under NO_COLOR it is all there is.
+        assert_eq!(last, "error: reload failed: ps timed out");
+
+        m.status.warn("select a pane first");
+        let out = render(&m, 100, 14, 0);
+        assert!(out.lines().last().unwrap_or_default().starts_with("warn: "));
     }
 }

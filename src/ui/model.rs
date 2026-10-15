@@ -280,7 +280,7 @@ pub struct Model {
     /// switch after the terminal is restored.
     pub switch_to: Option<String>,
     pub quit: bool,
-    pub status: String,
+    pub status: super::status::Status,
     /// Set after `J` or `M`, until a destination window is confirmed.
     pub pending_move: Option<PendingMove>,
     /// True while the `x` menu is open and waiting for the second key.
@@ -330,7 +330,7 @@ impl Model {
             waiting: 0,
             switch_to: None,
             quit: false,
-            status: String::new(),
+            status: super::status::Status::default(),
             pending_move: None,
             menu: false,
             help: false,
@@ -440,7 +440,9 @@ impl Model {
                 // A refresh can remove or renumber it; silently keeping the row
                 // number would move the pane somewhere they did not choose.
                 self.pending_move = None;
-                self.status = format!("pane move cancelled — {target} is no longer available");
+                self.status.warn(format!(
+                    "pane move cancelled — {target} is no longer available"
+                ));
                 self.clamp_cursor();
             }
         } else {
@@ -610,7 +612,7 @@ impl Model {
                 return;
             }
         }
-        self.status = "no window is waiting".into();
+        self.status.info("no window is waiting");
     }
 
     /// Show or hide the selected window's panes.
