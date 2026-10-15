@@ -148,6 +148,17 @@ point being compared against are kept in `$XDG_STATE_HOME/tmc/ui.json`
 The restored query is shown selected: the first letter typed replaces it,
 Backspace clears it, and Enter or a move keeps it.
 
+**Status line.** Messages carry a level, drawn as a prefix and a colour
+(`i` / `✓` / `!` / `✗`, or `info:` `ok:` `warn:` `error:` in ASCII). Info and
+success clear themselves after 4 seconds; warnings and errors stay until a key.
+
+**Terminal.** `NO_COLOR` drops every colour but keeps bold and reverse video.
+`TMC_ASCII=1` (or a non-UTF-8 locale) draws with ASCII only; a CJK locale keeps
+Unicode but cuts with `~` and names arrow keys in words, since `…` and the
+arrows draw two cells there. If one pane panics while drawing, it shows a
+one-line notice and the rest keeps working; the panic goes to `tmc.log` next to
+`ui.json`.
+
 **`x` — rearranging tmux**
 
 Everything that moves a window or a pane lives behind `x`, and pressing it

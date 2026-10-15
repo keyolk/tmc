@@ -52,6 +52,7 @@ pub enum Outcome {
 pub fn run(search: bool) -> Result<Outcome> {
     let points = point::list(&save::layout_dir());
     let mut model = Model::new(points);
+    model.theme = super::theme::Theme::detect();
     model.searching = search;
 
     // The last session's expanded windows, query and point. A broken file is
@@ -59,7 +60,7 @@ pub fn run(search: bool) -> Result<Outcome> {
     let state_path = state::path();
     match state::load(&state_path) {
         Ok(saved) => saved.restore(&mut model),
-        Err(e) => model.status = format!("{e:#}"),
+        Err(e) => model.status.error(format!("{e:#}")),
     }
 
     let focus = summoning_window();
@@ -107,6 +108,13 @@ fn restore_terminal_on_panic() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         if std::thread::current().id() != ui {
+            return;
+        }
+        // A pane's render is guarded and the TUI carries on after it: keep
+        // the terminal, and leave the message to the guard's log rather than
+        // printing it over the frame.
+        if super::guard::active() {
+            super::guard::note(info);
             return;
         }
         // Errors are ignored on purpose: this is already the failure path, and
@@ -263,7 +271,7 @@ impl Io {
                 }
                 match done {
                     Ok(d) => (d.finish)(model),
-                    Err(e) => model.status = format!("{e:#}"),
+                    Err(e) => model.status.error(format!("{e:#}")),
                 }
                 // `p` pressed while the command ran: its re-read compared
                 // against the old point.
@@ -323,11 +331,18 @@ fn event_loop(terminal: &mut Term, model: &mut Model, focus: Option<String>) -> 
             needs_redraw = false;
         }
 
-        let until_tick = next_tick.saturating_duration_since(Instant::now());
+        let now = Instant::now();
+        let until_tick = next_tick.saturating_duration_since(now);
         let wait = if io.outstanding(model) {
             until_tick.min(REPLY_POLL)
         } else {
             until_tick
+        };
+        // A status that times out wakes the loop once, at its deadline. Not a
+        // timer: with nothing on the status line this adds no wakeups at all.
+        let wait = match model.status.deadline() {
+            Some(at) => wait.min(at.saturating_duration_since(now)),
+            None => wait,
         };
         if event::poll(wait)? {
             match event::read()? {
@@ -347,6 +362,9 @@ fn event_loop(terminal: &mut Term, model: &mut Model, focus: Option<String>) -> 
         while let Some(reply) = io.workers.try_recv() {
             needs_redraw |= io.apply(model, reply);
         }
+
+        // The only redraw expiry costs: true once, when the message goes.
+        needs_redraw |= model.status.expire(Instant::now());
 
         // Tick: re-read the world. The reply redraws only when the display
         // would differ, so an idle workspace stays at 0 fps.
@@ -369,7 +387,7 @@ fn finish_running_command(terminal: &mut Term, model: &mut Model, io: &mut Io) -
     let Some(label) = model.busy else {
         return Ok(());
     };
-    model.status = format!("waiting for {label} to finish…");
+    model.status.info(format!("waiting for {label} to finish…"));
     terminal.draw(|frame| super::render::draw(frame, model, now_secs()))?;
     while model.busy.is_some() {
         let Some(reply) = io.workers.recv() else {
@@ -382,7 +400,7 @@ fn finish_running_command(terminal: &mut Term, model: &mut Model, io: &mut Io) -
 
 /// Turn a key into a change to the model, through the binding table.
 pub(super) fn handle_key(model: &mut Model, code: KeyCode, mods: KeyModifiers) -> Effect {
-    model.status.clear();
+    model.status.on_key(Instant::now());
     let ctx = keys::context(model);
 
     // Under a Korean input source the shortcut keys arrive as jamo (`q` -> `ㅂ`)
@@ -438,10 +456,8 @@ fn unbound(model: &mut Model, ctx: Ctx, key: Key) {
             model.move_destination(0);
         }
         (Ctx::Move, _) => {
-            model.status = format!(
-                "choose a window: {}",
-                keys::footer(Ctx::Move, model, usize::MAX)
-            );
+            let hint = keys::footer(Ctx::Move, model, usize::MAX);
+            model.status.warn(format!("choose a window: {hint}"));
         }
         // An unknown letter after `x` is a slip, and a complaint about it
         // would be noise on the screen that was showing the answer.
@@ -467,7 +483,9 @@ fn run_cmd(model: &mut Model, cmd: Cmd) -> Effect {
     if uses_worker(cmd)
         && let Some(label) = model.busy
     {
-        model.status = format!("still {label} — try again when it finishes");
+        model
+            .status
+            .warn(format!("still {label} — try again when it finishes"));
         return Effect::None;
     }
 
@@ -498,7 +516,9 @@ fn run_cmd(model: &mut Model, cmd: Cmd) -> Effect {
             if let Some(w) = model.current_window() {
                 if w.gone {
                     // Nothing to switch to; the window only exists in the point.
-                    model.status = "that window is gone — press r to restore it".into();
+                    model
+                        .status
+                        .warn("that window is gone — press r to restore it");
                 } else {
                     model.switch_to = Some(w.target());
                 }
@@ -523,7 +543,9 @@ fn run_cmd(model: &mut Model, cmd: Cmd) -> Effect {
             Some(action) if action.enabled => return job(run_action(model, kind)),
             // A greyed row already says what is missing; pressing it should
             // say the same thing rather than close in silence.
-            Some(action) => model.status = format!("{} — {}", action.label, action.detail),
+            Some(action) => model
+                .status
+                .warn(format!("{} — {}", action.label, action.detail)),
             None => {}
         },
         Cmd::Reload => return Effect::Reload,
@@ -554,14 +576,14 @@ fn settle_reload(model: &mut Model, result: Result<()>, shown: &mut Option<Strin
     match result {
         Ok(()) => {
             if let Some(msg) = shown.take()
-                && model.status == msg
+                && model.status.text() == msg
             {
                 model.status.clear();
             }
         }
         Err(e) => {
             let msg = format!("reload failed: {e:#}");
-            model.status = msg.clone();
+            model.status.error(msg.clone());
             *shown = Some(msg);
         }
     }
@@ -663,7 +685,7 @@ mod tests {
         let mut m = model_with_window();
         let mut shown = None;
         settle_reload(&mut m, Err(anyhow::anyhow!("tmux gone")), &mut shown);
-        m.status = "saved 2 session(s)".into();
+        m.status.success("saved 2 session(s)");
 
         settle_reload(&mut m, Ok(()), &mut shown);
         assert_eq!(m.status, "saved 2 session(s)");
@@ -1050,7 +1072,7 @@ mod tests {
     fn a_new_keypress_clears_the_previous_status() {
         // Otherwise a stale message sits under an unrelated action.
         let mut m = model_with_window();
-        m.status = "something happened".into();
+        m.status.info("something happened");
         press(&mut m, 'j', KeyModifiers::NONE);
         assert!(m.status.is_empty());
     }
@@ -1203,7 +1225,9 @@ mod tests {
         let mut m = Model::new(Vec::new());
         io.run(
             &mut m,
-            Effect::Job(Job::new("closing", || Ok(Done::status("unused")))),
+            Effect::Job(Job::new("closing", || {
+                Ok(Done::status(crate::ui::status::Level::Info, "unused"))
+            })),
         );
         assert_eq!(m.busy, Some("closing"));
         let generation = io.generation;
@@ -1219,7 +1243,7 @@ mod tests {
                 generation,
                 done: Ok(Done::then(move |m: &mut Model| {
                     *witness.lock().unwrap() = has_window(m, "projects:3");
-                    m.status = "killed 1 window(s)".into();
+                    m.status.success("killed 1 window(s)");
                 })),
                 snapshot: Ok(Snapshot::for_test("projects", 3)),
             },

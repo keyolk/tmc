@@ -7,9 +7,12 @@
 pub mod app;
 pub mod clipboard;
 mod commands;
+mod guard;
 pub mod keys;
 pub mod model;
 pub mod render;
 pub mod snapshot;
 pub mod state;
+pub mod status;
+pub mod theme;
 mod worker;

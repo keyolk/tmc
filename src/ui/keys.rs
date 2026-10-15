@@ -50,7 +50,23 @@ impl Key {
         })
     }
 
-    pub fn label(self) -> String {
+    /// How the key is written in hints and help. `glyphs` is the theme's
+    /// `key_glyphs`: arrows and symbols where they are safe, words otherwise.
+    pub fn label(self, glyphs: bool) -> String {
+        if !glyphs {
+            let word = match self {
+                Key::Enter => Some("enter"),
+                Key::Backspace => Some("bksp"),
+                Key::Up => Some("up"),
+                Key::Down => Some("down"),
+                Key::Left => Some("left"),
+                Key::Right => Some("right"),
+                _ => None,
+            };
+            if let Some(word) = word {
+                return word.into();
+            }
+        }
         match self {
             Key::Char(' ') => "space".into(),
             Key::Char(c) => c.to_string(),
@@ -335,9 +351,9 @@ fn entries<'a>(list: impl Iterator<Item = &'a Binding>, model: &Model) -> Vec<St
         match out.last_mut() {
             Some((keys, last)) if *last == w => {
                 keys.push('/');
-                keys.push_str(&b.key.label());
+                keys.push_str(&b.key.label(model.theme.glyphs.key_glyphs));
             }
-            _ => out.push((b.key.label(), w)),
+            _ => out.push((b.key.label(model.theme.glyphs.key_glyphs), w)),
         }
     }
     out.into_iter().map(|(k, w)| format!("{k} {w}")).collect()
@@ -387,7 +403,7 @@ pub fn footer(ctx: Ctx, model: &Model, width: usize) -> String {
 
 /// `?` help: every context and what each of its keys does, keys that do the
 /// same thing on one line.
-pub fn help_lines() -> Vec<(String, Vec<(String, String)>)> {
+pub fn help_lines(glyphs: bool) -> Vec<(String, Vec<(String, String)>)> {
     [
         Ctx::Search,
         Ctx::Tree,
@@ -403,9 +419,9 @@ pub fn help_lines() -> Vec<(String, Vec<(String, String)>)> {
             match lines.iter_mut().find(|(cmd, _, _)| *cmd == b.cmd) {
                 Some((_, keys, _)) => {
                     keys.push('/');
-                    keys.push_str(&b.key.label());
+                    keys.push_str(&b.key.label(glyphs));
                 }
-                None => lines.push((b.cmd, b.key.label(), b.help.to_string())),
+                None => lines.push((b.cmd, b.key.label(glyphs), b.help.to_string())),
             }
         }
         (
@@ -483,7 +499,7 @@ mod tests {
                 b.ctx
             );
         }
-        let listed: usize = help_lines().iter().map(|(_, l)| l.len()).sum();
+        let listed: usize = help_lines(true).iter().map(|(_, l)| l.len()).sum();
         assert!(listed > 0);
     }
 

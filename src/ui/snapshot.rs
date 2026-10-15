@@ -6,6 +6,7 @@
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
 
 use unicode_width::UnicodeWidthStr;
 
@@ -13,13 +14,7 @@ use super::model::Model;
 
 /// A frame as plain text, one line per row.
 pub fn render(model: &Model, width: u16, height: u16, now_secs: u64) -> String {
-    let mut terminal =
-        Terminal::new(TestBackend::new(width, height)).expect("test backend is infallible");
-    terminal
-        .draw(|frame| super::render::draw(frame, model, now_secs))
-        .expect("draw");
-
-    let buffer = terminal.backend().buffer();
+    let buffer = &frame(model, width, height, now_secs);
     (0..height)
         .map(|y| {
             // A double-width character occupies two cells: the symbol sits in
@@ -46,6 +41,16 @@ pub fn render(model: &Model, width: u16, height: u16, now_secs: u64) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// A frame with its styles, for checks the plain text cannot make (colour).
+pub fn frame(model: &Model, width: u16, height: u16, now_secs: u64) -> Buffer {
+    let mut terminal =
+        Terminal::new(TestBackend::new(width, height)).expect("test backend is infallible");
+    terminal
+        .draw(|frame| super::render::draw(frame, model, now_secs))
+        .expect("draw");
+    terminal.backend().buffer().clone()
 }
 
 #[cfg(test)]
@@ -264,8 +269,10 @@ mod tests {
             .lines()
             .find(|l| l.contains("firewall"))
             .expect("the removed window is listed");
+        // `-`, not `—`: the em dash is East Asian Ambiguous and would push
+        // the name column right on a CJK terminal.
         assert!(
-            line.contains('—'),
+            line.contains("   - "),
             "a gone window shows no live index: [{line}]",
         );
     }
@@ -501,7 +508,7 @@ mod tests {
         // that matches nothing, both lose the panel; the status must not go
         // with it.
         let mut m = model();
-        m.status = "killed 2 window(s)".into();
+        m.status.success("killed 2 window(s)");
         for width in [60u16, 70, 89, 110] {
             let out = render(&m, width, 12, 0);
             let last = out.lines().last().unwrap_or_default();
@@ -521,7 +528,8 @@ mod tests {
     #[test]
     fn a_long_status_is_cut_not_overflowed() {
         let mut m = model();
-        m.status = "reload failed: ps timed out after 3s; ".repeat(5);
+        m.status
+            .error("reload failed: ps timed out after 3s; ".repeat(5));
         let out = render(&m, 60, 12, 0);
         let last = out.lines().last().unwrap_or_default();
         assert!(last.width() <= 60, "[{last}]");
@@ -638,5 +646,167 @@ mod tests {
                 .contains(ratatui::style::Modifier::REVERSED),
             "selected, so typing visibly replaces it"
         );
+    }
+
+    #[test]
+    fn no_color_draws_no_colour_but_keeps_the_selection_visible() {
+        use crate::ui::theme::Theme;
+        use ratatui::style::{Color, Modifier};
+
+        let mut m = model();
+        m.theme = Theme {
+            no_color: true,
+            ..Theme::default()
+        };
+        m.menu = true; // the overlay border and key letters too
+        m.search = "co".into();
+        m.searching = true;
+        m.search_selected = true;
+        let buf = frame(&m, 110, 16, 0);
+
+        let coloured: Vec<_> = buf
+            .content
+            .iter()
+            .filter(|c| c.fg != Color::Reset || c.bg != Color::Reset)
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(coloured.is_empty(), "coloured cells: {coloured:?}");
+
+        // Attributes survive: the cursor row is bold, the restored query is
+        // reversed. Without them NO_COLOR would leave nothing to show either.
+        assert!(
+            buf.content
+                .iter()
+                .any(|c| c.modifier.contains(Modifier::BOLD)),
+            "bold is kept"
+        );
+        assert!(
+            buf.content
+                .iter()
+                .any(|c| c.modifier.contains(Modifier::REVERSED)),
+            "reverse video is kept"
+        );
+
+        // And with colour on, the same frame does colour something, so the
+        // check above is not passing on a frame that never had any.
+        m.theme = Theme::default();
+        let buf = frame(&m, 110, 16, 0);
+        assert!(buf.content.iter().any(|c| c.fg != Color::Reset));
+    }
+
+    #[test]
+    fn the_ascii_glyph_set_draws_nothing_outside_ascii_but_the_data() {
+        use crate::ui::theme::{Glyphs, Theme};
+
+        let mut m = model();
+        m.theme = Theme {
+            no_color: false,
+            glyphs: Glyphs::ASCII,
+        };
+        m.menu = true;
+        let out = render(&m, 110, 16, 0);
+        let foreign: String = out.chars().filter(|c| !c.is_ascii()).collect();
+        assert!(foreign.is_empty(), "non-ASCII {foreign:?} in\n{out}");
+        assert!(out.contains("+-"), "the menu box is drawn in ASCII:\n{out}");
+
+        // Help names every key, arrows and Enter included.
+        m.menu = false;
+        m.help = true;
+        let out = render(&m, 110, 40, 0);
+        let foreign: String = out.chars().filter(|c| !c.is_ascii()).collect();
+        assert!(foreign.is_empty(), "non-ASCII {foreign:?} in\n{out}");
+        assert!(out.contains("enter"), "{out}");
+    }
+
+    #[test]
+    fn a_success_gives_the_hints_back_once_it_expires() {
+        use crate::ui::status::{Level, TTL};
+        use std::time::{Duration, Instant};
+
+        let mut m = model();
+        let t0 = Instant::now();
+        m.status
+            .set_at_time(Level::Success, "saved 2 session(s)", t0);
+        let shown = render(&m, 100, 14, 0);
+        let last = shown.lines().last().unwrap_or_default();
+        assert_eq!(last, "✓ saved 2 session(s)", "prefix and text");
+
+        // Not yet: the loop is not woken early, and nothing changes.
+        assert!(!m.status.expire(t0 + TTL - Duration::from_millis(1)));
+        assert_eq!(render(&m, 100, 14, 0), shown);
+
+        // At the deadline the status goes and the hints come back -- one
+        // change, so one redraw; a second check finds nothing to do.
+        assert!(m.status.expire(t0 + TTL));
+        let after = render(&m, 100, 14, 0);
+        assert!(
+            after.lines().last().unwrap_or_default().contains("quit"),
+            "{after}"
+        );
+        assert!(!m.status.expire(t0 + TTL * 2));
+    }
+
+    #[test]
+    fn an_error_stays_and_says_so_without_colour() {
+        use crate::ui::status::TTL;
+        use crate::ui::theme::{Glyphs, Theme};
+        use std::time::Instant;
+
+        let mut m = model();
+        m.theme = Theme {
+            no_color: true,
+            glyphs: Glyphs::ASCII,
+        };
+        m.status.error("reload failed: ps timed out");
+        assert!(
+            !m.status.expire(Instant::now() + TTL * 10),
+            "errors wait for a key"
+        );
+        let out = render(&m, 100, 14, 0);
+        let last = out.lines().last().unwrap_or_default();
+        // The level is in the words: under NO_COLOR it is all there is.
+        assert_eq!(last, "error: reload failed: ps timed out");
+
+        m.status.warn("select a pane first");
+        let out = render(&m, 100, 14, 0);
+        assert!(out.lines().last().unwrap_or_default().starts_with("warn: "));
+    }
+
+    #[test]
+    fn a_cjk_window_name_keeps_the_columns_at_narrow_width() {
+        use crate::ui::theme::Theme;
+
+        // Where "2p" starts, in terminal columns, on the row naming `name`.
+        fn panes_column(out: &str, name: &str) -> usize {
+            let line = out.lines().find(|l| l.contains(name)).unwrap_or_else(|| {
+                panic!("{name} not listed:\n{out}");
+            });
+            let at = line.find(" 2p").expect("pane count");
+            line[..at].width()
+        }
+
+        let mut m = model();
+        // Fourteen columns is the name's budget; this is twenty.
+        if let Row::Window(w) = &mut m.rows[2] {
+            w.name = "한글창이름테스트용".into();
+        }
+        // Below the panel threshold and close to the floor.
+        for width in [50u16, 60, 89] {
+            let out = render(&m, width, 12, 0);
+            assert_eq!(
+                panes_column(&out, "한글"),
+                panes_column(&out, "coder"),
+                "at {width} columns:\n{out}"
+            );
+            assert!(out.contains("한글창이름테…"), "the cut is marked:\n{out}");
+            assert!(out.lines().all(|l| l.width() <= width as usize), "{out}");
+        }
+
+        // Under a CJK locale the marker is `~`: `…` would draw two cells and
+        // push the column right by one, which is the bug this guards.
+        m.theme = Theme::from_env(|k| (k == "LANG").then(|| "ko_KR.UTF-8".to_string()));
+        let out = render(&m, 60, 12, 0);
+        assert!(out.contains("한글창이름테~"), "{out}");
+        assert_eq!(panes_column(&out, "한글"), panes_column(&out, "coder"));
     }
 }
