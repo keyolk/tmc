@@ -7,6 +7,7 @@
 pub mod app;
 pub mod clipboard;
 mod commands;
+mod guard;
 pub mod keys;
 pub mod model;
 pub mod render;

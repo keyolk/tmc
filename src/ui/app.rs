@@ -110,6 +110,13 @@ fn restore_terminal_on_panic() {
         if std::thread::current().id() != ui {
             return;
         }
+        // A pane's render is guarded and the TUI carries on after it: keep
+        // the terminal, and leave the message to the guard's log rather than
+        // printing it over the frame.
+        if super::guard::active() {
+            super::guard::note(info);
+            return;
+        }
         // Errors are ignored on purpose: this is already the failure path, and
         // there is nowhere left to report a terminal that will not reset.
         let _ = disable_raw_mode();

@@ -7,6 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
+use super::guard;
 use super::keys::{self, Ctx};
 use super::model::{Model, Row, actions};
 use super::theme::Theme;
@@ -38,27 +39,46 @@ pub fn draw(frame: &mut Frame, model: &Model, now_secs: u64) {
         ])
         .split(area);
 
-    render_header(frame, rows[0], model, now_secs);
+    // Each pane is guarded: one that panics draws a line saying so, and the
+    // rest of the frame -- the key row with the way out above all -- still
+    // draws. See `guard`.
+    let t = &model.theme;
+    guard::pane(frame, rows[0], "header", t, false, |f| {
+        render_header(f, rows[0], model, now_secs)
+    });
 
     if area.width >= DETAIL_MIN_WIDTH {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
             .split(rows[1]);
-        render_tree(frame, columns[0], model);
-        render_detail(frame, columns[1], model);
+        guard::pane(frame, columns[0], "tree", t, false, |f| {
+            render_tree(f, columns[0], model)
+        });
+        guard::pane(frame, columns[1], "detail", t, false, |f| {
+            render_detail(f, columns[1], model)
+        });
     } else {
-        render_tree(frame, rows[1], model);
+        guard::pane(frame, rows[1], "tree", t, false, |f| {
+            render_tree(f, rows[1], model)
+        });
     }
 
-    render_keys(frame, rows[2], model);
+    guard::pane(frame, rows[2], "keys", t, false, |f| {
+        render_keys(f, rows[2], model)
+    });
 
-    // Last, so it sits over the tree and the panel both.
+    // Last, so it sits over the tree and the panel both. A failed overlay
+    // gives the tree back underneath its fallback line.
     if model.menu {
-        render_menu(frame, rows[1], model);
+        guard::pane(frame, rows[1], "menu", t, true, |f| {
+            render_menu(f, rows[1], model)
+        });
     }
     if model.help {
-        render_help(frame, rows[1], &model.theme, model.help_scroll);
+        guard::pane(frame, rows[1], "help", t, true, |f| {
+            render_help(f, rows[1], t, model.help_scroll)
+        });
     }
 }
 
