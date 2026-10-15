@@ -177,11 +177,15 @@ fn draw(frame: &mut ratatui::Frame, picker: &Picker, t: &Theme) {
         .map(|(pos, &i)| {
             let b = &picker.buffers[i];
             let selected = pos == picker.cursor;
+            // Cut with a marker rather than clipped by the paragraph: a
+            // preview that stops mid-word at the edge reads as the whole
+            // buffer. 2 for the cursor, 9 for the size column.
+            let room = (rows[1].width as usize).saturating_sub(2 + 9);
             Line::from(vec![
                 Span::raw(if selected { "> " } else { "  " }),
                 Span::styled(format!("{:>6}b  ", b.bytes), t.subtle()),
                 Span::styled(
-                    b.preview.clone(),
+                    super::render::truncate(&b.preview, room, t.glyphs.ellipsis),
                     if selected { t.selected() } else { t.text() },
                 ),
             ])

@@ -393,7 +393,7 @@ fn render_row<'a>(row: &'a Row, selected: bool, model: &Model, width: usize) -> 
             ];
             if !w.cc_session.is_empty() {
                 spans.push(Span::styled(
-                    format!(" {}", &w.cc_session[..8.min(w.cc_session.len())]),
+                    format!(" {}", short_id(&w.cc_session)),
                     t.subtle(),
                 ));
             }
@@ -452,10 +452,7 @@ fn render_detail(frame: &mut Frame, area: Rect, model: &Model) {
         head.push(Line::from(vec![
             Span::styled("  claude ", t.subtle()),
             Span::raw(w.state.clone()),
-            Span::styled(
-                format!("  {}", &w.cc_session[..8.min(w.cc_session.len())]),
-                t.subtle(),
-            ),
+            Span::styled(format!("  {}", short_id(&w.cc_session)), t.subtle()),
         ]));
     }
     let rows = Layout::default()
@@ -685,7 +682,7 @@ fn style_for(t: &Theme, change: Change) -> Style {
 ///
 /// `marker` is the theme's ellipsis: `…`, or `~` where `…` would draw two
 /// cells (a CJK locale) or not at all (ASCII).
-fn truncate(s: &str, width: usize, marker: &str) -> String {
+pub(super) fn truncate(s: &str, width: usize, marker: &str) -> String {
     use unicode_width::UnicodeWidthChar;
 
     if s.width() <= width {
@@ -705,6 +702,14 @@ fn truncate(s: &str, width: usize, marker: &str) -> String {
     }
     out.push_str(marker);
     out
+}
+
+/// The first eight characters of a session id.
+///
+/// By character, not byte: `@cc_session` is a tmux option anything can set,
+/// and slicing `[..8]` through a multi-byte character panics the draw.
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
 }
 
 /// Pad to `width` terminal columns.
@@ -750,6 +755,13 @@ mod tests {
         let cut = truncate("한글이름테스트", 8, "…");
         assert!(cut.width() <= 8, "{cut:?} is {} columns", cut.width());
         assert_eq!(cut, "한글이…");
+    }
+
+    #[test]
+    fn a_session_id_is_cut_by_character_not_byte() {
+        assert_eq!(short_id("e399ae98-489d-4cc7"), "e399ae98");
+        assert_eq!(short_id("세션아이디가길다는뜻"), "세션아이디가길다");
+        assert_eq!(short_id("abc"), "abc");
     }
 
     #[test]

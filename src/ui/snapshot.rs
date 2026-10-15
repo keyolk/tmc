@@ -771,4 +771,42 @@ mod tests {
         let out = render(&m, 100, 14, 0);
         assert!(out.lines().last().unwrap_or_default().starts_with("warn: "));
     }
+
+    #[test]
+    fn a_cjk_window_name_keeps_the_columns_at_narrow_width() {
+        use crate::ui::theme::Theme;
+
+        // Where "2p" starts, in terminal columns, on the row naming `name`.
+        fn panes_column(out: &str, name: &str) -> usize {
+            let line = out.lines().find(|l| l.contains(name)).unwrap_or_else(|| {
+                panic!("{name} not listed:\n{out}");
+            });
+            let at = line.find(" 2p").expect("pane count");
+            line[..at].width()
+        }
+
+        let mut m = model();
+        // Fourteen columns is the name's budget; this is twenty.
+        if let Row::Window(w) = &mut m.rows[2] {
+            w.name = "한글창이름테스트용".into();
+        }
+        // Below the panel threshold and close to the floor.
+        for width in [50u16, 60, 89] {
+            let out = render(&m, width, 12, 0);
+            assert_eq!(
+                panes_column(&out, "한글"),
+                panes_column(&out, "coder"),
+                "at {width} columns:\n{out}"
+            );
+            assert!(out.contains("한글창이름테…"), "the cut is marked:\n{out}");
+            assert!(out.lines().all(|l| l.width() <= width as usize), "{out}");
+        }
+
+        // Under a CJK locale the marker is `~`: `…` would draw two cells and
+        // push the column right by one, which is the bug this guards.
+        m.theme = Theme::from_env(|k| (k == "LANG").then(|| "ko_KR.UTF-8".to_string()));
+        let out = render(&m, 60, 12, 0);
+        assert!(out.contains("한글창이름테~"), "{out}");
+        assert_eq!(panes_column(&out, "한글"), panes_column(&out, "coder"));
+    }
 }
