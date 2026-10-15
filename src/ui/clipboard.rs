@@ -14,10 +14,10 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use super::theme::Theme;
 use crate::collect::clipboard::{self, Buffer};
 
 /// State of the picker, kept apart from the terminal so it can be tested.
@@ -112,6 +112,7 @@ pub fn run(target: &str) -> Result<()> {
         return Ok(());
     }
     let mut picker = Picker::new(buffers);
+    let theme = Theme::detect();
 
     enable_raw_mode()?;
     let mut out = io::stdout();
@@ -119,7 +120,7 @@ pub fn run(target: &str) -> Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
 
     let result = loop {
-        if let Err(e) = terminal.draw(|frame| draw(frame, &picker)) {
+        if let Err(e) = terminal.draw(|frame| draw(frame, &picker, &theme)) {
             break Err(anyhow::Error::from(e));
         }
         match event::read() {
@@ -145,7 +146,7 @@ pub fn run(target: &str) -> Result<()> {
     Ok(())
 }
 
-fn draw(frame: &mut ratatui::Frame, picker: &Picker) {
+fn draw(frame: &mut ratatui::Frame, picker: &Picker, t: &Theme) {
     let area = frame.area();
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -154,9 +155,9 @@ fn draw(frame: &mut ratatui::Frame, picker: &Picker) {
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("buffer  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("buffer  ", t.subtle()),
             Span::raw(picker.filter.clone()),
-            Span::styled("▌", Style::default().fg(Color::Yellow)),
+            Span::styled(t.glyphs.caret, t.accent()),
         ])),
         rows[0],
     );
@@ -178,17 +179,10 @@ fn draw(frame: &mut ratatui::Frame, picker: &Picker) {
             let selected = pos == picker.cursor;
             Line::from(vec![
                 Span::raw(if selected { "> " } else { "  " }),
-                Span::styled(
-                    format!("{:>6}b  ", b.bytes),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(format!("{:>6}b  ", b.bytes), t.subtle()),
                 Span::styled(
                     b.preview.clone(),
-                    if selected {
-                        Style::default().add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                    },
+                    if selected { t.selected() } else { t.text() },
                 ),
             ])
         })

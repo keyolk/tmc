@@ -6,6 +6,7 @@
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
 
 use unicode_width::UnicodeWidthStr;
 
@@ -13,13 +14,7 @@ use super::model::Model;
 
 /// A frame as plain text, one line per row.
 pub fn render(model: &Model, width: u16, height: u16, now_secs: u64) -> String {
-    let mut terminal =
-        Terminal::new(TestBackend::new(width, height)).expect("test backend is infallible");
-    terminal
-        .draw(|frame| super::render::draw(frame, model, now_secs))
-        .expect("draw");
-
-    let buffer = terminal.backend().buffer();
+    let buffer = &frame(model, width, height, now_secs);
     (0..height)
         .map(|y| {
             // A double-width character occupies two cells: the symbol sits in
@@ -46,6 +41,16 @@ pub fn render(model: &Model, width: u16, height: u16, now_secs: u64) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// A frame with its styles, for checks the plain text cannot make (colour).
+pub fn frame(model: &Model, width: u16, height: u16, now_secs: u64) -> Buffer {
+    let mut terminal =
+        Terminal::new(TestBackend::new(width, height)).expect("test backend is infallible");
+    terminal
+        .draw(|frame| super::render::draw(frame, model, now_secs))
+        .expect("draw");
+    terminal.backend().buffer().clone()
 }
 
 #[cfg(test)]
@@ -264,8 +269,10 @@ mod tests {
             .lines()
             .find(|l| l.contains("firewall"))
             .expect("the removed window is listed");
+        // `-`, not `—`: the em dash is East Asian Ambiguous and would push
+        // the name column right on a CJK terminal.
         assert!(
-            line.contains('—'),
+            line.contains("   - "),
             "a gone window shows no live index: [{line}]",
         );
     }
@@ -638,5 +645,75 @@ mod tests {
                 .contains(ratatui::style::Modifier::REVERSED),
             "selected, so typing visibly replaces it"
         );
+    }
+
+    #[test]
+    fn no_color_draws_no_colour_but_keeps_the_selection_visible() {
+        use crate::ui::theme::Theme;
+        use ratatui::style::{Color, Modifier};
+
+        let mut m = model();
+        m.theme = Theme {
+            no_color: true,
+            ..Theme::default()
+        };
+        m.menu = true; // the overlay border and key letters too
+        m.search = "co".into();
+        m.searching = true;
+        m.search_selected = true;
+        let buf = frame(&m, 110, 16, 0);
+
+        let coloured: Vec<_> = buf
+            .content
+            .iter()
+            .filter(|c| c.fg != Color::Reset || c.bg != Color::Reset)
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(coloured.is_empty(), "coloured cells: {coloured:?}");
+
+        // Attributes survive: the cursor row is bold, the restored query is
+        // reversed. Without them NO_COLOR would leave nothing to show either.
+        assert!(
+            buf.content
+                .iter()
+                .any(|c| c.modifier.contains(Modifier::BOLD)),
+            "bold is kept"
+        );
+        assert!(
+            buf.content
+                .iter()
+                .any(|c| c.modifier.contains(Modifier::REVERSED)),
+            "reverse video is kept"
+        );
+
+        // And with colour on, the same frame does colour something, so the
+        // check above is not passing on a frame that never had any.
+        m.theme = Theme::default();
+        let buf = frame(&m, 110, 16, 0);
+        assert!(buf.content.iter().any(|c| c.fg != Color::Reset));
+    }
+
+    #[test]
+    fn the_ascii_glyph_set_draws_nothing_outside_ascii_but_the_data() {
+        use crate::ui::theme::{Glyphs, Theme};
+
+        let mut m = model();
+        m.theme = Theme {
+            no_color: false,
+            glyphs: Glyphs::ASCII,
+        };
+        m.menu = true;
+        let out = render(&m, 110, 16, 0);
+        let foreign: String = out.chars().filter(|c| !c.is_ascii()).collect();
+        assert!(foreign.is_empty(), "non-ASCII {foreign:?} in\n{out}");
+        assert!(out.contains("+-"), "the menu box is drawn in ASCII:\n{out}");
+
+        // Help names every key, arrows and Enter included.
+        m.menu = false;
+        m.help = true;
+        let out = render(&m, 110, 40, 0);
+        let foreign: String = out.chars().filter(|c| !c.is_ascii()).collect();
+        assert!(foreign.is_empty(), "non-ASCII {foreign:?} in\n{out}");
+        assert!(out.contains("enter"), "{out}");
     }
 }

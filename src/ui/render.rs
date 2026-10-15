@@ -2,13 +2,14 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use unicode_width::UnicodeWidthStr;
 
 use super::keys::{self, Ctx};
 use super::model::{Model, Row, actions};
+use super::theme::Theme;
 use crate::clock;
 use crate::layout::diff::Change;
 
@@ -22,7 +23,7 @@ pub fn draw(frame: &mut Frame, model: &Model, now_secs: u64) {
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         frame.render_widget(
-            Paragraph::new("terminal too small").style(Style::default().fg(Color::Red)),
+            Paragraph::new("terminal too small").style(model.theme.error()),
             area,
         );
         return;
@@ -57,7 +58,7 @@ pub fn draw(frame: &mut Frame, model: &Model, now_secs: u64) {
         render_menu(frame, rows[1], model);
     }
     if model.help {
-        render_help(frame, rows[1], model.help_scroll);
+        render_help(frame, rows[1], &model.theme, model.help_scroll);
     }
 }
 
@@ -67,6 +68,8 @@ pub fn draw(frame: &mut Frame, model: &Model, now_secs: u64) {
 /// covering the tree is the point — the commands act on the selection, which
 /// the title line names, not on whatever the cursor is passing over.
 fn render_menu(frame: &mut Frame, body: Rect, model: &Model) {
+    let t = &model.theme;
+    let ell = t.glyphs.ellipsis;
     let entries = actions(model);
     let title = format!(" x  {} ", menu_target(model));
     let footer = keys::footer(Ctx::Menu, model, usize::MAX);
@@ -98,46 +101,38 @@ fn render_menu(frame: &mut Frame, body: Rect, model: &Model) {
         .iter()
         .zip(&keys)
         .map(|(action, key)| {
-            let detail = truncate(&action.detail, budget);
+            let detail = truncate(&action.detail, budget, ell);
             let pad = usable.saturating_sub(widest_key + detail.width()).max(1);
             let (key_style, label_style) = if action.enabled {
-                (
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                    Style::default(),
-                )
+                (t.accent(), t.text())
             } else {
                 // Greyed rather than hidden. With five commands the reason a
                 // row is unavailable is the useful part — "needs two or more
                 // marked" is how you learn merge takes a selection at all —
                 // and a menu that changes shape teaches nothing.
-                (
-                    Style::default().fg(Color::DarkGray),
-                    Style::default().fg(Color::DarkGray),
-                )
+                (t.subtle(), t.subtle())
             };
             let (k, label) = key.split_at(1);
             Line::from(vec![
                 Span::styled(k.to_string(), key_style),
                 Span::styled(label.to_string(), label_style),
                 Span::raw(" ".repeat(widest_key - key.width() + pad)),
-                Span::styled(detail, Style::default().fg(Color::DarkGray)),
+                Span::styled(detail, t.subtle()),
             ])
         })
         .collect();
     lines.push(Line::raw(""));
-    lines.push(Line::styled(footer, Style::default().fg(Color::DarkGray)));
+    lines.push(Line::styled(footer, t.subtle()));
 
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::DarkGray))
+                .border_set(t.glyphs.border)
+                .border_style(t.border_focus())
                 .title(Span::styled(
-                    truncate(&title, area.width.saturating_sub(4) as usize),
+                    truncate(&title, area.width.saturating_sub(4) as usize, ell),
                     Style::default().add_modifier(Modifier::BOLD),
                 ))
                 .padding(ratatui::widgets::Padding::horizontal(1)),
@@ -185,6 +180,7 @@ fn centred(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn render_header(frame: &mut Frame, area: Rect, model: &Model, now_secs: u64) {
+    let t = &model.theme;
     let (modified, added, removed) = model.counts;
     let point = model
         .current_point()
@@ -208,31 +204,25 @@ fn render_header(frame: &mut Frame, area: Rect, model: &Model, now_secs: u64) {
         summary.push(Span::raw("   "));
         // A restored query is drawn selected, the way a GUI search box
         // shows last time's text: typing replaces it.
-        let style = Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD);
         summary.push(Span::styled(
             model.search.clone(),
             if model.search_selected {
-                style.add_modifier(Modifier::REVERSED)
+                t.replaceable()
             } else {
-                style
+                t.accent()
             },
         ));
-        summary.push(Span::styled("▌", Style::default().fg(Color::Yellow)));
+        summary.push(Span::styled(t.glyphs.caret, t.accent()));
     } else if !model.search.is_empty() {
         // Stepped out to the tree with a filter still applied. The slash marks
         // it as a filter rather than part of the summary, and the missing
         // cursor says typing will no longer land here.
-        summary.push(Span::styled(
-            format!("   /{}", model.search),
-            Style::default().fg(Color::Yellow),
-        ));
+        summary.push(Span::styled(format!("   /{}", model.search), t.accent()));
     }
     if model.waiting > 0 {
         summary.push(Span::styled(
             format!("  {} waiting", model.waiting),
-            Style::default().fg(Color::Yellow),
+            t.warn(),
         ));
     }
     // Windows and panes are marked with the same key but act differently —
@@ -251,18 +241,18 @@ fn render_header(frame: &mut Frame, area: Rect, model: &Model, now_secs: u64) {
     if let Some(newer) = &model.stale_build {
         summary.push(Span::styled(
             format!("   this build is {} — run make install", newer),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            t.error(),
         ));
     }
 
     let drift = Line::from(vec![
-        Span::styled(point, Style::default().fg(Color::DarkGray)),
+        Span::styled(point, t.subtle()),
         Span::raw("   "),
-        Span::styled(format!("~{modified}"), style_for(Change::Modified)),
+        Span::styled(format!("~{modified}"), style_for(t, Change::Modified)),
         Span::raw(" "),
-        Span::styled(format!("+{added}"), style_for(Change::Added)),
+        Span::styled(format!("+{added}"), style_for(t, Change::Added)),
         Span::raw(" "),
-        Span::styled(format!("-{removed}"), style_for(Change::Removed)),
+        Span::styled(format!("-{removed}"), style_for(t, Change::Removed)),
     ]);
 
     frame.render_widget(Paragraph::new(vec![Line::from(summary), drift]), area);
@@ -291,12 +281,17 @@ fn render_tree(frame: &mut Frame, area: Rect, model: &Model) {
     if visible.is_empty() && !model.search.is_empty() {
         lines.push(Line::styled(
             format!("  no window matches \"{}\"", model.search),
-            Style::default().fg(Color::DarkGray),
+            model.theme.subtle(),
         ));
     }
 
     frame.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::RIGHT)),
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::RIGHT)
+                .border_set(model.theme.glyphs.border)
+                .border_style(model.theme.border()),
+        ),
         area,
     );
 }
@@ -312,16 +307,15 @@ fn scroll_offset(cursor: usize, total: usize, height: usize) -> usize {
 }
 
 fn render_row<'a>(row: &'a Row, selected: bool, model: &Model, width: usize) -> Line<'a> {
+    let t = &model.theme;
+    let ell = t.glyphs.ellipsis;
     match row {
         Row::Session { name, windows } => Line::from(vec![
             Span::styled(
-                format!("▾ {name}"),
+                format!("{} {name}", t.glyphs.session),
                 Style::default().add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                format!("  {windows}w"),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(format!("  {windows}w"), t.subtle()),
         ]),
         Row::Pane(p) => {
             // Indented under its window, addressed by pane id — that is what
@@ -343,24 +337,19 @@ fn render_row<'a>(row: &'a Row, selected: bool, model: &Model, width: usize) -> 
             };
             Line::from(vec![
                 Span::raw(format!("{cursor}{mark}   ")),
-                Span::styled(
-                    format!("{:<5}", p.pane_id),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(
-                    if p.active { "· " } else { "  " },
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(format!("{:<5}", p.pane_id), t.subtle()),
+                // `*` rather than `·`: the command column starts right after
+                // this, and `·` is East Asian Ambiguous -- two cells on a CJK
+                // terminal, which would push every active pane's command one
+                // column right of its siblings'. tmux marks its current window
+                // with `*` too.
+                Span::styled(if p.active { "* " } else { "  " }, t.subtle()),
                 Span::styled(
                     // The pane id and markers take a fixed prefix; the rest is
                     // the command, cut to what is left. Three claude panes in
                     // one window are indistinguishable otherwise.
-                    truncate(&command, width.saturating_sub(13)),
-                    if selected {
-                        Style::default().add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::Gray)
-                    },
+                    truncate(&command, width.saturating_sub(13), ell),
+                    if selected { t.selected() } else { t.muted() },
                 ),
             ])
         }
@@ -371,8 +360,10 @@ fn render_row<'a>(row: &'a Row, selected: bool, model: &Model, width: usize) -> 
                 ' '
             };
             let cursor = if selected { '>' } else { ' ' };
+            // `-`, not `—`: the dash is East Asian Ambiguous and would shift
+            // the name column on a CJK terminal.
             let index = if w.gone {
-                "  —".to_string()
+                "  -".to_string()
             } else {
                 format!("{:>3}", w.index)
             };
@@ -381,38 +372,29 @@ fn render_row<'a>(row: &'a Row, selected: bool, model: &Model, width: usize) -> 
                 Span::raw(format!("{cursor}{mark} ")),
                 Span::styled(
                     w.state_glyph().to_string(),
-                    if w.waiting {
-                        Style::default().fg(Color::Yellow)
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    },
+                    if w.waiting { t.warn() } else { t.subtle() },
                 ),
                 Span::raw(format!(" {index} ")),
                 Span::styled(
                     // Padded to the display width the name actually occupies,
                     // so a Korean window name does not shift the columns after
                     // it — `{:<14}` counts characters, not columns.
-                    pad(&truncate(&w.name, 14), 14),
+                    pad(&truncate(&w.name, 14, ell), 14),
                     if w.gone {
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::CROSSED_OUT)
+                        t.subtle().add_modifier(Modifier::CROSSED_OUT)
                     } else if selected {
-                        Style::default().add_modifier(Modifier::BOLD)
+                        t.selected()
                     } else {
-                        Style::default()
+                        t.text()
                     },
                 ),
-                Span::styled(
-                    format!("{:>2}p ", w.panes),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(w.change.marker().to_string(), style_for(w.change)),
+                Span::styled(format!("{:>2}p ", w.panes), t.subtle()),
+                Span::styled(w.change.marker().to_string(), style_for(t, w.change)),
             ];
             if !w.cc_session.is_empty() {
                 spans.push(Span::styled(
                     format!(" {}", &w.cc_session[..8.min(w.cc_session.len())]),
-                    Style::default().fg(Color::DarkGray),
+                    t.subtle(),
                 ));
             }
             Line::from(spans)
@@ -421,12 +403,10 @@ fn render_row<'a>(row: &'a Row, selected: bool, model: &Model, width: usize) -> 
 }
 
 fn render_detail(frame: &mut Frame, area: Rect, model: &Model) {
+    let t = &model.theme;
     let Some(w) = model.current_window() else {
         frame.render_widget(
-            Paragraph::new(Line::styled(
-                "select a window",
-                Style::default().fg(Color::DarkGray),
-            )),
+            Paragraph::new(Line::styled("select a window", t.subtle())),
             area,
         );
         return;
@@ -446,41 +426,35 @@ fn render_detail(frame: &mut Frame, area: Rect, model: &Model) {
                 Style::default().add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
-            Span::styled(
-                format!("{} {}", p.window_target(), w.name),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(format!("{} {}", p.window_target(), w.name), t.subtle()),
         ]),
         None => Line::from(vec![
             Span::styled(w.target(), Style::default().add_modifier(Modifier::BOLD)),
             Span::raw("  "),
-            Span::styled(w.name.clone(), Style::default().fg(Color::DarkGray)),
+            Span::styled(w.name.clone(), t.subtle()),
             Span::raw("  "),
-            Span::styled(
-                format!("{}p", w.panes),
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled(format!("{}p", w.panes), t.subtle()),
         ]),
     }];
 
     match model.current_pane() {
         Some(p) => head.push(Line::from(vec![
-            Span::styled("  cwd ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  cwd ", t.subtle()),
             Span::raw(p.path.clone()),
         ])),
         None => {
             for reason in &w.reasons {
-                head.push(Line::styled(format!("  {reason}"), style_for(w.change)));
+                head.push(Line::styled(format!("  {reason}"), style_for(t, w.change)));
             }
         }
     }
     if !w.state.is_empty() {
         head.push(Line::from(vec![
-            Span::styled("  claude ", Style::default().fg(Color::DarkGray)),
+            Span::styled("  claude ", t.subtle()),
             Span::raw(w.state.clone()),
             Span::styled(
                 format!("  {}", &w.cc_session[..8.min(w.cc_session.len())]),
-                Style::default().fg(Color::DarkGray),
+                t.subtle(),
             ),
         ]));
     }
@@ -501,6 +475,12 @@ fn render_preview(frame: &mut Frame, area: Rect, model: &Model, w: &super::model
     if area.height == 0 {
         return;
     }
+    let t = &model.theme;
+    let rule = format!(
+        "{r} output {}",
+        t.glyphs.rule.repeat(area.width.saturating_sub(9) as usize),
+        r = t.glyphs.rule
+    );
 
     // Keyed by whatever `app::preview_target` asked for: the pane id when one
     // is selected, the window otherwise. Asking by window while a pane is
@@ -515,7 +495,7 @@ fn render_preview(frame: &mut Frame, area: Rect, model: &Model, w: &super::model
             frame.render_widget(
                 Paragraph::new(Line::styled(
                     "  not running — press r to restore it",
-                    Style::default().fg(Color::DarkGray),
+                    t.subtle(),
                 )),
                 area,
             );
@@ -524,35 +504,23 @@ fn render_preview(frame: &mut Frame, area: Rect, model: &Model, w: &super::model
         // Still being captured. An empty body would say "(nothing on
         // screen)" for the moment it takes, which is a claim, not a wait.
         None => {
-            frame.render_widget(
-                Paragraph::new(Line::styled(
-                    "─ output ".to_string() + &"─".repeat(area.width.saturating_sub(9) as usize),
-                    Style::default().fg(Color::DarkGray),
-                )),
-                area,
-            );
+            frame.render_widget(Paragraph::new(Line::styled(rule, t.subtle())), area);
             return;
         }
     };
 
-    let mut lines: Vec<Line> = vec![Line::styled(
-        "─ output ".to_string() + &"─".repeat(area.width.saturating_sub(9) as usize),
-        Style::default().fg(Color::DarkGray),
-    )];
+    let mut lines: Vec<Line> = vec![Line::styled(rule, t.subtle())];
 
     // Dim, because the preview is context rather than this app's own output —
     // and full-brightness terminal text next to the tree reads as a second UI.
     let captured = crate::collect::tmux::tail_lines(body, area.height.saturating_sub(1) as usize);
     if captured.is_empty() {
-        lines.push(Line::styled(
-            "  (nothing on screen)",
-            Style::default().fg(Color::DarkGray),
-        ));
+        lines.push(Line::styled("  (nothing on screen)", t.subtle()));
     }
     for line in captured {
         lines.push(Line::styled(
-            truncate(line, area.width as usize),
-            Style::default().fg(Color::Gray),
+            truncate(line, area.width as usize, t.glyphs.ellipsis),
+            t.muted(),
         ));
     }
 
@@ -560,6 +528,8 @@ fn render_preview(frame: &mut Frame, area: Rect, model: &Model, w: &super::model
 }
 
 fn render_keys(frame: &mut Frame, area: Rect, model: &Model) {
+    let t = &model.theme;
+    let ell = t.glyphs.ellipsis;
     // The status takes the key row while it is set. It used to live in the
     // detail panel, which is dropped below 90 columns and empty when no window
     // is selected -- exactly the popup sizes and the empty search where a
@@ -568,8 +538,7 @@ fn render_keys(frame: &mut Frame, area: Rect, model: &Model) {
     // come back on the next keystroke.
     if !model.status.is_empty() {
         frame.render_widget(
-            Paragraph::new(truncate(&model.status, area.width as usize))
-                .style(Style::default().fg(Color::Yellow)),
+            Paragraph::new(truncate(&model.status, area.width as usize, ell)).style(t.warn()),
             area,
         );
         return;
@@ -577,7 +546,6 @@ fn render_keys(frame: &mut Frame, area: Rect, model: &Model) {
 
     let width = area.width as usize;
     let ctx = keys::context(model);
-    let dim = Style::default().fg(Color::DarkGray);
 
     // The hints are derived from the binding table for whatever context is
     // live: while the menu is up its letters mean the menu's commands, and
@@ -593,14 +561,14 @@ fn render_keys(frame: &mut Frame, area: Rect, model: &Model) {
             ),
         };
         let what = if model.searching {
-            format!("{what}   /{}▌", model.search)
+            format!("{what}   /{}{}", model.search, t.glyphs.caret)
         } else {
             what
         };
         let room = width.saturating_sub(what.width() + 3);
         let text = format!("{what}   {}", keys::footer(ctx, model, room));
         frame.render_widget(
-            Paragraph::new(truncate(&text, width)).style(Style::default().fg(Color::Yellow)),
+            Paragraph::new(truncate(&text, width, ell)).style(t.warn()),
             area,
         );
         return;
@@ -609,7 +577,7 @@ fn render_keys(frame: &mut Frame, area: Rect, model: &Model) {
     // A command running on the worker says so ahead of the hints, which stay:
     // navigation still works while it runs.
     let mut lead = match model.busy {
-        Some(label) => format!("{label}…   "),
+        Some(label) => format!("{label}{ell}   "),
         None => String::new(),
     };
     match ctx {
@@ -622,11 +590,14 @@ fn render_keys(frame: &mut Frame, area: Rect, model: &Model) {
     let room = width.saturating_sub(lead.width());
     let text = format!("{lead}{}", keys::footer(ctx, model, room));
     let style = if model.busy.is_some() {
-        Style::default().fg(Color::Yellow)
+        t.warn()
     } else {
-        dim
+        t.subtle()
     };
-    frame.render_widget(Paragraph::new(truncate(&text, width)).style(style), area);
+    frame.render_widget(
+        Paragraph::new(truncate(&text, width, ell)).style(style),
+        area,
+    );
 }
 
 /// `?` help, derived from the binding table: every context, every key.
@@ -634,8 +605,8 @@ fn render_keys(frame: &mut Frame, area: Rect, model: &Model) {
 /// Drawn over the body like the `x` menu, so the tree it describes stays in
 /// view around it. Scrolled with j/k on a short terminal rather than
 /// squeezed; the hint row below names both.
-fn render_help(frame: &mut Frame, body: Rect, scroll: usize) {
-    let sections = keys::help_lines();
+fn render_help(frame: &mut Frame, body: Rect, t: &Theme, scroll: usize) {
+    let sections = keys::help_lines(t.glyphs.key_glyphs);
     let widest_keys = sections
         .iter()
         .flat_map(|(_, lines)| lines.iter().map(|(k, _)| k.width()))
@@ -663,14 +634,9 @@ fn render_help(frame: &mut Frame, body: Rect, scroll: usize) {
         ));
         for (k, h) in entries {
             let pad = widest_keys.saturating_sub(k.width()) + 2;
-            let help = truncate(h, usable.saturating_sub(widest_keys + 2));
+            let help = truncate(h, usable.saturating_sub(widest_keys + 2), t.glyphs.ellipsis);
             lines.push(Line::from(vec![
-                Span::styled(
-                    k.clone(),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(k.clone(), t.accent()),
                 Span::raw(" ".repeat(pad)),
                 Span::raw(help),
             ]));
@@ -688,8 +654,8 @@ fn render_help(frame: &mut Frame, body: Rect, scroll: usize) {
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::DarkGray))
+                .border_set(t.glyphs.border)
+                .border_style(t.border_focus())
                 .title(Span::styled(
                     " keys ",
                     Style::default().add_modifier(Modifier::BOLD),
@@ -700,12 +666,12 @@ fn render_help(frame: &mut Frame, body: Rect, scroll: usize) {
     );
 }
 
-fn style_for(change: Change) -> Style {
+fn style_for(t: &Theme, change: Change) -> Style {
     match change {
-        Change::Modified => Style::default().fg(Color::Blue),
-        Change::Added => Style::default().fg(Color::Green),
-        Change::Removed => Style::default().fg(Color::Red),
-        Change::Same => Style::default().fg(Color::DarkGray),
+        Change::Modified => t.info(),
+        Change::Added => t.added(),
+        Change::Removed => t.removed(),
+        Change::Same => t.subtle(),
     }
 }
 
@@ -714,14 +680,17 @@ fn style_for(change: Change) -> Style {
 /// Measured in display width, not characters: CJK text is two columns per
 /// character, so counting characters overflows the panel by up to double.
 /// Window names and captured output here are routinely Korean.
-fn truncate(s: &str, width: usize) -> String {
+///
+/// `marker` is the theme's ellipsis: `…`, or `~` where `…` would draw two
+/// cells (a CJK locale) or not at all (ASCII).
+fn truncate(s: &str, width: usize, marker: &str) -> String {
     use unicode_width::UnicodeWidthChar;
 
     if s.width() <= width {
         return s.to_string();
     }
-    // Leave a column for the ellipsis.
-    let budget = width.saturating_sub(1);
+    // Leave room for the marker.
+    let budget = width.saturating_sub(marker.width());
     let mut out = String::new();
     let mut used = 0;
     for ch in s.chars() {
@@ -732,7 +701,7 @@ fn truncate(s: &str, width: usize) -> String {
         out.push(ch);
         used += w;
     }
-    out.push('…');
+    out.push_str(marker);
     out
 }
 
@@ -767,8 +736,8 @@ mod tests {
 
     #[test]
     fn truncation_marks_what_it_cut() {
-        assert_eq!(truncate("short", 10), "short");
-        assert_eq!(truncate("a-very-long-window-name", 10), "a-very-lo…");
+        assert_eq!(truncate("short", 10, "…"), "short");
+        assert_eq!(truncate("a-very-long-window-name", 10, "…"), "a-very-lo…");
     }
 
     #[test]
@@ -776,7 +745,7 @@ mod tests {
         use unicode_width::UnicodeWidthStr;
         // Korean is two columns per character. Counting characters would let
         // a name occupy twice its budget and push the panel border off.
-        let cut = truncate("한글이름테스트", 8);
+        let cut = truncate("한글이름테스트", 8, "…");
         assert!(cut.width() <= 8, "{cut:?} is {} columns", cut.width());
         assert_eq!(cut, "한글이…");
     }

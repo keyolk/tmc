@@ -197,8 +197,11 @@ pub fn actions(model: &Model) -> Vec<Action> {
         .count();
     let merging = model.marked_live_windows().len();
 
+    // The details are right-aligned against the menu's border, so they keep
+    // to ASCII punctuation: `—` is East Asian Ambiguous and on a CJK terminal
+    // would push the border out by a cell.
     let panes_detail = match panes {
-        0 => "needs a pane — l expands".to_string(),
+        0 => "needs a pane; l expands".to_string(),
         1 => "1 pane".to_string(),
         n => format!("{n} panes"),
     };
@@ -231,7 +234,7 @@ pub fn actions(model: &Model) -> Vec<Action> {
                 if windows > 0 && model.live_sessions() != 2 {
                     match model.live_sessions() {
                         0 | 1 => "no other session".to_string(),
-                        n => format!("{n} sessions — ambiguous"),
+                        n => format!("{n} sessions, ambiguous"),
                     }
                 } else {
                     windows_detail.clone()
@@ -309,6 +312,10 @@ pub struct Model {
     /// Cached by target so moving the cursor back and forth over the same rows
     /// does not re-shell for a capture that has not changed.
     pub preview: Option<(String, String)>,
+    /// Colours and glyphs. `Model::new` takes the fixed default so tests do
+    /// not depend on the developer's `NO_COLOR` or locale; the entry points
+    /// replace it with `Theme::detect()`.
+    pub theme: super::theme::Theme,
 }
 
 impl Model {
@@ -336,6 +343,7 @@ impl Model {
             stale_build: check_build(),
             expanded: std::collections::HashSet::new(),
             preview: None,
+            theme: super::theme::Theme::default(),
         }
     }
 

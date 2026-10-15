@@ -52,6 +52,7 @@ pub enum Outcome {
 pub fn run(search: bool) -> Result<Outcome> {
     let points = point::list(&save::layout_dir());
     let mut model = Model::new(points);
+    model.theme = super::theme::Theme::detect();
     model.searching = search;
 
     // The last session's expanded windows, query and point. A broken file is

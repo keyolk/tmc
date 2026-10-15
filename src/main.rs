@@ -578,6 +578,7 @@ fn snapshot(
 ) -> Result<()> {
     let points = point::list(&layout::save::layout_dir());
     let mut model = ui::model::Model::new(points);
+    model.theme = ui::theme::Theme::detect();
     model.searching = searching;
     model.menu = menu;
     if let Some(target) = expand {
