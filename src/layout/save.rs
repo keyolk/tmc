@@ -62,14 +62,15 @@ fn build_pane(p: &tmux::Pane, conf: tmux::SessionConfidence, tree: &Tree) -> Pan
     let command = command::for_pane(p.pid, tree, |pid| tree.args(pid).map(str::to_string));
     let shell_only = command.is_none();
 
-    // The published id names a session in this window. When several claudes
-    // share the window it is not necessarily *this* pane's, so the confidence
-    // travels with it and the restore UI can ask rather than guess.
+    // A pane-scoped id is this pane's own. Without one, the window's id names
+    // a session in this window, and when several claudes share the window it
+    // is not necessarily *this* pane's, so the confidence travels with it and
+    // the restore UI can ask rather than guess.
     let (claude_session, session_confidence) = match conf {
         tmux::SessionConfidence::None => (None, None),
-        tmux::SessionConfidence::Exact => (non_empty(&p.cc_session), Some("exact".to_string())),
+        tmux::SessionConfidence::Exact => (non_empty(p.session_id()), Some("exact".to_string())),
         tmux::SessionConfidence::Ambiguous => {
-            (non_empty(&p.cc_session), Some("ambiguous".to_string()))
+            (non_empty(p.session_id()), Some("ambiguous".to_string()))
         }
     };
 
@@ -142,6 +143,7 @@ mod tests {
             active: idx == 1,
             cc_session: String::new(),
             cc_state: String::new(),
+            cc_pane_session: String::new(),
         }
     }
 
@@ -207,6 +209,34 @@ mod tests {
             assert_eq!(p.claude_session.as_deref(), Some("abc-123"));
             assert_eq!(p.session_confidence.as_deref(), Some("ambiguous"));
         }
+    }
+
+    #[test]
+    fn a_fork_and_its_parent_save_their_own_sessions() {
+        // The window option names whichever claude published last, so saving
+        // it for both panes made a restore open the same conversation twice.
+        let mut panes = vec![
+            pane("projects", 1, "happy", 1, 100),
+            pane("projects", 1, "happy", 2, 100),
+        ];
+        for p in &mut panes {
+            p.cc_session = "fork".into();
+        }
+        panes[0].cc_pane_session = "parent".into();
+        panes[1].cc_pane_session = "fork".into();
+        let s = snapshot(&panes, &tree(), NOW);
+        let saved: Vec<_> = s[0].windows[0]
+            .panes
+            .iter()
+            .map(|p| (p.claude_session.as_deref(), p.session_confidence.as_deref()))
+            .collect();
+        assert_eq!(
+            saved,
+            vec![
+                (Some("parent"), Some("exact")),
+                (Some("fork"), Some("exact"))
+            ],
+        );
     }
 
     #[test]

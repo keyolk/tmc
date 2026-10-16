@@ -423,6 +423,7 @@ mod tests {
             active: false,
             cc_session: String::new(),
             cc_state: String::new(),
+            cc_pane_session: String::new(),
         }
     }
 

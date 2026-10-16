@@ -74,6 +74,7 @@ impl Snapshot {
                 active: true,
                 cc_session: String::new(),
                 cc_state: String::new(),
+                cc_pane_session: String::new(),
             }],
             tree: proc::Tree::parse_for_test(""),
             pending: HashMap::new(),

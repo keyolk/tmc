@@ -1046,6 +1046,7 @@ mod tests {
             active: false,
             cc_session: cc.into(),
             cc_state: state.into(),
+            cc_pane_session: String::new(),
         }
     }
 

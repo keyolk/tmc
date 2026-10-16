@@ -29,14 +29,15 @@ const FORMAT: &str = concat!(
     "#{pane_current_command}\t",
     "#{?pane_active,1,0}\t",
     // Published by ~/.claude/hooks/cc_state.py as a *window* option, so every
-    // pane in a window reports the same value. tmux has no pane-scoped user
-    // options (`set-window-option -p` is rejected, and `set-option -p` is
-    // denied by ~/.claude/hooks/tmux_pane_guard.py), and a claude process
-    // exposes no session id through its cwd, environment or open files. A
-    // window running several claudes is therefore ambiguous by construction —
-    // `resolve` in this module narrows it as far as the data allows.
+    // pane in a window reports the same value — whichever claude published
+    // last. Kept because the window status and the pending.jsonl join read it.
     "#{@cc_session}\t",
-    "#{@cc_state}",
+    "#{@cc_state}\t",
+    // The same id, pane-scoped (`set -p`), and cleared by the SessionEnd hook.
+    // This is what tells a forked pane from the pane it was forked from; the
+    // window copy above names only one of them. Empty for a session that has
+    // not published since the hook started writing it.
+    "#{@cc_pane_session}",
 );
 
 /// One pane as tmux reports it, before any process-tree work.
@@ -60,10 +61,25 @@ pub struct Pane {
     pub active: bool,
     /// Claude Code session id as published on the *window*. Shared by every
     /// pane in the window, so it identifies the pane only when the window runs
-    /// a single claude. See `cc_session_is_exact`.
+    /// a single claude. See `session_confidence`.
     pub cc_session: String,
     /// `working` / `waiting` / `done`, empty when unknown.
     pub cc_state: String,
+    /// Claude Code session id published on this pane alone. Empty when the
+    /// pane's claude has not published one.
+    pub cc_pane_session: String,
+}
+
+impl Pane {
+    /// The session id that best names this pane's own claude: the
+    /// pane-scoped one when present, else the window's.
+    pub fn session_id(&self) -> &str {
+        if self.cc_pane_session.is_empty() {
+            &self.cc_session
+        } else {
+            &self.cc_pane_session
+        }
+    }
 }
 
 /// How much to trust a pane's `cc_session`.
@@ -77,8 +93,8 @@ pub struct Pane {
 pub enum SessionConfidence {
     /// No claude in this window.
     None,
-    /// Exactly one pane in the window runs claude, so the window-scoped id is
-    /// that pane's id.
+    /// The pane published its own id, or it is the only pane in the window
+    /// running claude, so the window-scoped id is that pane's id.
     Exact,
     /// Several panes in the window run claude and share one published id. It
     /// names *a* session in this window, but not necessarily this pane's.
@@ -98,6 +114,9 @@ pub fn session_confidence(panes: &[Pane], tree: &proc::Tree) -> Vec<SessionConfi
     panes
         .iter()
         .map(|p| {
+            if !p.cc_pane_session.is_empty() {
+                return SessionConfidence::Exact;
+            }
             if p.cc_session.is_empty() {
                 return SessionConfidence::None;
             }
@@ -192,8 +211,8 @@ fn parse_pane(line: &str) -> Option<Pane> {
     // The pane path is user data and the only field that could plausibly hold
     // a tab, so bounding the split keeps a pathological path from shifting
     // every later column.
-    let f: Vec<&str> = line.splitn(15, SEP).collect();
-    if f.len() < 15 {
+    let f: Vec<&str> = line.splitn(16, SEP).collect();
+    if f.len() < 16 {
         return None; // a malformed row must not kill the whole listing
     }
     Some(Pane {
@@ -212,6 +231,7 @@ fn parse_pane(line: &str) -> Option<Pane> {
         active: f[12] == "1",
         cc_session: f[13].to_string(),
         cc_state: f[14].to_string(),
+        cc_pane_session: f[15].to_string(),
     })
 }
 
@@ -239,6 +259,7 @@ mod tests {
         "1",
         "12f17a65-a326-4f2f-88a9-47a53e61de7f",
         "working",
+        "",
     ];
 
     #[test]
@@ -386,6 +407,53 @@ mod tests {
             session_confidence(&panes, &tree),
             vec![SessionConfidence::Ambiguous; 3],
         );
+    }
+
+    #[test]
+    fn a_fork_beside_its_parent_keeps_its_own_session() {
+        // happy:18 on the reference machine: a session forked into a split.
+        // The window option named the fork for both panes, so a restore
+        // resumed the fork twice and lost the parent.
+        const PARENT: &str = "5653a483-0ce9-448f-926d-02144240427b";
+        const FORK: &str = "d05d77bb-ffca-497d-803a-dc6dffebd78d";
+        let mut panes = vec![pane("@6", 1, "fish", FORK), pane("@6", 2, "fish", FORK)];
+        panes[0].pid = 100;
+        panes[1].pid = 200;
+        panes[0].cc_pane_session = PARENT.into();
+        panes[1].cc_pane_session = FORK.into();
+        let tree = tree_with_claude_under(&[100, 200]);
+        assert_eq!(
+            session_confidence(&panes, &tree),
+            vec![SessionConfidence::Exact, SessionConfidence::Exact],
+        );
+        assert_eq!(panes[0].session_id(), PARENT);
+        assert_eq!(panes[1].session_id(), FORK);
+    }
+
+    #[test]
+    fn a_pane_that_never_published_still_falls_back_to_the_window() {
+        // One claude predates the pane-scoped stamp. It stays ambiguous rather
+        // than borrowing its neighbour's pane id.
+        let mut panes = vec![pane("@7", 1, "fish", SESS), pane("@7", 2, "fish", SESS)];
+        panes[0].pid = 100;
+        panes[1].pid = 200;
+        panes[1].cc_pane_session = "other".into();
+        let tree = tree_with_claude_under(&[100, 200]);
+        assert_eq!(
+            session_confidence(&panes, &tree),
+            vec![SessionConfidence::Ambiguous, SessionConfidence::Exact],
+        );
+        assert_eq!(panes[0].session_id(), SESS);
+        assert_eq!(panes[1].session_id(), "other");
+    }
+
+    #[test]
+    fn parses_the_pane_scoped_session() {
+        let mut f = OK.to_vec();
+        f[15] = "d05d77bb";
+        let p = parse_pane(&row(&f)).expect("row should parse");
+        assert_eq!(p.cc_pane_session, "d05d77bb");
+        assert_eq!(p.cc_state, "working");
     }
 
     #[test]
