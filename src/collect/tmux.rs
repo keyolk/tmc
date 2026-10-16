@@ -33,7 +33,8 @@ const FORMAT: &str = concat!(
     // publishing pane state.
     "#{@cc_pane_session}\t",
     "#{@cc_session}\t",
-    "#{@cc_state}",
+    "#{@cc_state}\t",
+    "#{@cc_pane_state}",
 );
 
 /// One pane as tmux reports it, before any process-tree work.
@@ -61,8 +62,10 @@ pub struct Pane {
     /// Legacy Claude Code session id published on the window. Shared by every
     /// pane in the window and used only when `pane_cc_session` is unavailable.
     pub cc_session: String,
-    /// `working` / `waiting` / `done`, empty when unknown.
+    /// Legacy state published on the window. Shared by every pane.
     pub cc_state: String,
+    /// State published for this pane. Empty when the hook has not reached it.
+    pub pane_cc_state: String,
 }
 
 impl Pane {
@@ -73,6 +76,16 @@ impl Pane {
             &self.cc_session
         } else {
             &self.pane_cc_session
+        }
+    }
+
+    /// State paired with `claude_session`. A pane-scoped state must not be
+    /// mixed with a window-scoped last-writer session id.
+    pub fn claude_state(&self) -> &str {
+        if self.pane_cc_session.is_empty() {
+            &self.cc_state
+        } else {
+            &self.pane_cc_state
         }
     }
 }
@@ -206,8 +219,8 @@ fn parse_pane(line: &str) -> Option<Pane> {
     // The pane path is user data and the only field that could plausibly hold
     // a tab, so bounding the split keeps a pathological path from shifting
     // every later column.
-    let f: Vec<&str> = line.splitn(16, SEP).collect();
-    if f.len() < 16 {
+    let f: Vec<&str> = line.splitn(17, SEP).collect();
+    if f.len() < 17 {
         return None; // a malformed row must not kill the whole listing
     }
     Some(Pane {
@@ -227,6 +240,7 @@ fn parse_pane(line: &str) -> Option<Pane> {
         pane_cc_session: f[13].to_string(),
         cc_session: f[14].to_string(),
         cc_state: f[15].to_string(),
+        pane_cc_state: f[16].to_string(),
     })
 }
 
@@ -255,6 +269,7 @@ mod tests {
         "12f17a65-a326-4f2f-88a9-47a53e61de7f",
         "legacy-window-session",
         "working",
+        "waiting",
     ];
 
     #[test]
@@ -293,6 +308,19 @@ mod tests {
         assert_eq!(p.pane_cc_session, "12f17a65-a326-4f2f-88a9-47a53e61de7f");
         assert_eq!(p.cc_session, "legacy-window-session");
         assert_eq!(p.cc_state, "working");
+        assert_eq!(p.pane_cc_state, "waiting");
+    }
+
+    #[test]
+    fn pane_session_and_state_stay_paired() {
+        let mut f = OK.to_vec();
+        f[13] = "fork";
+        f[15] = "working";
+        f[16] = "waiting";
+        let p = parse_pane(&row(&f)).expect("row should parse");
+
+        assert_eq!(p.claude_session(), "fork");
+        assert_eq!(p.claude_state(), "waiting");
     }
 
     #[test]
@@ -304,10 +332,12 @@ mod tests {
         f[13] = "";
         f[14] = "";
         f[15] = "";
+        f[16] = "";
         let p = parse_pane(&row(&f)).expect("row should parse");
         assert!(p.pane_cc_session.is_empty());
         assert!(p.cc_session.is_empty());
         assert!(p.cc_state.is_empty());
+        assert!(p.pane_cc_state.is_empty());
     }
 
     #[test]

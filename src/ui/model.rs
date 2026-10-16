@@ -910,33 +910,31 @@ fn build_rows(
                 .iter()
                 .filter(|p| p.session == w.session && p.window_index == w.index)
                 .collect();
-            let cc_session = live
-                .first()
+            // State and session id must come from the same pane. The window
+            // options are last-writer values, so pairing one with the first
+            // pane's id can hide a waiting fork.
+            let running: Vec<&tmux::Pane> = live
+                .iter()
+                .copied()
+                .filter(|p| tree.find_descendant(p.pid, |c| c == "claude").is_some())
+                .collect();
+            let running_claude = !running.is_empty();
+            let blocked = running.iter().copied().find(|p| {
+                p.claude_state() == "waiting"
+                    && pending
+                        .get(p.claude_session())
+                        .is_some_and(|e| e.kind.blocking())
+            });
+            let representative = blocked
+                .or_else(|| running.iter().copied().find(|p| p.active))
+                .or_else(|| running.first().copied());
+            let cc_session = representative
                 .map(|p| p.claude_session().to_string())
                 .unwrap_or_default();
-
-            // Whether a claude is actually running here, from the process
-            // tree. `@cc_state` is published by hooks and outlives the session
-            // that set it — a window whose claude exited without a SessionEnd
-            // keeps advertising `waiting` forever. Asking the process table
-            // costs nothing extra: the tree is already loaded for the diff.
-            let running_claude = live
-                .iter()
-                .any(|p| tree.find_descendant(p.pid, |c| c == "claude").is_some());
-
-            // A state with no claude behind it is a leftover, not a status.
-            let state = if running_claude {
-                live.first().map(|p| p.cc_state.clone()).unwrap_or_default()
-            } else {
-                String::new()
-            };
-
-            // Waiting is the join of two sources: the hook publishes the state
-            // on the window, and notify.py records *why* it is blocked. Both
-            // must agree, so a stale state does not show a window as waiting
-            // when its queue entry is gone.
-            let waiting =
-                state == "waiting" && pending.get(&cc_session).is_some_and(|e| e.kind.blocking());
+            let state = representative
+                .map(|p| p.claude_state().to_string())
+                .unwrap_or_default();
+            let waiting = blocked.is_some();
 
             let target = format!("{}:{}", w.session, w.index);
             rows.push(Row::Window(WindowRow {
@@ -1047,6 +1045,7 @@ mod tests {
             pane_cc_session: cc.into(),
             cc_session: cc.into(),
             cc_state: state.into(),
+            pane_cc_state: state.into(),
         }
     }
 
@@ -1128,6 +1127,39 @@ mod tests {
             &Default::default(),
         );
         assert!(matches!(&with[1], Row::Window(w) if w.waiting));
+    }
+
+    #[test]
+    fn a_waiting_fork_is_visible_when_it_is_not_the_first_pane() {
+        let mut parent = live_pane("projects", 1, "alpha", "working", "parent");
+        parent.pid = 100;
+        parent.pane_index = 1;
+        parent.pane_id = "%1".into();
+        let mut fork = live_pane("projects", 1, "alpha", "waiting", "fork");
+        fork.pid = 300;
+        fork.pane_index = 2;
+        fork.pane_id = "%2".into();
+        let panes = vec![parent, fork];
+        let diff = Diff {
+            windows: vec![window_diff("projects", 1, "alpha", Change::Same)],
+        };
+        let tree = proc::Tree::parse_for_test(
+            "1 0 launchd\n100 1 fish\n200 100 claude\n300 1 fish\n400 300 claude\n",
+        );
+
+        let rows = build_rows(
+            &panes,
+            &diff,
+            &pending_with("fork", notify::Kind::Idle),
+            &tree,
+            &Default::default(),
+        );
+        let Row::Window(w) = &rows[1] else {
+            panic!("expected a window row")
+        };
+        assert!(w.waiting);
+        assert_eq!(w.state, "waiting");
+        assert_eq!(w.cc_session, "fork");
     }
 
     #[test]

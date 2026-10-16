@@ -145,6 +145,7 @@ mod tests {
             pane_cc_session: String::new(),
             cc_session: String::new(),
             cc_state: String::new(),
+            pane_cc_state: String::new(),
         }
     }
 
