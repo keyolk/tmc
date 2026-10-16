@@ -28,13 +28,10 @@ const FORMAT: &str = concat!(
     "#{pane_current_path}\t",
     "#{pane_current_command}\t",
     "#{?pane_active,1,0}\t",
-    // Published by ~/.claude/hooks/cc_state.py as a *window* option, so every
-    // pane in a window reports the same value. tmux has no pane-scoped user
-    // options (`set-window-option -p` is rejected, and `set-option -p` is
-    // denied by ~/.claude/hooks/tmux_pane_guard.py), and a claude process
-    // exposes no session id through its cwd, environment or open files. A
-    // window running several claudes is therefore ambiguous by construction —
-    // `resolve` in this module narrows it as far as the data allows.
+    // Prefer the pane-scoped session id published by cc_state.py. The window
+    // value remains as a fallback for sessions started before that hook began
+    // publishing pane state.
+    "#{@cc_pane_session}\t",
     "#{@cc_session}\t",
     "#{@cc_state}",
 );
@@ -58,15 +55,29 @@ pub struct Pane {
     pub path: String,
     pub current_command: String,
     pub active: bool,
-    /// Claude Code session id as published on the *window*. Shared by every
-    /// pane in the window, so it identifies the pane only when the window runs
-    /// a single claude. See `cc_session_is_exact`.
+    /// Claude Code session id published for this pane. Unlike `cc_session`,
+    /// this remains distinct when a window contains an original and a fork.
+    pub pane_cc_session: String,
+    /// Legacy Claude Code session id published on the window. Shared by every
+    /// pane in the window and used only when `pane_cc_session` is unavailable.
     pub cc_session: String,
     /// `working` / `waiting` / `done`, empty when unknown.
     pub cc_state: String,
 }
 
-/// How much to trust a pane's `cc_session`.
+impl Pane {
+    /// Best session id available for this pane. New hook data is pane-scoped;
+    /// the window value keeps older running sessions restorable.
+    pub fn claude_session(&self) -> &str {
+        if self.pane_cc_session.is_empty() {
+            &self.cc_session
+        } else {
+            &self.pane_cc_session
+        }
+    }
+}
+
+/// How much to trust the session id available for a pane.
 ///
 /// `tmux.sh` collapsed this distinction: it guessed a per-pane id from file
 /// birthtimes and wrote the guess into the snapshot as if it were fact, so a
@@ -77,16 +88,16 @@ pub struct Pane {
 pub enum SessionConfidence {
     /// No claude in this window.
     None,
-    /// Exactly one pane in the window runs claude, so the window-scoped id is
-    /// that pane's id.
+    /// This pane has its own id, or it is the only Claude pane using the
+    /// window-scoped fallback.
     Exact,
-    /// Several panes in the window run claude and share one published id. It
-    /// names *a* session in this window, but not necessarily this pane's.
+    /// Several Claude panes share only one window-scoped fallback id. It names
+    /// a session in this window, but not necessarily this pane's.
     Ambiguous,
 }
 
-/// Classify each pane's `cc_session` by how many panes in its window could
-/// have produced it.
+/// Classify each pane's session id. A pane-scoped id is always exact; only the
+/// legacy window-scoped fallback needs process-tree disambiguation.
 ///
 /// The pane's own foreground command is not enough to decide this: claude is
 /// usually a *descendant* of the pane's shell, not the shell itself. On the
@@ -98,6 +109,9 @@ pub fn session_confidence(panes: &[Pane], tree: &proc::Tree) -> Vec<SessionConfi
     panes
         .iter()
         .map(|p| {
+            if !p.pane_cc_session.is_empty() {
+                return SessionConfidence::Exact;
+            }
             if p.cc_session.is_empty() {
                 return SessionConfidence::None;
             }
@@ -192,8 +206,8 @@ fn parse_pane(line: &str) -> Option<Pane> {
     // The pane path is user data and the only field that could plausibly hold
     // a tab, so bounding the split keeps a pathological path from shifting
     // every later column.
-    let f: Vec<&str> = line.splitn(15, SEP).collect();
-    if f.len() < 15 {
+    let f: Vec<&str> = line.splitn(16, SEP).collect();
+    if f.len() < 16 {
         return None; // a malformed row must not kill the whole listing
     }
     Some(Pane {
@@ -210,8 +224,9 @@ fn parse_pane(line: &str) -> Option<Pane> {
         path: f[10].to_string(),
         current_command: f[11].to_string(),
         active: f[12] == "1",
-        cc_session: f[13].to_string(),
-        cc_state: f[14].to_string(),
+        pane_cc_session: f[13].to_string(),
+        cc_session: f[14].to_string(),
+        cc_state: f[15].to_string(),
     })
 }
 
@@ -238,6 +253,7 @@ mod tests {
         "ccproxy",
         "1",
         "12f17a65-a326-4f2f-88a9-47a53e61de7f",
+        "legacy-window-session",
         "working",
     ];
 
@@ -274,7 +290,8 @@ mod tests {
         assert_eq!(p.session, "projects");
         assert_eq!(p.window_index, 1);
         assert_eq!(p.pane_id, "%251");
-        assert_eq!(p.cc_session, "12f17a65-a326-4f2f-88a9-47a53e61de7f");
+        assert_eq!(p.pane_cc_session, "12f17a65-a326-4f2f-88a9-47a53e61de7f");
+        assert_eq!(p.cc_session, "legacy-window-session");
         assert_eq!(p.cc_state, "working");
     }
 
@@ -286,7 +303,9 @@ mod tests {
         let mut f = OK.to_vec();
         f[13] = "";
         f[14] = "";
+        f[15] = "";
         let p = parse_pane(&row(&f)).expect("row should parse");
+        assert!(p.pane_cc_session.is_empty());
         assert!(p.cc_session.is_empty());
         assert!(p.cc_state.is_empty());
     }
@@ -343,7 +362,8 @@ mod tests {
         f[3] = win;
         f[7] = "1";
         f[11] = cmd;
-        f[13] = sess;
+        f[13] = "";
+        f[14] = sess;
         let mut p = parse_pane(&row(&f)).expect("fixture should parse");
         p.pane_index = idx;
         p
@@ -386,6 +406,26 @@ mod tests {
             session_confidence(&panes, &tree),
             vec![SessionConfidence::Ambiguous; 3],
         );
+    }
+
+    #[test]
+    fn pane_scoped_ids_keep_forks_exact() {
+        let mut panes = vec![
+            pane("@2", 1, "fish", "legacy"),
+            pane("@2", 2, "fish", "legacy"),
+        ];
+        panes[0].pid = 100;
+        panes[1].pid = 200;
+        panes[0].pane_cc_session = "original".into();
+        panes[1].pane_cc_session = "fork".into();
+        let tree = tree_with_claude_under(&[100, 200]);
+
+        assert_eq!(
+            session_confidence(&panes, &tree),
+            vec![SessionConfidence::Exact, SessionConfidence::Exact],
+        );
+        assert_eq!(panes[0].claude_session(), "original");
+        assert_eq!(panes[1].claude_session(), "fork");
     }
 
     #[test]

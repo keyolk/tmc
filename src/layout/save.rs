@@ -62,14 +62,16 @@ fn build_pane(p: &tmux::Pane, conf: tmux::SessionConfidence, tree: &Tree) -> Pan
     let command = command::for_pane(p.pid, tree, |pid| tree.args(pid).map(str::to_string));
     let shell_only = command.is_none();
 
-    // The published id names a session in this window. When several claudes
-    // share the window it is not necessarily *this* pane's, so the confidence
-    // travels with it and the restore UI can ask rather than guess.
+    // Pane-scoped ids are exact even when a window contains several Claude
+    // sessions. The confidence travels only to expose legacy window-scoped
+    // fallback data instead of silently treating a last-writer value as fact.
     let (claude_session, session_confidence) = match conf {
         tmux::SessionConfidence::None => (None, None),
-        tmux::SessionConfidence::Exact => (non_empty(&p.cc_session), Some("exact".to_string())),
+        tmux::SessionConfidence::Exact => {
+            (non_empty(p.claude_session()), Some("exact".to_string()))
+        }
         tmux::SessionConfidence::Ambiguous => {
-            (non_empty(&p.cc_session), Some("ambiguous".to_string()))
+            (non_empty(p.claude_session()), Some("ambiguous".to_string()))
         }
     };
 
@@ -140,6 +142,7 @@ mod tests {
             path: "/home/u/src".into(),
             current_command: "fish".into(),
             active: idx == 1,
+            pane_cc_session: String::new(),
             cc_session: String::new(),
             cc_state: String::new(),
         }
@@ -207,6 +210,29 @@ mod tests {
             assert_eq!(p.claude_session.as_deref(), Some("abc-123"));
             assert_eq!(p.session_confidence.as_deref(), Some("ambiguous"));
         }
+    }
+
+    #[test]
+    fn preserves_distinct_original_and_fork_session_ids() {
+        let mut panes = vec![
+            pane("projects", 1, "cohome", 1, 100),
+            pane("projects", 1, "cohome", 2, 100),
+        ];
+        for p in &mut panes {
+            p.cc_session = "legacy-last-writer".into();
+        }
+        panes[0].pane_cc_session = "original".into();
+        panes[1].pane_cc_session = "fork".into();
+
+        let s = snapshot(&panes, &tree(), NOW);
+        let saved = &s[0].windows[0].panes;
+        assert_eq!(saved[0].claude_session.as_deref(), Some("original"));
+        assert_eq!(saved[1].claude_session.as_deref(), Some("fork"));
+        assert!(
+            saved
+                .iter()
+                .all(|p| p.session_confidence.as_deref() == Some("exact"))
+        );
     }
 
     #[test]

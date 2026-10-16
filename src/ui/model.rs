@@ -912,7 +912,7 @@ fn build_rows(
                 .collect();
             let cc_session = live
                 .first()
-                .map(|p| p.cc_session.clone())
+                .map(|p| p.claude_session().to_string())
                 .unwrap_or_default();
 
             // Whether a claude is actually running here, from the process
@@ -1044,6 +1044,7 @@ mod tests {
             path: "/tmp".into(),
             current_command: "fish".into(),
             active: false,
+            pane_cc_session: cc.into(),
             cc_session: cc.into(),
             cc_state: state.into(),
         }

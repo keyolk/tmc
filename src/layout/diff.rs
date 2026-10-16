@@ -421,6 +421,7 @@ mod tests {
             path: path.into(),
             current_command: "fish".into(),
             active: false,
+            pane_cc_session: String::new(),
             cc_session: String::new(),
             cc_state: String::new(),
         }
