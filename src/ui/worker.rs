@@ -72,6 +72,7 @@ impl Snapshot {
                 path: "/".into(),
                 current_command: "zsh".into(),
                 active: true,
+                pane_cc_session: String::new(),
                 cc_session: String::new(),
                 cc_state: String::new(),
             }],
