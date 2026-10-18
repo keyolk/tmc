@@ -21,9 +21,9 @@
 
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 
-use crate::collect::cmd;
+use crate::collect::{cmd, proc};
 use crate::config;
 use crate::layout::{Session, Window};
 
@@ -45,6 +45,8 @@ pub trait Tmux {
     fn send_literal(&mut self, target: &str, text: &str);
     /// Submit whatever is at the prompt.
     fn send_enter(&mut self, target: &str);
+    /// Validate and recover autorun Claude panes after the bulk launch.
+    fn recover_claude_ttys(&mut self, targets: &[String]) -> Vec<String>;
     /// Block until the pane's foreground process is a shell.
     fn wait_for_shell(&self, target: &str);
     /// Close a session and everything in it.
@@ -148,6 +150,10 @@ impl Tmux for Server {
         let _ = cmd::run("tmux", &["send-keys", "-t", target, "Enter"], cmd::FAST);
     }
 
+    fn recover_claude_ttys(&mut self, targets: &[String]) -> Vec<String> {
+        recover_claude_ttys(targets)
+    }
+
     /// Wait until the pane's foreground process is a shell.
     ///
     /// A flat sleep is too short when a heavy rc file is still rendering: the
@@ -183,6 +189,103 @@ impl Tmux for Server {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+}
+
+/// Repair only restored panes that still run Claude with shell TTY modes.
+fn recover_claude_ttys(targets: &[String]) -> Vec<String> {
+    // Claude normally switches its TTY immediately. This grace period avoids
+    // racing normal startup while adding one delay for the whole bulk restore.
+    std::thread::sleep(Duration::from_secs(1));
+    let tree = match proc::Tree::capture() {
+        Ok(tree) => tree,
+        Err(error) => return vec![format!("could not validate Claude TTYs: {error:#}")],
+    };
+
+    targets
+        .iter()
+        .filter_map(|target| {
+            recover_claude_tty(target, &tree)
+                .err()
+                .map(|error| format!("could not recover Claude TTY in {target}: {error:#}"))
+        })
+        .collect()
+}
+
+const CLAUDE_RAW_STTY_ARGS: &[&str] = &[
+    "-brkint", "-icrnl", "-inpck", "-istrip", "-ixon", "-opost", "cs8", "-echo", "-icanon",
+    "-iexten", "-isig", "min", "1", "time", "0",
+];
+
+fn recover_claude_tty(target: &str, tree: &proc::Tree) -> Result<()> {
+    let pane = cmd::run(
+        "tmux",
+        &[
+            "display-message",
+            "-p",
+            "-t",
+            target,
+            "#{pane_pid}\t#{pane_tty}",
+        ],
+        cmd::FAST,
+    )?;
+    let (pid, tty) = pane
+        .trim()
+        .split_once('\t')
+        .ok_or_else(|| anyhow!("tmux returned no pane pid or TTY"))?;
+    let pid = pid.parse::<u32>()?;
+
+    // The restored command is only a candidate. Do not change a shell when
+    // Claude failed to start or exited during the grace period.
+    if tree.comm(pid) != Some("claude")
+        && tree
+            .find_descendant(pid, |command| command == "claude")
+            .is_none()
+    {
+        return Err(anyhow!("Claude is not running; left unchanged"));
+    }
+
+    let before = stty(tty, &["-a"])?;
+    if tty_is_raw(&before) {
+        return Ok(());
+    }
+
+    stty(tty, CLAUDE_RAW_STTY_ARGS)?;
+    let after = stty(tty, &["-a"])?;
+    if !tty_is_raw(&after) {
+        return Err(anyhow!("terminal processing is still enabled"));
+    }
+    Ok(())
+}
+
+fn tty_is_raw(output: &str) -> bool {
+    [
+        "brkint", "icrnl", "inpck", "istrip", "ixon", "opost", "echo", "icanon", "iexten", "isig",
+    ]
+    .iter()
+    .all(|flag| !stty_flag(output, flag))
+        && stty_flag(output, "cs8")
+}
+
+fn stty_flag(output: &str, name: &str) -> bool {
+    output
+        .split_whitespace()
+        .map(|token| token.trim_matches(';'))
+        .find(|token| *token == name || token.strip_prefix('-') == Some(name))
+        .is_some_and(|token| token == name)
+}
+
+#[cfg(target_os = "macos")]
+fn stty(tty: &str, args: &[&str]) -> Result<String> {
+    let mut all = vec!["-f", tty];
+    all.extend_from_slice(args);
+    cmd::run("stty", &all, cmd::FAST)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn stty(tty: &str, args: &[&str]) -> Result<String> {
+    let mut all = vec!["-F", tty];
+    all.extend_from_slice(args);
+    cmd::run("stty", &all, cmd::FAST)
 }
 
 /// What a restore did, or would do.
@@ -336,6 +439,19 @@ pub fn session<T: Tmux>(
         } else {
             report.commands_prefilled += 1;
         }
+    }
+
+    // This runs once after every autorun command is submitted. Restricting the
+    // target list here avoids a global tmux hook touching unrelated panes.
+    let claude_targets: Vec<String> = pending
+        .iter()
+        .filter(|p| p.run && mentions_claude(&p.command))
+        .map(|p| p.target.clone())
+        .collect();
+    if !claude_targets.is_empty() {
+        report
+            .notes
+            .extend(tmux.recover_claude_ttys(&claude_targets));
     }
 
     Ok(report)
@@ -549,6 +665,12 @@ mod tests {
         }
         fn send_enter(&mut self, target: &str) {
             self.calls.push(format!("enter {target}"));
+        }
+        fn recover_claude_ttys(&mut self, targets: &[String]) -> Vec<String> {
+            if !targets.is_empty() {
+                self.calls.push(format!("recover {}", targets.join(",")));
+            }
+            Vec::new()
         }
         fn wait_for_shell(&self, _target: &str) {}
         fn kill_session(&mut self, name: &str) -> Result<()> {
@@ -1038,6 +1160,82 @@ mod tests {
             assert!(pair[0].starts_with("send "), "text first: {pair:?}");
             assert!(pair[1].starts_with("enter "), "then Enter: {pair:?}");
         }
+    }
+
+    #[test]
+    fn validates_only_claude_panes_that_autorun() {
+        let mut tmux = Fake::new();
+        let saved = saved_session(vec![window(
+            1,
+            "alpha",
+            vec![
+                pane("claude", None),
+                pane("htop", None),
+                pane("claude", None),
+            ],
+        )]);
+
+        session(
+            &mut tmux,
+            &saved,
+            Selection::all(),
+            &autorun(&["claude", "htop"]),
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            tmux.calls
+                .iter()
+                .any(|call| call == "recover projects:0.0,projects:0.2")
+        );
+    }
+
+    #[test]
+    fn non_claude_autorun_does_not_validate_a_tty() {
+        let mut tmux = Fake::new();
+        let saved = saved_session(vec![window(1, "alpha", vec![pane("htop", None)])]);
+
+        session(
+            &mut tmux,
+            &saved,
+            Selection::all(),
+            &autorun(&["htop"]),
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert!(!tmux.calls.iter().any(|call| call.starts_with("recover ")));
+    }
+
+    #[test]
+    fn raw_recovery_disables_all_claude_terminal_processing() {
+        assert_eq!(
+            CLAUDE_RAW_STTY_ARGS,
+            [
+                "-brkint", "-icrnl", "-inpck", "-istrip", "-ixon", "-opost", "cs8", "-echo",
+                "-icanon", "-iexten", "-isig", "min", "1", "time", "0",
+            ],
+        );
+    }
+
+    #[test]
+    fn partial_raw_state_still_needs_recovery() {
+        assert!(!tty_is_raw(
+            "iflags: -brkint -icrnl -inpck -istrip -ixon; oflags: -opost; cflags: cs8; lflags: -echo -icanon iexten isig",
+        ));
+        assert!(tty_is_raw(
+            "iflags: -brkint -icrnl -inpck -istrip -ixon; oflags: -opost; cflags: cs8; lflags: -echo -icanon -iexten -isig",
+        ));
+    }
+
+    #[test]
+    fn stty_flags_match_whole_tokens() {
+        assert!(stty_flag("lflags: icanon echo; echoe", "icanon"));
+        assert!(!stty_flag("lflags: -icanon -echo echoe", "icanon"));
+        assert!(!stty_flag("lflags: -icanon -echo echoe", "echo"));
     }
 
     #[test]
