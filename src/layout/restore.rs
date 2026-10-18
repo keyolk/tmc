@@ -250,6 +250,7 @@ fn recover_claude_tty(target: &str, tree: &proc::Tree) -> Result<()> {
     }
 
     stty(tty, CLAUDE_RAW_STTY_ARGS)?;
+    flush_tty_input(tty)?;
     let after = stty(tty, &["-a"])?;
     if !tty_is_raw(&after) {
         return Err(anyhow!("terminal processing is still enabled"));
@@ -272,6 +273,19 @@ fn stty_flag(output: &str, name: &str) -> bool {
         .map(|token| token.trim_matches(';'))
         .find(|token| *token == name || token.strip_prefix('-') == Some(name))
         .is_some_and(|token| token == name)
+}
+
+fn flush_tty_input(tty: &str) -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::os::fd::AsRawFd;
+
+    let file = OpenOptions::new().read(true).write(true).open(tty)?;
+    // SAFETY: `file` owns a live TTY descriptor for this call. tcflush does not
+    // retain it, and TCIFLUSH only discards unread input already queued there.
+    if unsafe { libc::tcflush(file.as_raw_fd(), libc::TCIFLUSH) } == -1 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
