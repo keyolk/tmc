@@ -10,6 +10,7 @@ mod commands;
 mod guard;
 pub mod keys;
 pub mod model;
+mod mouse;
 pub mod render;
 pub mod snapshot;
 pub mod state;

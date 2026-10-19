@@ -9,7 +9,9 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -85,10 +87,44 @@ type Term = Terminal<CrosstermBackend<io::Stdout>>;
 
 fn setup() -> Result<Term> {
     restore_terminal_on_panic();
-    enable_raw_mode()?;
+    let mut guard = TerminalSetupGuard::arm()?;
     let mut out = io::stdout();
-    crossterm::execute!(out, EnterAlternateScreen)?;
-    Ok(Terminal::new(CrosstermBackend::new(out))?)
+    crossterm::execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
+    let terminal = Terminal::new(CrosstermBackend::new(out))?;
+    guard.disarm();
+    Ok(terminal)
+}
+
+/// Restores the terminal if setup returns before it can hand ownership to the
+/// normal teardown path.
+pub(super) struct TerminalSetupGuard {
+    armed: bool,
+}
+
+impl TerminalSetupGuard {
+    pub(super) fn arm() -> Result<Self> {
+        enable_raw_mode()?;
+        Ok(Self { armed: true })
+    }
+
+    pub(super) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TerminalSetupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = disable_raw_mode();
+        let _ = crossterm::execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            crossterm::cursor::Show
+        );
+    }
 }
 
 /// Put the terminal back before a panic message is printed.
@@ -103,7 +139,7 @@ fn setup() -> Result<Term> {
 /// status line while the UI carries on; restoring the terminal for it would
 /// drop the alternate screen out from under a running TUI, and printing it
 /// would scribble over the frame.
-fn restore_terminal_on_panic() {
+pub(super) fn restore_terminal_on_panic() {
     let ui = std::thread::current().id();
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -120,15 +156,27 @@ fn restore_terminal_on_panic() {
         // Errors are ignored on purpose: this is already the failure path, and
         // there is nowhere left to report a terminal that will not reset.
         let _ = disable_raw_mode();
-        let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+        let _ = crossterm::execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            crossterm::cursor::Show
+        );
         previous(info);
     }));
 }
 
 fn teardown(terminal: &mut Term) -> Result<()> {
-    disable_raw_mode()?;
-    crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    let raw = disable_raw_mode();
+    let screen = crossterm::execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    );
+    let cursor = terminal.show_cursor();
+    raw?;
+    screen?;
+    cursor?;
     Ok(())
 }
 
@@ -355,6 +403,14 @@ fn event_loop(terminal: &mut Term, model: &mut Model, focus: Option<String>) -> 
                     needs_redraw = true;
                 }
                 Event::Key(_) => {}
+                Event::Mouse(mouse) if super::mouse::actionable(mouse.kind) => {
+                    model.status.on_key(Instant::now());
+                    let area = ratatui::layout::Rect::from(terminal.size()?);
+                    let effect = super::mouse::handle(model, mouse, area);
+                    io.run(model, effect);
+                    needs_redraw = true;
+                }
+                Event::Mouse(_) => {}
                 _ => needs_redraw = true, // resize
             }
         }
@@ -477,7 +533,7 @@ fn uses_worker(cmd: Cmd) -> bool {
     )
 }
 
-fn run_cmd(model: &mut Model, cmd: Cmd) -> Effect {
+pub(super) fn run_cmd(model: &mut Model, cmd: Cmd) -> Effect {
     // One command at a time. Two would race on the same windows, and the
     // second was chosen against a tree the first is busy changing.
     if uses_worker(cmd)
@@ -505,10 +561,12 @@ fn run_cmd(model: &mut Model, cmd: Cmd) -> Effect {
         Cmd::Up => model.move_cursor(-1),
         Cmd::Top => {
             model.cursor = 0;
+            model.preview_scroll = 0;
             model.move_cursor(0);
         }
         Cmd::Bottom => {
             model.cursor = model.rows.len().saturating_sub(1);
+            model.preview_scroll = 0;
             model.move_cursor(-1);
         }
         Cmd::Switch => {
