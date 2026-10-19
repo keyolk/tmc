@@ -20,6 +20,46 @@ const DETAIL_MIN_WIDTH: u16 = 90;
 const MIN_WIDTH: u16 = 50;
 const MIN_HEIGHT: u16 = 10;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Regions {
+    pub header: Rect,
+    pub body: Rect,
+    pub tree: Rect,
+    pub detail: Rect,
+    pub keys: Rect,
+}
+
+/// Geometry shared by pure rendering and mouse hit testing.
+pub(super) fn regions(area: Rect) -> Regions {
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        return Regions::default();
+    }
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    let (tree, detail) = if area.width >= DETAIL_MIN_WIDTH {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(rows[1]);
+        (columns[0], columns[1])
+    } else {
+        (rows[1], Rect::default())
+    };
+    Regions {
+        header: rows[0],
+        body: rows[1],
+        tree,
+        detail,
+        keys: rows[2],
+    }
+}
+
 pub fn draw(frame: &mut Frame, model: &Model, now_secs: u64) {
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
@@ -30,54 +70,39 @@ pub fn draw(frame: &mut Frame, model: &Model, now_secs: u64) {
         return;
     }
 
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2), // header
-            Constraint::Min(1),    // body
-            Constraint::Length(1), // keys
-        ])
-        .split(area);
+    let regions = regions(area);
 
     // Each pane is guarded: one that panics draws a line saying so, and the
     // rest of the frame -- the key row with the way out above all -- still
     // draws. See `guard`.
     let t = &model.theme;
-    guard::pane(frame, rows[0], "header", t, false, |f| {
-        render_header(f, rows[0], model, now_secs)
+    guard::pane(frame, regions.header, "header", t, false, |f| {
+        render_header(f, regions.header, model, now_secs)
     });
 
-    if area.width >= DETAIL_MIN_WIDTH {
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-            .split(rows[1]);
-        guard::pane(frame, columns[0], "tree", t, false, |f| {
-            render_tree(f, columns[0], model)
-        });
-        guard::pane(frame, columns[1], "detail", t, false, |f| {
-            render_detail(f, columns[1], model)
-        });
-    } else {
-        guard::pane(frame, rows[1], "tree", t, false, |f| {
-            render_tree(f, rows[1], model)
+    guard::pane(frame, regions.tree, "tree", t, false, |f| {
+        render_tree(f, regions.tree, model)
+    });
+    if regions.detail.width > 0 {
+        guard::pane(frame, regions.detail, "detail", t, false, |f| {
+            render_detail(f, regions.detail, model)
         });
     }
 
-    guard::pane(frame, rows[2], "keys", t, false, |f| {
-        render_keys(f, rows[2], model)
+    guard::pane(frame, regions.keys, "keys", t, false, |f| {
+        render_keys(f, regions.keys, model)
     });
 
     // Last, so it sits over the tree and the panel both. A failed overlay
     // gives the tree back underneath its fallback line.
     if model.menu {
-        guard::pane(frame, rows[1], "menu", t, true, |f| {
-            render_menu(f, rows[1], model)
+        guard::pane(frame, regions.body, "menu", t, true, |f| {
+            render_menu(f, regions.body, model)
         });
     }
     if model.help {
-        guard::pane(frame, rows[1], "help", t, true, |f| {
-            render_help(f, rows[1], t, model.help_scroll)
+        guard::pane(frame, regions.body, "help", t, true, |f| {
+            render_help(f, regions.body, t, model.help_scroll)
         });
     }
 }
@@ -87,6 +112,25 @@ pub fn draw(frame: &mut Frame, model: &Model, now_secs: u64) {
 /// Floating rather than a panel swap, because it is momentary and because
 /// covering the tree is the point — the commands act on the selection, which
 /// the title line names, not on whatever the cursor is passing over.
+pub(super) fn menu_area(body: Rect, model: &Model) -> Rect {
+    let entries = actions(model);
+    let title = format!(" x  {} ", menu_target(model));
+    let footer = keys::footer(Ctx::Menu, model, usize::MAX);
+    let widest_key = entries
+        .iter()
+        .map(|a| format!("{}:{}", a.key, a.label).width())
+        .max()
+        .unwrap_or(0);
+    let widest_detail = entries.iter().map(|a| a.detail.width()).max().unwrap_or(0);
+    const GAP: usize = 3;
+    let inner = (widest_key + GAP + widest_detail)
+        .max(title.width())
+        .max(footer.width());
+    let width = (inner as u16 + 4).min(body.width);
+    let height = (entries.len() as u16 + 4).min(body.height);
+    centred(body, width, height)
+}
+
 fn render_menu(frame: &mut Frame, body: Rect, model: &Model) {
     let t = &model.theme;
     let ell = t.glyphs.ellipsis;
@@ -101,16 +145,8 @@ fn render_menu(frame: &mut Frame, body: Rect, model: &Model) {
         .map(|a| format!("{}:{}", a.key, a.label))
         .collect();
     let widest_key = keys.iter().map(|k| k.width()).max().unwrap_or(0);
-    let widest_detail = entries.iter().map(|a| a.detail.width()).max().unwrap_or(0);
     const GAP: usize = 3;
-    let inner = (widest_key + GAP + widest_detail)
-        .max(title.width())
-        .max(footer.width());
-    // +2 for the border, +2 for a column of padding either side.
-    let width = (inner as u16 + 4).min(body.width);
-    // One row per action, one for the footer, one blank above it.
-    let height = (entries.len() as u16 + 2 + 2).min(body.height);
-    let area = centred(body, width, height);
+    let area = menu_area(body, model);
 
     let usable = area.width.saturating_sub(4) as usize;
     // The box is capped by the terminal, so on a narrow one the detail is
@@ -317,7 +353,7 @@ fn render_tree(frame: &mut Frame, area: Rect, model: &Model) {
 }
 
 /// Keep the cursor in view without jumping the list around.
-fn scroll_offset(cursor: usize, total: usize, height: usize) -> usize {
+pub(super) fn scroll_offset(cursor: usize, total: usize, height: usize) -> usize {
     if total <= height || height == 0 {
         return 0;
     }
@@ -530,7 +566,12 @@ fn render_preview(frame: &mut Frame, area: Rect, model: &Model, w: &super::model
 
     // Dim, because the preview is context rather than this app's own output —
     // and full-brightness terminal text next to the tree reads as a second UI.
-    let captured = crate::collect::tmux::tail_lines(body, area.height.saturating_sub(1) as usize);
+    let height = area.height.saturating_sub(1) as usize;
+    let all = crate::collect::tmux::tail_lines(body, usize::MAX);
+    let scroll = model.preview_scroll.min(all.len().saturating_sub(height));
+    let end = all.len().saturating_sub(scroll);
+    let start = end.saturating_sub(height);
+    let captured = &all[start..end];
     if captured.is_empty() {
         lines.push(Line::styled("  (nothing on screen)", t.subtle()));
     }
@@ -624,7 +665,7 @@ fn render_keys(frame: &mut Frame, area: Rect, model: &Model) {
 /// Drawn over the body like the `x` menu, so the tree it describes stays in
 /// view around it. Scrolled with j/k on a short terminal rather than
 /// squeezed; the hint row below names both.
-fn render_help(frame: &mut Frame, body: Rect, t: &Theme, scroll: usize) {
+pub(super) fn help_area(body: Rect, t: &Theme) -> Rect {
     let sections = keys::help_lines(t.glyphs.key_glyphs);
     let widest_keys = sections
         .iter()
@@ -639,7 +680,17 @@ fn render_help(frame: &mut Frame, body: Rect, t: &Theme, scroll: usize) {
     let width = ((widest_keys + 2 + widest_help) as u16 + 4).min(body.width);
     let rows: usize = sections.iter().map(|(_, l)| l.len() + 2).sum();
     let height = (rows as u16 + 2).min(body.height);
-    let area = centred(body, width, height);
+    centred(body, width, height)
+}
+
+fn render_help(frame: &mut Frame, body: Rect, t: &Theme, scroll: usize) {
+    let sections = keys::help_lines(t.glyphs.key_glyphs);
+    let widest_keys = sections
+        .iter()
+        .flat_map(|(_, lines)| lines.iter().map(|(k, _)| k.width()))
+        .max()
+        .unwrap_or(0);
+    let area = help_area(body, t);
     let usable = area.width.saturating_sub(4) as usize;
 
     let mut lines: Vec<Line> = Vec::new();
@@ -742,6 +793,23 @@ fn pad(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mouse_regions_follow_the_responsive_layout() {
+        let narrow = regions(Rect::new(0, 0, 89, 24));
+        assert_eq!(narrow.tree, narrow.body);
+        assert_eq!(narrow.detail, Rect::default());
+
+        let wide = regions(Rect::new(0, 0, 90, 24));
+        assert!(wide.tree.width > 0);
+        assert!(wide.detail.width > 0);
+        assert_eq!(wide.tree.width + wide.detail.width, wide.body.width);
+    }
+
+    #[test]
+    fn a_tiny_terminal_has_no_mouse_targets() {
+        assert_eq!(regions(Rect::new(0, 0, 49, 9)).tree, Rect::default());
+    }
 
     #[test]
     fn a_short_list_never_scrolls() {

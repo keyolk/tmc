@@ -218,7 +218,9 @@ impl Workers {
                 // A failed capture shows as an empty panel, as it always has:
                 // the preview is context, and an error in its place would be
                 // louder than the thing it failed to show.
-                let body = tmux::capture_pane(&target, 40).unwrap_or_default();
+                // Keep enough scrollback for the detail pane's mouse wheel;
+                // rendering still takes only the visible slice.
+                let body = tmux::capture_pane(&target, 500).unwrap_or_default();
                 if reply_tx.send(Reply::Preview { target, body }).is_err() {
                     return;
                 }

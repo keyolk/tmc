@@ -137,6 +137,20 @@ The hint row, the `x` menu, `?` and the key dispatch are all read off one
 table (`src/ui/keys.rs`), so a key cannot be advertised and not answer, or
 answer and not be listed.
 
+**Mouse** augments the same model; every action remains reachable by keyboard.
+
+| gesture | where | action |
+|---|---|---|
+| left click | header | focus search |
+| left click | tree | select a window or pane |
+| right / middle click | tree | select and toggle its mark |
+| wheel | tree | move three rows; in destination mode, visit valid windows |
+| wheel | detail | scroll captured output |
+| click | `x` menu | run that row, or show why it is disabled |
+| wheel / outside click | `?` help | scroll / close |
+| left click | clipboard | select without pasting |
+| middle / right click | clipboard | select and paste |
+
 Reloads, previews and every command that changes tmux run off the input
 thread. Navigation and `Esc` keep answering while a restore brings windows up;
 another tmux-changing command waits until it finishes, and leaving waits for it

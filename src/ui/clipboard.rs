@@ -7,13 +7,16 @@
 use std::io;
 
 use anyhow::{Context, Result};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -94,6 +97,40 @@ impl Picker {
         }
     }
 
+    pub fn mouse(&mut self, event: MouseEvent, area: Rect) {
+        let rows = picker_rows(area);
+        if event.column < rows[1].x
+            || event.column >= rows[1].right()
+            || event.row < rows[1].y
+            || event.row >= rows[1].bottom()
+        {
+            return;
+        }
+        match event.kind {
+            MouseEventKind::ScrollDown => self.move_cursor(3),
+            MouseEventKind::ScrollUp => self.move_cursor(-3),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let visible = self.visible();
+                let offset = list_offset(self.cursor, visible.len(), rows[1].height as usize);
+                let position = offset + event.row.saturating_sub(rows[1].y) as usize;
+                if position < visible.len() {
+                    self.cursor = position;
+                }
+            }
+            MouseEventKind::Down(MouseButton::Right | MouseButton::Middle) => {
+                let visible = self.visible();
+                let offset = list_offset(self.cursor, visible.len(), rows[1].height as usize);
+                let position = offset + event.row.saturating_sub(rows[1].y) as usize;
+                if position < visible.len() {
+                    self.cursor = position;
+                    self.chosen = self.current().map(|b| b.name.clone());
+                    self.quit = self.chosen.is_some();
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn clamp(&mut self) {
         let visible = self.visible().len();
         if visible == 0 {
@@ -114,9 +151,10 @@ pub fn run(target: &str) -> Result<()> {
     let mut picker = Picker::new(buffers);
     let theme = Theme::detect();
 
+    super::app::restore_terminal_on_panic();
     enable_raw_mode()?;
     let mut out = io::stdout();
-    crossterm::execute!(out, EnterAlternateScreen)?;
+    crossterm::execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
 
     let result = loop {
@@ -130,14 +168,30 @@ pub fn run(target: &str) -> Result<()> {
                     break Ok(());
                 }
             }
+            Ok(Event::Mouse(mouse)) => match terminal.size() {
+                Ok(size) => {
+                    picker.mouse(mouse, Rect::from(size));
+                    if picker.quit {
+                        break Ok(());
+                    }
+                }
+                Err(e) => break Err(anyhow::Error::from(e)),
+            },
             Ok(_) => {}
             Err(e) => break Err(anyhow::Error::from(e)),
         }
     };
 
-    disable_raw_mode()?;
-    crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    let raw = disable_raw_mode();
+    let screen = crossterm::execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    );
+    let cursor = terminal.show_cursor();
+    raw?;
+    screen?;
+    cursor?;
     result?;
 
     if let Some(name) = picker.chosen {
@@ -146,12 +200,22 @@ pub fn run(target: &str) -> Result<()> {
     Ok(())
 }
 
-fn draw(frame: &mut ratatui::Frame, picker: &Picker, t: &Theme) {
-    let area = frame.area();
-    let rows = Layout::default()
+fn picker_rows(area: Rect) -> std::rc::Rc<[Rect]> {
+    Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1)])
-        .split(area);
+        .split(area)
+}
+
+fn list_offset(cursor: usize, total: usize, height: usize) -> usize {
+    cursor
+        .saturating_sub(height / 2)
+        .min(total.saturating_sub(height))
+}
+
+fn draw(frame: &mut ratatui::Frame, picker: &Picker, t: &Theme) {
+    let area = frame.area();
+    let rows = picker_rows(area);
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -164,10 +228,7 @@ fn draw(frame: &mut ratatui::Frame, picker: &Picker, t: &Theme) {
 
     let visible = picker.visible();
     let height = rows[1].height as usize;
-    let offset = picker
-        .cursor
-        .saturating_sub(height / 2)
-        .min(visible.len().saturating_sub(height));
+    let offset = list_offset(picker.cursor, visible.len(), height);
 
     let lines: Vec<Line> = visible
         .iter()
@@ -213,6 +274,48 @@ mod tests {
             buffer("buffer2", "cargo test --release"),
             buffer("buffer1", "kubectl get pods"),
         ])
+    }
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn a_mouse_click_selects_without_pasting() {
+        let mut p = picker();
+        p.mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), 2, 2),
+            Rect::new(0, 0, 60, 10),
+        );
+        assert_eq!(p.cursor, 1);
+        assert!(p.chosen.is_none());
+        assert!(!p.quit);
+    }
+
+    #[test]
+    fn wheel_moves_only_inside_the_buffer_list() {
+        let mut p = picker();
+        let area = Rect::new(0, 0, 60, 10);
+        p.mouse(mouse(MouseEventKind::ScrollDown, 2, 2), area);
+        assert_eq!(p.cursor, 2);
+        p.mouse(mouse(MouseEventKind::ScrollUp, 2, 0), area);
+        assert_eq!(p.cursor, 2, "the filter line does not own list scrolling");
+    }
+
+    #[test]
+    fn middle_click_is_an_explicit_mouse_paste() {
+        let mut p = picker();
+        p.mouse(
+            mouse(MouseEventKind::Down(MouseButton::Middle), 2, 2),
+            Rect::new(0, 0, 60, 10),
+        );
+        assert_eq!(p.chosen.as_deref(), Some("buffer2"));
+        assert!(p.quit);
     }
 
     #[test]

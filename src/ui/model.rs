@@ -312,6 +312,9 @@ pub struct Model {
     /// Cached by target so moving the cursor back and forth over the same rows
     /// does not re-shell for a capture that has not changed.
     pub preview: Option<(String, String)>,
+    /// Lines above the newest preview frame. Mouse wheel over the detail pane
+    /// changes this; selecting another row returns to live output.
+    pub preview_scroll: usize,
     /// Colours and glyphs. `Model::new` takes the fixed default so tests do
     /// not depend on the developer's `NO_COLOR` or locale; the entry points
     /// replace it with `Theme::detect()`.
@@ -343,6 +346,7 @@ impl Model {
             stale_build: check_build(),
             expanded: std::collections::HashSet::new(),
             preview: None,
+            preview_scroll: 0,
             theme: super::theme::Theme::default(),
         }
     }
@@ -520,18 +524,63 @@ impl Model {
         let next = self.cursor as isize + delta;
         self.cursor = next.clamp(0, visible.len() as isize - 1) as usize;
         self.skip_header(delta.signum());
+        self.preview_scroll = 0;
+    }
+
+    /// Select one visible row by its on-screen position. Session headers are
+    /// labels and reject the click rather than moving to a neighbour.
+    pub fn select_visible(&mut self, position: usize) -> bool {
+        let visible = self.visible();
+        let Some(&row) = visible.get(position) else {
+            return false;
+        };
+        if matches!(self.rows.get(row), Some(Row::Session { .. })) {
+            return false;
+        }
+        self.cursor = position;
+        self.preview_scroll = 0;
+        true
+    }
+
+    /// Select a valid move destination without letting a click on a pane,
+    /// source, or gone window substitute some other candidate.
+    pub fn select_destination_visible(&mut self, position: usize) -> bool {
+        let old = self.cursor;
+        let old_scroll = self.preview_scroll;
+        if !self.select_visible(position) {
+            return false;
+        }
+        let excluded = self
+            .pending_move
+            .as_ref()
+            .and_then(PendingMove::sole_source)
+            .map(str::to_string);
+        let valid = self
+            .cursor_row()
+            .and_then(|i| self.rows.get(i))
+            .is_some_and(
+                |row| matches!(row, Row::Window(w) if !w.gone && Some(w.target()) != excluded),
+            );
+        if !valid {
+            self.cursor = old;
+            self.preview_scroll = old_scroll;
+            return false;
+        }
+        self.move_destination(0)
     }
 
     /// Type into the search, keeping the cursor on something real.
     pub fn search_push(&mut self, c: char) {
         self.search.push(c);
         self.cursor = 0;
+        self.preview_scroll = 0;
         self.skip_header(1);
     }
 
     pub fn search_pop(&mut self) {
         self.search.pop();
         self.cursor = 0;
+        self.preview_scroll = 0;
         self.skip_header(1);
     }
 
@@ -540,6 +589,7 @@ impl Model {
     pub fn search_clear(&mut self) {
         self.search.clear();
         self.cursor = 0;
+        self.preview_scroll = 0;
         self.skip_header(1);
     }
 
@@ -591,6 +641,7 @@ impl Model {
             return false;
         };
         self.cursor = pos;
+        self.preview_scroll = 0;
         true
     }
 
@@ -609,6 +660,7 @@ impl Model {
             let pos = (self.cursor + step) % n;
             if matches!(&self.rows[visible[pos]], Row::Window(w) if w.waiting) {
                 self.cursor = pos;
+                self.preview_scroll = 0;
                 return;
             }
         }
@@ -636,6 +688,7 @@ impl Model {
         } else {
             self.expanded.remove(&target);
         }
+        self.preview_scroll = 0;
         true
     }
 
@@ -737,6 +790,7 @@ impl Model {
             None => 0,
         };
         self.cursor = candidates[next].0;
+        self.preview_scroll = 0;
         if let Some(moving) = &mut self.pending_move {
             moving.destination = Some(candidates[next].1.clone());
         }
