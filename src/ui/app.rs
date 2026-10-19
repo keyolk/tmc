@@ -87,10 +87,44 @@ type Term = Terminal<CrosstermBackend<io::Stdout>>;
 
 fn setup() -> Result<Term> {
     restore_terminal_on_panic();
-    enable_raw_mode()?;
+    let mut guard = TerminalSetupGuard::arm()?;
     let mut out = io::stdout();
     crossterm::execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
-    Ok(Terminal::new(CrosstermBackend::new(out))?)
+    let terminal = Terminal::new(CrosstermBackend::new(out))?;
+    guard.disarm();
+    Ok(terminal)
+}
+
+/// Restores the terminal if setup returns before it can hand ownership to the
+/// normal teardown path.
+pub(super) struct TerminalSetupGuard {
+    armed: bool,
+}
+
+impl TerminalSetupGuard {
+    pub(super) fn arm() -> Result<Self> {
+        enable_raw_mode()?;
+        Ok(Self { armed: true })
+    }
+
+    pub(super) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TerminalSetupGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = disable_raw_mode();
+        let _ = crossterm::execute!(
+            io::stdout(),
+            DisableMouseCapture,
+            LeaveAlternateScreen,
+            crossterm::cursor::Show
+        );
+    }
 }
 
 /// Put the terminal back before a panic message is printed.

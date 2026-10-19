@@ -44,11 +44,16 @@ pub fn handle(model: &mut Model, event: MouseEvent, area: Rect) -> Effect {
         };
     }
     if regions.detail.contains(point.into()) {
+        let preview = render::detail_preview_area(regions.detail, model);
+        if !preview.contains(point.into()) {
+            return Effect::None;
+        }
+        let visible_lines = preview.height.saturating_sub(1) as usize;
         let max_scroll = preview_body(model)
             .map(|body| {
                 crate::collect::tmux::tail_lines(body, usize::MAX)
                     .len()
-                    .saturating_sub(1)
+                    .saturating_sub(visible_lines)
             })
             .unwrap_or(0);
         match event.kind {
@@ -77,7 +82,8 @@ pub fn handle(model: &mut Model, event: MouseEvent, area: Rect) -> Effect {
             Effect::None
         }
         MouseEventKind::Down(MouseButton::Right | MouseButton::Middle) => {
-            if select_tree(model, event.row, regions.tree) {
+            let choosing_destination = model.pending_move.is_some();
+            if select_tree(model, event.row, regions.tree) && !choosing_destination {
                 model.toggle_mark();
             }
             Effect::None
@@ -259,22 +265,29 @@ mod tests {
     #[test]
     fn detail_wheel_scrolls_preview_without_moving_the_tree() {
         let mut m = model();
-        m.preview = Some(("s:0".into(), "one\ntwo\nthree\nfour\nfive\n".into()));
+        m.preview = Some((
+            "s:0".into(),
+            (1..=50).map(|i| format!("line {i}\n")).collect(),
+        ));
         let area = Rect::new(0, 0, 100, 20);
         let detail = render::regions(area).detail;
+        let preview = render::detail_preview_area(detail, &m);
+        let point = (preview.x + 1, preview.y + 1);
         handle(
             &mut m,
-            event(MouseEventKind::ScrollUp, detail.x + 1, detail.y + 1),
+            event(MouseEventKind::ScrollUp, point.0, point.1),
             area,
         );
         assert_eq!(m.preview_scroll, 3);
         assert_eq!(m.cursor, 0);
+        let max = 50usize.saturating_sub(preview.height.saturating_sub(1) as usize);
+        m.preview_scroll = max;
         handle(
             &mut m,
-            event(MouseEventKind::ScrollDown, detail.x + 1, detail.y + 1),
+            event(MouseEventKind::ScrollDown, point.0, point.1),
             area,
         );
-        assert_eq!(m.preview_scroll, 0);
+        assert_eq!(m.preview_scroll, max.saturating_sub(3));
     }
 
     #[test]
@@ -294,6 +307,30 @@ mod tests {
             area,
         );
         assert_eq!(m.cursor, 1);
+        assert_eq!(
+            m.pending_move
+                .as_ref()
+                .and_then(|moving| moving.destination.as_deref()),
+            Some("s:1")
+        );
+    }
+
+    #[test]
+    fn right_clicking_a_destination_does_not_leave_a_mark() {
+        let mut m = model();
+        m.pending_move = Some(PendingMove {
+            panes: vec![("%1".into(), "s:0".into())],
+            kind: MoveKind::Panes,
+            destination: None,
+        });
+        let area = Rect::new(0, 0, 80, 20);
+        let tree = render::regions(area).tree;
+        handle(
+            &mut m,
+            event(MouseEventKind::Down(MouseButton::Right), 2, tree.y + 1),
+            area,
+        );
+        assert!(m.marks.is_empty());
         assert_eq!(
             m.pending_move
                 .as_ref()

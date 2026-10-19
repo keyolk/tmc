@@ -458,6 +458,24 @@ fn render_row<'a>(row: &'a Row, selected: bool, model: &Model, width: usize) -> 
     }
 }
 
+pub(super) fn detail_preview_area(area: Rect, model: &Model) -> Rect {
+    let Some(window) = model.current_window() else {
+        return Rect::default();
+    };
+    let mut head = 1usize;
+    match model.current_pane() {
+        Some(_) => head += 1, // cwd
+        None => head += window.reasons.len(),
+    }
+    if !window.state.is_empty() {
+        head += 1;
+    }
+    Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(head as u16 + 1), Constraint::Min(0)])
+        .split(area)[1]
+}
+
 fn render_detail(frame: &mut Frame, area: Rect, model: &Model) {
     let t = &model.theme;
     let Some(w) = model.current_window() else {
@@ -511,16 +529,14 @@ fn render_detail(frame: &mut Frame, area: Rect, model: &Model) {
             Span::styled(format!("  {}", short_id(&w.cc_session)), t.subtle()),
         ]));
     }
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(head.len() as u16 + 1),
-            Constraint::Min(0),
-        ])
-        .split(area);
-    frame.render_widget(Paragraph::new(head), rows[0]);
+    let preview = detail_preview_area(area, model);
+    let head_area = Rect {
+        height: preview.y.saturating_sub(area.y),
+        ..area
+    };
+    frame.render_widget(Paragraph::new(head), head_area);
 
-    render_preview(frame, rows[1], model, w);
+    render_preview(frame, preview, model, w);
 }
 
 /// What the window is showing right now.

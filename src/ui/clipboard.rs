@@ -11,9 +11,7 @@ use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
     MouseButton, MouseEvent, MouseEventKind,
 };
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -152,10 +150,11 @@ pub fn run(target: &str) -> Result<()> {
     let theme = Theme::detect();
 
     super::app::restore_terminal_on_panic();
-    enable_raw_mode()?;
+    let mut guard = super::app::TerminalSetupGuard::arm()?;
     let mut out = io::stdout();
     crossterm::execute!(out, EnterAlternateScreen, EnableMouseCapture)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(out))?;
+    guard.disarm();
 
     let result = loop {
         if let Err(e) = terminal.draw(|frame| draw(frame, &picker, &theme)) {
