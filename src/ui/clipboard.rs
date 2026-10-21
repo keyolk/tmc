@@ -18,6 +18,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use super::link;
 use super::theme::Theme;
 use crate::collect::clipboard::{self, Buffer};
 
@@ -29,6 +30,12 @@ pub struct Picker {
     pub filter: String,
     pub chosen: Option<String>,
     pub quit: bool,
+    /// What the last ctrl-o did, on the filter line until the next key.
+    pub note: Option<String>,
+    /// Opens a URL; tests put a recorder here.
+    pub launcher: link::Launcher,
+    /// Reads a buffer's whole text; tests read a fixture instead of tmux.
+    pub read: fn(&str) -> Result<String>,
 }
 
 impl Picker {
@@ -39,6 +46,9 @@ impl Picker {
             filter: String::new(),
             chosen: None,
             quit: false,
+            note: None,
+            launcher: link::DEFAULT,
+            read: clipboard::content,
         }
     }
 
@@ -67,6 +77,7 @@ impl Picker {
     }
 
     pub fn key(&mut self, code: KeyCode, mods: KeyModifiers) {
+        self.note = None;
         match code {
             KeyCode::Esc => self.quit = true,
             KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => self.quit = true,
@@ -74,6 +85,9 @@ impl Picker {
             KeyCode::Up => self.move_cursor(-1),
             KeyCode::Char('n') if mods.contains(KeyModifiers::CONTROL) => self.move_cursor(1),
             KeyCode::Char('p') if mods.contains(KeyModifiers::CONTROL) => self.move_cursor(-1),
+            // Not `o`, the fleet's open-link key: every printable key types
+            // into the filter here, so the link takes the control chord.
+            KeyCode::Char('o') if mods.contains(KeyModifiers::CONTROL) => self.open_link(),
             KeyCode::Enter => {
                 self.chosen = self.current().map(|b| b.name.clone());
                 self.quit = true;
@@ -93,6 +107,27 @@ impl Picker {
             }
             _ => {}
         }
+    }
+
+    /// Open the first URL in the highlighted buffer. Read whole on demand:
+    /// the row shows only tmux's sample, which cuts URLs.
+    fn open_link(&mut self) {
+        let Some(name) = self.current().map(|b| b.name.clone()) else {
+            self.note = Some("no buffer selected".into());
+            return;
+        };
+        let text = match (self.read)(&name) {
+            Ok(text) => text,
+            Err(e) => {
+                self.note = Some(format!("read {name}: {e:#}"));
+                return;
+            }
+        };
+        let opened = link::open_first(self.launcher, &link::find(&text));
+        self.note = Some(match opened.err {
+            Some(link::OpenError::NoLink) => "no link in this buffer".into(),
+            _ => opened.note(),
+        });
     }
 
     pub fn mouse(&mut self, event: MouseEvent, area: Rect) {
@@ -216,14 +251,27 @@ fn draw(frame: &mut ratatui::Frame, picker: &Picker, t: &Theme) {
     let area = frame.area();
     let rows = picker_rows(area);
 
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("buffer  ", t.subtle()),
-            Span::raw(picker.filter.clone()),
-            Span::styled(t.glyphs.caret, t.accent()),
-        ])),
-        rows[0],
-    );
+    let head = Line::from(vec![
+        Span::styled("buffer  ", t.subtle()),
+        Span::raw(picker.filter.clone()),
+        Span::styled(t.glyphs.caret, t.accent()),
+    ]);
+    // The picker has no hint row; the filter line names the one key that is
+    // not typing, and says what it did.
+    let side = picker
+        .note
+        .clone()
+        .unwrap_or_else(|| "ctrl-o open link".into());
+    let room = (rows[0].width as usize).saturating_sub(head.width() + 2);
+    frame.render_widget(Paragraph::new(head), rows[0]);
+    if room > 0 {
+        frame.render_widget(
+            Paragraph::new(super::render::truncate(&side, room, t.glyphs.ellipsis))
+                .style(t.subtle())
+                .alignment(ratatui::layout::Alignment::Right),
+            rows[0],
+        );
+    }
 
     let visible = picker.visible();
     let height = rows[1].height as usize;
@@ -414,6 +462,73 @@ mod tests {
         assert!(p.filter.is_empty(), "a control chord must not type");
         p.key(KeyCode::Char('p'), KeyModifiers::CONTROL);
         assert_eq!(p.cursor, 0);
+    }
+
+    fn read_fixture(name: &str) -> Result<String> {
+        Ok(match name {
+            "buffer3" => "see https://github.com/keyolk/tmc/pull/15 and\nhttps://x.io/b".into(),
+            "buffer2" => "javascript:alert(1) file:///etc/passwd".into(),
+            _ => "kubectl get pods".into(),
+        })
+    }
+
+    fn ctrl_o(p: &mut Picker) {
+        p.key(KeyCode::Char('o'), KeyModifiers::CONTROL);
+    }
+
+    #[test]
+    fn ctrl_o_opens_the_first_url_of_the_whole_buffer() {
+        let mut p = picker();
+        p.read = read_fixture;
+        p.launcher = link::stub::record;
+        ctrl_o(&mut p);
+        assert_eq!(
+            link::stub::take(),
+            ["https://github.com/keyolk/tmc/pull/15"]
+        );
+        assert_eq!(
+            p.note.as_deref(),
+            Some("opened https://github.com/keyolk/tmc/pull/15 (the first of 2 links)")
+        );
+        assert!(p.filter.is_empty(), "the chord does not type");
+        assert!(
+            p.chosen.is_none() && !p.quit,
+            "opening a link is not pasting"
+        );
+    }
+
+    #[test]
+    fn ctrl_o_without_an_http_url_launches_nothing_and_says_so() {
+        let mut p = picker();
+        p.read = read_fixture;
+        p.launcher = link::stub::unexpected;
+        p.key(KeyCode::Down, KeyModifiers::NONE);
+        ctrl_o(&mut p);
+        assert_eq!(p.note.as_deref(), Some("no link in this buffer"));
+        p.key(KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(p.note, None, "the next key takes the note down");
+        ctrl_o(&mut p);
+        assert_eq!(p.note.as_deref(), Some("no link in this buffer"));
+    }
+
+    #[test]
+    fn plain_o_still_types() {
+        let mut p = picker();
+        p.launcher = link::stub::unexpected;
+        p.key(KeyCode::Char('o'), KeyModifiers::NONE);
+        assert_eq!(p.filter, "o");
+    }
+
+    #[test]
+    fn the_filter_line_names_ctrl_o() {
+        let p = picker();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 5)).unwrap();
+        terminal.draw(|f| draw(f, &p, &Theme::default())).unwrap();
+        let top: String = (0..60)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(top.trim_end().ends_with("ctrl-o open link"), "{top:?}");
     }
 
     #[test]

@@ -366,10 +366,7 @@ fn event_loop(terminal: &mut Term, model: &mut Model, focus: Option<String>) -> 
     // fills the rows in rather than replacing the screen.
     // The last drawn frame: drag selection reads panes without full text
     // from it, as the Go kit reads View().
-    let mut last_frame = terminal
-        .draw(|frame| super::render::draw(frame, model, now_secs()))?
-        .buffer
-        .clone();
+    let mut last_frame = draw(terminal, model, now_secs())?;
     let (copied_tx, copied_rx) = std::sync::mpsc::channel();
     let mut copies = 0usize;
 
@@ -382,10 +379,7 @@ fn event_loop(terminal: &mut Term, model: &mut Model, focus: Option<String>) -> 
         if needs_redraw {
             io.want_preview(model);
             let now = now_secs();
-            last_frame = terminal
-                .draw(|frame| super::render::draw(frame, model, now))?
-                .buffer
-                .clone();
+            last_frame = draw(terminal, model, now)?;
             needs_redraw = false;
         }
 
@@ -455,6 +449,28 @@ fn event_loop(terminal: &mut Term, model: &mut Model, focus: Option<String>) -> 
     }
 }
 
+/// Draw a frame, with the preview's URLs made links, and return it as
+/// rendered without them: drag selection copies text from it, and the escapes
+/// are not text.
+fn draw<B>(
+    terminal: &mut Terminal<B>,
+    model: &mut Model,
+    now: u64,
+) -> Result<ratatui::buffer::Buffer>
+where
+    B: ratatui::backend::Backend,
+    B::Error: Send + Sync + 'static,
+{
+    model.screen = terminal.size()?.into();
+    let mut plain = None;
+    terminal.draw(|frame| {
+        super::render::draw(frame, model, now);
+        plain = Some(frame.buffer_mut().clone());
+        super::preview_links::apply(frame.buffer_mut(), model);
+    })?;
+    Ok(plain.expect("the draw closure ran"))
+}
+
 /// Leaving while a command runs waits for it.
 ///
 /// The process exiting would kill the worker mid-command: a restore stopped
@@ -466,7 +482,7 @@ fn finish_running_command(terminal: &mut Term, model: &mut Model, io: &mut Io) -
         return Ok(());
     };
     model.status.info(format!("waiting for {label} to finish…"));
-    terminal.draw(|frame| super::render::draw(frame, model, now_secs()))?;
+    draw(terminal, model, now_secs())?;
     while model.busy.is_some() {
         let Some(reply) = io.workers.recv() else {
             break; // the worker is gone; nothing left to wait for
@@ -631,6 +647,7 @@ pub(super) fn run_cmd(model: &mut Model, cmd: Cmd) -> Effect {
             None => {}
         },
         Cmd::Reload => return Effect::Reload,
+        Cmd::OpenLink => super::preview_links::open(model),
         Cmd::Help => {
             model.help = true;
             model.help_scroll = 0;
@@ -746,6 +763,23 @@ mod tests {
     /// their own modules.
     fn press(model: &mut Model, c: char, mods: KeyModifiers) {
         let _ = handle_key(model, KeyCode::Char(c), mods);
+    }
+
+    #[test]
+    fn the_frame_kept_for_selection_has_no_link_escapes() {
+        let mut m = model_with_window();
+        m.preview = Some(("projects:1".into(), "https://x.io/a\n".into()));
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(110, 16)).expect("test backend");
+        let kept = draw(&mut terminal, &mut m, 0).expect("draw");
+        let has_link =
+            |b: &ratatui::buffer::Buffer| b.content.iter().any(|c| c.symbol().contains("\x1b]8;;"));
+        assert!(
+            has_link(terminal.backend().buffer()),
+            "the terminal gets the link"
+        );
+        assert!(!has_link(&kept), "drag selection copies text, not escapes");
+        assert_eq!(m.screen, ratatui::layout::Rect::new(0, 0, 110, 16));
     }
 
     #[test]

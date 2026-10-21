@@ -150,6 +150,7 @@ pub enum Cmd {
     CloseMenu,
     Run(ActionKind),
     Reload,
+    OpenLink,
     Help,
     CloseHelp,
     HelpDown,
@@ -249,6 +250,8 @@ pub static BINDINGS: &[Binding] = &[
     b(Ctx::Tree, Key::Left, Cmd::Collapse, Hidden, "", "hide the window's panes"),
     b(Ctx::Tree, C('s'), Cmd::Save, Group(4), "save", "save a restore point"),
     b(Ctx::Tree, C('n'), Cmd::NextWaiting, Group(4), "waiting", "next window waiting for you"),
+    // `o` is the fleet's open-link key (tui-design E11).
+    b(Ctx::Tree, C('o'), Cmd::OpenLink, Group(5), "open link", "open the first link in the output on screen"),
     b(Ctx::Tree, C('p'), Cmd::PointNext, Group(6), "point", "older restore point"),
     b(Ctx::Tree, C('P'), Cmd::PointPrev, Group(6), "point", "newer restore point"),
     b(Ctx::Tree, C('c'), Cmd::ClearMarks, Hidden, "", "clear the marks"),
