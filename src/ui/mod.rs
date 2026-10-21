@@ -7,11 +7,13 @@
 pub mod app;
 pub mod clipboard;
 mod commands;
+mod drag;
 mod guard;
 pub mod keys;
 pub mod model;
 mod mouse;
 pub mod render;
+mod selection;
 pub mod snapshot;
 pub mod state;
 pub mod status;

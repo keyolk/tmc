@@ -364,7 +364,14 @@ fn event_loop(terminal: &mut Term, model: &mut Model, focus: Option<String>) -> 
     // first reload costs ~0.1s of `ps` and `tmux` before it can say anything;
     // the frame drawn here is the real one with an empty tree, so the reply
     // fills the rows in rather than replacing the screen.
-    terminal.draw(|frame| super::render::draw(frame, model, now_secs()))?;
+    // The last drawn frame: drag selection reads panes without full text
+    // from it, as the Go kit reads View().
+    let mut last_frame = terminal
+        .draw(|frame| super::render::draw(frame, model, now_secs()))?
+        .buffer
+        .clone();
+    let (copied_tx, copied_rx) = std::sync::mpsc::channel();
+    let mut copies = 0usize;
 
     let mut io = Io::new(focus);
     io.reload(model);
@@ -375,13 +382,16 @@ fn event_loop(terminal: &mut Term, model: &mut Model, focus: Option<String>) -> 
         if needs_redraw {
             io.want_preview(model);
             let now = now_secs();
-            terminal.draw(|frame| super::render::draw(frame, model, now))?;
+            last_frame = terminal
+                .draw(|frame| super::render::draw(frame, model, now))?
+                .buffer
+                .clone();
             needs_redraw = false;
         }
 
         let now = Instant::now();
         let until_tick = next_tick.saturating_duration_since(now);
-        let wait = if io.outstanding(model) {
+        let wait = if io.outstanding(model) || copies > 0 {
             until_tick.min(REPLY_POLL)
         } else {
             until_tick
@@ -403,16 +413,28 @@ fn event_loop(terminal: &mut Term, model: &mut Model, focus: Option<String>) -> 
                     needs_redraw = true;
                 }
                 Event::Key(_) => {}
-                Event::Mouse(mouse) if super::mouse::actionable(mouse.kind) => {
-                    model.status.on_key(Instant::now());
+                Event::Mouse(mouse) => {
                     let area = ratatui::layout::Rect::from(terminal.size()?);
-                    let effect = super::mouse::handle(model, mouse, area);
-                    io.run(model, effect);
-                    needs_redraw = true;
+                    let out =
+                        super::drag::dispatch(model, mouse, area, &last_frame, Instant::now());
+                    if let Some(text) = out.copy {
+                        copies += 1;
+                        super::selection::copy_in_background(text, copied_tx.clone());
+                    }
+                    io.run(model, out.effect);
+                    needs_redraw |= out.redraw;
                 }
-                Event::Mouse(_) => {}
                 _ => needs_redraw = true, // resize
             }
+        }
+
+        while let Ok(done) = copied_rx.try_recv() {
+            copies = copies.saturating_sub(1);
+            match done.error {
+                None => model.status.success(done.message()),
+                Some(_) => model.status.error(done.message()),
+            }
+            needs_redraw = true;
         }
 
         while let Some(reply) = io.workers.try_recv() {
@@ -457,6 +479,8 @@ fn finish_running_command(terminal: &mut Term, model: &mut Model, io: &mut Io) -
 /// Turn a key into a change to the model, through the binding table.
 pub(super) fn handle_key(model: &mut Model, code: KeyCode, mods: KeyModifiers) -> Effect {
     model.status.on_key(Instant::now());
+    // A key is the "next action" that ends a drag selection's highlight.
+    model.selection.clear();
     let ctx = keys::context(model);
 
     // Under a Korean input source the shortcut keys arrive as jamo (`q` -> `ㅂ`)
