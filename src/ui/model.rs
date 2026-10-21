@@ -319,6 +319,9 @@ pub struct Model {
     /// not depend on the developer's `NO_COLOR` or locale; the entry points
     /// replace it with `Theme::detect()`.
     pub theme: super::theme::Theme,
+    /// The mouse drag selection, drawn over the frame until the next press
+    /// or key.
+    pub selection: super::selection::Selection,
 }
 
 impl Model {
@@ -347,6 +350,7 @@ impl Model {
             expanded: std::collections::HashSet::new(),
             preview: None,
             preview_scroll: 0,
+            selection: Default::default(),
             theme: super::theme::Theme::default(),
         }
     }

@@ -105,6 +105,10 @@ pub fn draw(frame: &mut Frame, model: &Model, now_secs: u64) {
             render_help(f, regions.body, t, model.help_scroll)
         });
     }
+
+    // Over everything, so the highlight shows whatever the panes drew.
+    let panes = super::drag::panes(area, model);
+    model.selection.paint(frame.buffer_mut(), &panes);
 }
 
 /// The `x` menu: every window and pane command, with what each would act on.
@@ -551,14 +555,7 @@ fn render_preview(frame: &mut Frame, area: Rect, model: &Model, w: &super::model
         r = t.glyphs.rule
     );
 
-    // Keyed by whatever `app::preview_target` asked for: the pane id when one
-    // is selected, the window otherwise. Asking by window while a pane is
-    // selected silently rendered "(nothing on screen)".
-    let key = match model.current_pane() {
-        Some(p) => p.target().to_string(),
-        None => w.target(),
-    };
-    let body = match model.preview_for(&key) {
+    let body = match model.preview_for(&preview_key(model, w)) {
         Some(body) => body,
         None if w.gone => {
             frame.render_widget(
@@ -582,11 +579,7 @@ fn render_preview(frame: &mut Frame, area: Rect, model: &Model, w: &super::model
 
     // Dim, because the preview is context rather than this app's own output —
     // and full-brightness terminal text next to the tree reads as a second UI.
-    let height = area.height.saturating_sub(1) as usize;
-    let all = crate::collect::tmux::tail_lines(body, usize::MAX);
-    let scroll = model.preview_scroll.min(all.len().saturating_sub(height));
-    let end = all.len().saturating_sub(scroll);
-    let start = end.saturating_sub(height);
+    let (all, start, end) = preview_window(body, model.preview_scroll, area);
     let captured = &all[start..end];
     if captured.is_empty() {
         lines.push(Line::styled("  (nothing on screen)", t.subtle()));
@@ -599,6 +592,27 @@ fn render_preview(frame: &mut Frame, area: Rect, model: &Model, w: &super::model
     }
 
     frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Which capture the preview shows. Keyed by whatever `app::preview_target`
+/// asked for: the pane id when one is selected, the window otherwise. Asking
+/// by window while a pane is selected silently rendered "(nothing on screen)".
+pub(super) fn preview_key(model: &Model, w: &super::model::WindowRow) -> String {
+    match model.current_pane() {
+        Some(p) => p.target().to_string(),
+        None => w.target(),
+    }
+}
+
+/// The captured lines, and the range of them drawn below the rule of the
+/// preview `area`. Shared with drag selection, which needs the same offset.
+pub(super) fn preview_window(body: &str, scroll: usize, area: Rect) -> (Vec<&str>, usize, usize) {
+    let height = area.height.saturating_sub(1) as usize;
+    let all = crate::collect::tmux::tail_lines(body, usize::MAX);
+    let scroll = scroll.min(all.len().saturating_sub(height));
+    let end = all.len().saturating_sub(scroll);
+    let start = end.saturating_sub(height);
+    (all, start, end)
 }
 
 fn render_keys(frame: &mut Frame, area: Rect, model: &Model) {
