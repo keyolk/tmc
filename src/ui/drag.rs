@@ -17,7 +17,7 @@ use super::selection::{Kind, Pane};
 
 /// The selectable panes of the frame drawn into `area`, in drawing order.
 pub(super) fn panes(area: Rect, model: &Model) -> Vec<Pane> {
-    let regions = render::regions(area);
+    let regions = render::regions(area, &model.split);
     if regions.body.width == 0 {
         return Vec::new();
     }
@@ -32,17 +32,11 @@ pub(super) fn panes(area: Rect, model: &Model) -> Vec<Pane> {
         return vec![Pane::new("menu", inset(b, 2, 1), Kind::List)];
     }
 
+    // The divider between tree and detail is in neither rect, so a drag
+    // from the tree never copies it.
     let mut out = vec![
         Pane::new("header", regions.header, Kind::List),
-        // The tree draws a right border; the pane stops before it.
-        Pane::new(
-            "tree",
-            Rect {
-                width: regions.tree.width.saturating_sub(1),
-                ..regions.tree
-            },
-            Kind::List,
-        ),
+        Pane::new("tree", regions.tree, Kind::List),
     ];
     if regions.detail.width > 0 {
         let preview = render::detail_preview_area(regions.detail, model);
@@ -126,9 +120,9 @@ pub(super) struct Dispatched {
     pub redraw: bool,
 }
 
-/// One mouse event: the selection first, then, unless it consumed the event,
-/// the click handling it had before. A press that did not move still reaches
-/// `mouse::handle` as a click.
+/// One mouse event: the split first, then the selection, then, unless one
+/// of them consumed the event, the click handling it had before. A press
+/// that did not move still reaches `mouse::handle` as a click.
 pub(super) fn dispatch(
     model: &mut Model,
     event: MouseEvent,
@@ -136,6 +130,27 @@ pub(super) fn dispatch(
     frame: &Buffer,
     now: Instant,
 ) -> Dispatched {
+    // Only the base screen has a divider: an overlay owns every press.
+    if !model.help && !model.menu {
+        let body = render::regions(area, &model.split).body;
+        let split = model.split.mouse(&event, body, now);
+        if split.consumed {
+            // The press never reaches the selection, which would otherwise
+            // have dropped its old highlight: drop it here, or a stale
+            // highlight is painted over panes that just moved.
+            if matches!(
+                event.kind,
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+            ) {
+                model.selection.clear();
+            }
+            return Dispatched {
+                effect: super::app::Effect::None,
+                copy: None,
+                redraw: true,
+            };
+        }
+    }
     let fed = feed(model, &event, area, frame, now);
     let mut out = Dispatched {
         effect: super::app::Effect::None,

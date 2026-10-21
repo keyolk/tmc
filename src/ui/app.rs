@@ -664,6 +664,12 @@ pub(super) fn run_cmd(model: &mut Model, cmd: Cmd) -> Effect {
         }
         Cmd::Confirm => return job(confirm_move(model)),
         Cmd::CancelMove => cancel_move(model),
+        // Against the body last drawn, so a step is from the divider on
+        // screen. Saved with the rest of the UI state on the way out.
+        Cmd::Split(action) => {
+            let body = super::render::regions(model.screen, &model.split).body;
+            model.split.handle(action, body);
+        }
     }
     Effect::None
 }
