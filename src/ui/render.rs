@@ -10,6 +10,7 @@ use unicode_width::UnicodeWidthStr;
 use super::guard;
 use super::keys::{self, Ctx};
 use super::model::{Model, Row, actions};
+use super::split::{Config, Split};
 use super::theme::Theme;
 use crate::clock;
 use crate::layout::diff::Change;
@@ -20,17 +21,36 @@ const DETAIL_MIN_WIDTH: u16 = 90;
 const MIN_WIDTH: u16 = 50;
 const MIN_HEIGHT: u16 = 10;
 
+/// The tree | detail split as it was before it could be resized: 55/45 from
+/// `DETAIL_MIN_WIDTH` up, the tree alone below it. The divider is the one
+/// column the tree's right border used to take, so the default look is
+/// unchanged; the minimums keep a tree row and the detail readable.
+pub(super) fn tree_split() -> Split {
+    Split::new(Config {
+        divider: 1,
+        collapse: DETAIL_MIN_WIDTH,
+        default: 0.55,
+        min_a: 30,
+        min_b: 30,
+        lo: 0.2,
+        hi: 0.8,
+        ..Config::default()
+    })
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct Regions {
     pub header: Rect,
     pub body: Rect,
     pub tree: Rect,
+    /// Between the tree and the detail; in neither pane.
+    pub divider: Rect,
     pub detail: Rect,
     pub keys: Rect,
 }
 
-/// Geometry shared by pure rendering and mouse hit testing.
-pub(super) fn regions(area: Rect) -> Regions {
+/// Geometry shared by pure rendering, mouse hit testing and drag selection.
+pub(super) fn regions(area: Rect, split: &Split) -> Regions {
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         return Regions::default();
     }
@@ -42,19 +62,12 @@ pub(super) fn regions(area: Rect) -> Regions {
             Constraint::Length(1),
         ])
         .split(area);
-    let (tree, detail) = if area.width >= DETAIL_MIN_WIDTH {
-        let columns = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-            .split(rows[1]);
-        (columns[0], columns[1])
-    } else {
-        (rows[1], Rect::default())
-    };
+    let (tree, divider, detail) = split.layout(rows[1]);
     Regions {
         header: rows[0],
         body: rows[1],
         tree,
+        divider,
         detail,
         keys: rows[2],
     }
@@ -70,7 +83,7 @@ pub fn draw(frame: &mut Frame, model: &Model, now_secs: u64) {
         return;
     }
 
-    let regions = regions(area);
+    let regions = regions(area, &model.split);
 
     // Each pane is guarded: one that panics draws a line saying so, and the
     // rest of the frame -- the key row with the way out above all -- still
@@ -88,6 +101,12 @@ pub fn draw(frame: &mut Frame, model: &Model, now_secs: u64) {
             render_detail(f, regions.detail, model)
         });
     }
+    model.split.draw_divider(
+        frame.buffer_mut(),
+        regions.divider,
+        t.glyphs.border.vertical_right,
+        t.border(),
+    );
 
     guard::pane(frame, regions.keys, "keys", t, false, |f| {
         render_keys(f, regions.keys, model)
@@ -345,15 +364,8 @@ fn render_tree(frame: &mut Frame, area: Rect, model: &Model) {
         ));
     }
 
-    frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::RIGHT)
-                .border_set(model.theme.glyphs.border)
-                .border_style(model.theme.border()),
-        ),
-        area,
-    );
+    // No border of its own: the split's divider is drawn beside it.
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// Keep the cursor in view without jumping the list around.
@@ -826,19 +838,26 @@ mod tests {
 
     #[test]
     fn mouse_regions_follow_the_responsive_layout() {
-        let narrow = regions(Rect::new(0, 0, 89, 24));
+        let narrow = regions(Rect::new(0, 0, 89, 24), &tree_split());
         assert_eq!(narrow.tree, narrow.body);
         assert_eq!(narrow.detail, Rect::default());
 
-        let wide = regions(Rect::new(0, 0, 90, 24));
+        let wide = regions(Rect::new(0, 0, 90, 24), &tree_split());
         assert!(wide.tree.width > 0);
         assert!(wide.detail.width > 0);
-        assert_eq!(wide.tree.width + wide.detail.width, wide.body.width);
+        assert_eq!(wide.divider.width, 1);
+        assert_eq!(
+            wide.tree.width + wide.divider.width + wide.detail.width,
+            wide.body.width
+        );
     }
 
     #[test]
     fn a_tiny_terminal_has_no_mouse_targets() {
-        assert_eq!(regions(Rect::new(0, 0, 49, 9)).tree, Rect::default());
+        assert_eq!(
+            regions(Rect::new(0, 0, 49, 9), &tree_split()).tree,
+            Rect::default()
+        );
     }
 
     #[test]

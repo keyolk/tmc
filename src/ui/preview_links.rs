@@ -35,7 +35,7 @@ pub(super) fn regions(area: Rect, model: &Model) -> Vec<Region> {
     if model.help || model.menu {
         return Vec::new();
     }
-    let detail = render::regions(area).detail;
+    let detail = render::regions(area, &model.split).detail;
     if detail.width == 0 {
         return Vec::new();
     }

@@ -17,6 +17,9 @@ mod preview_links;
 pub mod render;
 mod selection;
 pub mod snapshot;
+mod split;
+#[cfg(test)]
+mod split_tests;
 pub mod state;
 pub mod status;
 pub mod theme;

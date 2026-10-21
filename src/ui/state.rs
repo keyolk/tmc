@@ -26,6 +26,15 @@ pub struct UiState {
     /// The restore point's display name, e.g. `saved:work`. A name rather
     /// than an index: a new autosave shifts every index by one.
     pub point: Option<String>,
+    /// The tree | detail split, only once the user has moved it: an unmoved
+    /// split follows the default. A garbage value drops the ratio, not the
+    /// file.
+    #[serde(
+        default,
+        deserialize_with = "super::split::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub split: Option<super::split::State>,
 }
 
 pub fn path() -> PathBuf {
@@ -99,11 +108,16 @@ impl UiState {
             expanded,
             search: model.search.clone(),
             point: model.current_point().map(|p| p.name.clone()),
+            split: model.split.state(),
         }
     }
 
     /// Put this state back into a fresh model.
     pub fn restore(&self, model: &mut Model) {
+        // Out of range (NaN, a percentage) is rejected and the default kept.
+        if let Some(s) = self.split {
+            model.split.restore(s);
+        }
         model.expanded = self.expanded.iter().cloned().collect();
         model.search = self.search.clone();
         // A query from last time is a suggestion, not something to append
@@ -123,6 +137,7 @@ impl UiState {
 mod tests {
     use super::*;
     use crate::layout::point::{Point, Ref};
+    use ratatui::layout::Rect;
 
     fn point(name: &str) -> Point {
         Point {
@@ -142,6 +157,7 @@ mod tests {
             expanded: ["projects:1".to_string()].into(),
             search: "claude".into(),
             point: Some("saved:work".into()),
+            split: Some(crate::ui::split::State { ratio: 0.4 }),
         };
         save(&file, &state).expect("save");
         assert_eq!(load(&file).expect("load"), state);
@@ -188,6 +204,48 @@ mod tests {
             m.point_index, 0,
             "a vanished point falls back to the newest"
         );
+    }
+
+    #[test]
+    fn a_moved_split_round_trips_and_an_unmoved_one_is_not_saved() {
+        let r = Rect::new(0, 0, 120, 24);
+        let mut m = Model::new(Vec::new());
+        assert_eq!(
+            UiState::capture(&m).split,
+            None,
+            "unmoved: follow the default"
+        );
+        m.split.handle(crate::ui::split::Action::Grow, r);
+        let saved = UiState::capture(&m);
+        let ratio = saved.split.expect("moved").ratio;
+        let mut fresh = Model::new(Vec::new());
+        saved.restore(&mut fresh);
+        assert_eq!(fresh.split.ratio(), ratio);
+        assert_eq!(fresh.split.layout(r), m.split.layout(r));
+    }
+
+    #[test]
+    fn a_garbage_split_falls_back_to_the_default_and_keeps_the_rest() {
+        let dir = std::env::temp_dir().join(format!("tmc-state-split-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("ui.json");
+        let default = Model::new(Vec::new()).split.ratio();
+        for split in [
+            r#"{"ratio": 55}"#,
+            r#"{"ratio": "wide"}"#,
+            r#"{"ratio": -1}"#,
+            "[]",
+        ] {
+            let raw = format!(r#"{{"search": "cl", "split": {split}}}"#);
+            std::fs::write(&file, raw).unwrap();
+            let state = load(&file).expect("the rest of the file still loads");
+            assert_eq!(state.search, "cl");
+            let mut m = Model::new(Vec::new());
+            state.restore(&mut m);
+            assert_eq!(m.split.ratio(), default, "{split}");
+            assert!(!m.split.is_set(), "{split}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

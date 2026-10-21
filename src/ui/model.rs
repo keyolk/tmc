@@ -327,6 +327,8 @@ pub struct Model {
     pub screen: ratatui::layout::Rect,
     /// Opens a URL in the browser; tests put a recorder here.
     pub launcher: super::link::Launcher,
+    /// The tree | detail boundary, which `<` `>` `=` and a divider drag move.
+    pub split: super::split::Split,
 }
 
 impl Model {
@@ -359,6 +361,7 @@ impl Model {
             theme: super::theme::Theme::default(),
             screen: ratatui::layout::Rect::default(),
             launcher: super::link::DEFAULT,
+            split: super::render::tree_split(),
         }
     }
 
