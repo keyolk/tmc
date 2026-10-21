@@ -322,6 +322,11 @@ pub struct Model {
     /// The mouse drag selection, drawn over the frame until the next press
     /// or key.
     pub selection: super::selection::Selection,
+    /// The size of the last frame, so a key can act on what was on screen
+    /// (`o` opens a link the preview showed, not one scrolled out of it).
+    pub screen: ratatui::layout::Rect,
+    /// Opens a URL in the browser; tests put a recorder here.
+    pub launcher: super::link::Launcher,
 }
 
 impl Model {
@@ -352,6 +357,8 @@ impl Model {
             preview_scroll: 0,
             selection: Default::default(),
             theme: super::theme::Theme::default(),
+            screen: ratatui::layout::Rect::default(),
+            launcher: super::link::DEFAULT,
         }
     }
 

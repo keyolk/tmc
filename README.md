@@ -130,6 +130,7 @@ from where the TUI opens leaves.
 | `l` / `h` | expand a window to its panes / collapse |
 | `x` | the window and pane menu, below |
 | `R` | re-read tmux now |
+| `o` | open the first link in the output on screen |
 | `?` | every key, in every mode |
 | `q`, `Esc`, `Ctrl-C` | quit |
 
@@ -150,6 +151,14 @@ answer and not be listed.
 | wheel / outside click | `?` help | scroll / close |
 | left click | clipboard | select without pasting |
 | middle / right click | clipboard | select and paste |
+
+**Links.** A URL in the output preview is an OSC 8 hyperlink carrying the
+whole URL, even where the panel cuts the line, so cmd/ctrl+click opens it
+(never a plain click). `o` opens the first one on screen and says how many
+there were; in the clipboard picker, where letters type, it is `Ctrl-o` and
+reads the whole buffer. Only http(s) URLs are linked or opened, and over SSH
+nothing is opened, since the browser would start on the remote host. Behind
+tmux, links need `set -as terminal-features '*:hyperlinks'` (tmux 3.4+).
 
 Reloads, previews and every command that changes tmux run off the input
 thread. Navigation and `Esc` keep answering while a restore brings windows up;
