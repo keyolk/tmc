@@ -10,6 +10,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use unicode_width::UnicodeWidthStr;
 
 use super::model::{ActionKind, Model};
+use super::split::Action as SplitAction;
 
 /// A key as the table names it: modifiers folded in, Shift spelled by case.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -153,6 +154,7 @@ pub enum Cmd {
     CloseMenu,
     Run(ActionKind),
     Reload,
+    OpenLink,
     Help,
     CloseHelp,
     HelpDown,
@@ -162,6 +164,8 @@ pub enum Cmd {
     Confirm,
     CancelMove,
     FilterOff,
+    /// Move the tree | detail divider.
+    Split(SplitAction),
     NamePop,
     CreateSession,
     CancelName,
@@ -255,6 +259,8 @@ pub static BINDINGS: &[Binding] = &[
     b(Ctx::Tree, Key::Left, Cmd::Collapse, Hidden, "", "hide the window's panes"),
     b(Ctx::Tree, C('s'), Cmd::Save, Group(4), "save", "save a restore point"),
     b(Ctx::Tree, C('n'), Cmd::NextWaiting, Group(4), "waiting", "next window waiting for you"),
+    // `o` is the fleet's open-link key (tui-design E11).
+    b(Ctx::Tree, C('o'), Cmd::OpenLink, Group(5), "open link", "open the first link in the output on screen"),
     b(Ctx::Tree, C('p'), Cmd::PointNext, Group(6), "point", "older restore point"),
     b(Ctx::Tree, C('P'), Cmd::PointPrev, Group(6), "point", "newer restore point"),
     b(Ctx::Tree, C('c'), Cmd::ClearMarks, Hidden, "", "clear the marks"),
@@ -263,6 +269,11 @@ pub static BINDINGS: &[Binding] = &[
     b(Ctx::Tree, C('G'), Cmd::Bottom, Hidden, "", "last row"),
     b(Ctx::Tree, Key::End, Cmd::Bottom, Hidden, "", "last row"),
     b(Ctx::Tree, C('R'), Cmd::Reload, Hidden, "", "re-read tmux now"),
+    // The split, last: resizing is rare next to everything above. Shrink
+    // before grow so the hint reads `</>/=` in the order of the keyboard.
+    b(Ctx::Tree, C('<'), Cmd::Split(SplitAction::Shrink), Group(7), "split", "narrow the tree"),
+    b(Ctx::Tree, C('>'), Cmd::Split(SplitAction::Grow), Group(7), "split", "widen the tree"),
+    b(Ctx::Tree, C('='), Cmd::Split(SplitAction::Reset), Group(7), "split", "reset the tree | detail split"),
     b(Ctx::Tree, C('?'), Cmd::Help, Pinned, "help", "this help"),
     // Esc pops one level: the pane-move choice, then the search line, then
     // the app. Doing nothing at the root would make the key that got you out
@@ -558,5 +569,26 @@ mod tests {
         assert!(f.contains("j/k move"), "{f}");
         assert!(f.contains("p/P point"), "{f}");
         assert!(f.ends_with("? help   esc/q quit"), "{f}");
+        assert!(f.contains("</>/= split"), "{f}");
+    }
+
+    #[test]
+    fn the_split_keys_are_the_last_hint_group_and_in_help() {
+        // Dropped first on a narrow row: the commands above matter more.
+        let m = Model::new(Vec::new());
+        let narrow = footer(Ctx::Tree, &m, 100);
+        assert!(!narrow.contains("split"), "{narrow}");
+        let tree = help_lines(true)
+            .into_iter()
+            .find(|(t, _)| t == "tree")
+            .unwrap()
+            .1;
+        for help in [
+            "narrow the tree",
+            "widen the tree",
+            "reset the tree | detail split",
+        ] {
+            assert!(tree.iter().any(|(_, h)| h == help), "{help} not in help");
+        }
     }
 }

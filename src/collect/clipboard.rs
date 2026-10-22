@@ -77,6 +77,13 @@ fn collapse(sample: &str) -> String {
     out.trim_end().to_string()
 }
 
+/// A buffer's whole text. The listing's sample is cut at 200 characters and
+/// shows newlines as `\n`, so a URL read from it can be cut or run into the
+/// next line.
+pub fn content(buffer: &str) -> Result<String> {
+    cmd::run("tmux", &["show-buffer", "-b", buffer], cmd::FAST)
+}
+
 /// Paste a buffer into a pane.
 pub fn paste(buffer: &str, target: &str) -> Result<()> {
     cmd::run(

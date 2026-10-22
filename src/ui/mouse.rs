@@ -32,7 +32,7 @@ pub fn handle(model: &mut Model, event: MouseEvent, area: Rect) -> Effect {
         return menu(model, event.kind, point, area);
     }
 
-    let regions = render::regions(area);
+    let regions = render::regions(area, &model.split);
     if regions.header.contains(point.into()) {
         return match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
@@ -127,7 +127,7 @@ fn select_tree(model: &mut Model, row: u16, tree: Rect) -> bool {
 }
 
 fn help(model: &mut Model, kind: MouseEventKind, point: (u16, u16), area: Rect) -> Effect {
-    let body = render::regions(area).body;
+    let body = render::regions(area, &model.split).body;
     let box_area = render::help_area(body, &model.theme);
     match kind {
         MouseEventKind::ScrollDown if box_area.contains(point.into()) => {
@@ -145,7 +145,7 @@ fn help(model: &mut Model, kind: MouseEventKind, point: (u16, u16), area: Rect) 
 }
 
 fn menu(model: &mut Model, kind: MouseEventKind, point: (u16, u16), area: Rect) -> Effect {
-    let body = render::regions(area).body;
+    let body = render::regions(area, &model.split).body;
     let box_area = render::menu_area(body, model);
     if matches!(kind, MouseEventKind::Down(MouseButton::Left)) && !box_area.contains(point.into()) {
         model.menu = false;
@@ -208,7 +208,7 @@ mod tests {
     fn a_tree_click_selects_the_row_under_it() {
         let mut m = model();
         let area = Rect::new(0, 0, 80, 20);
-        let tree = render::regions(area).tree;
+        let tree = render::regions(area, &m.split).tree;
         handle(
             &mut m,
             event(MouseEventKind::Down(MouseButton::Left), 2, tree.y + 4),
@@ -221,7 +221,7 @@ mod tests {
     fn the_wheel_moves_three_rows_only_over_the_tree() {
         let mut m = model();
         let area = Rect::new(0, 0, 100, 20);
-        let regions = render::regions(area);
+        let regions = render::regions(area, &m.split);
         handle(
             &mut m,
             event(MouseEventKind::ScrollDown, 2, regions.tree.y + 1),
@@ -252,7 +252,7 @@ mod tests {
         );
         m.cursor = 1;
         let area = Rect::new(0, 0, 80, 20);
-        let tree = render::regions(area).tree;
+        let tree = render::regions(area, &m.split).tree;
         handle(
             &mut m,
             event(MouseEventKind::Down(MouseButton::Right), 2, tree.y),
@@ -271,7 +271,7 @@ mod tests {
             (1..=50).map(|i| format!("line {i}\n")).collect(),
         ));
         let area = Rect::new(0, 0, 100, 20);
-        let detail = render::regions(area).detail;
+        let detail = render::regions(area, &m.split).detail;
         let preview = render::detail_preview_area(detail, &m);
         let point = (preview.x + 1, preview.y + 1);
         handle(
@@ -301,7 +301,7 @@ mod tests {
             destination: Some("s:1".into()),
         });
         let area = Rect::new(0, 0, 80, 20);
-        let tree = render::regions(area).tree;
+        let tree = render::regions(area, &m.split).tree;
         handle(
             &mut m,
             event(MouseEventKind::Down(MouseButton::Left), 2, tree.y),
@@ -325,7 +325,7 @@ mod tests {
             destination: None,
         });
         let area = Rect::new(0, 0, 80, 20);
-        let tree = render::regions(area).tree;
+        let tree = render::regions(area, &m.split).tree;
         handle(
             &mut m,
             event(MouseEventKind::Down(MouseButton::Right), 2, tree.y + 1),
@@ -345,7 +345,7 @@ mod tests {
         let mut m = model();
         m.help = true;
         let area = Rect::new(0, 0, 100, 20);
-        let help = render::help_area(render::regions(area).body, &m.theme);
+        let help = render::help_area(render::regions(area, &m.split).body, &m.theme);
         handle(
             &mut m,
             event(MouseEventKind::ScrollDown, help.x + 1, help.y + 1),
@@ -360,7 +360,7 @@ mod tests {
         let mut m = model();
         m.menu = true;
         let area = Rect::new(0, 0, 100, 30);
-        let menu = render::menu_area(render::regions(area).body, &m);
+        let menu = render::menu_area(render::regions(area, &m.split).body, &m);
         handle(
             &mut m,
             event(

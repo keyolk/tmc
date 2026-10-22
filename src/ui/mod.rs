@@ -7,12 +7,19 @@
 pub mod app;
 pub mod clipboard;
 mod commands;
+mod drag;
 mod guard;
 pub mod keys;
+mod link;
 pub mod model;
 mod mouse;
+mod preview_links;
 pub mod render;
+mod selection;
 pub mod snapshot;
+mod split;
+#[cfg(test)]
+mod split_tests;
 pub mod state;
 pub mod status;
 pub mod theme;

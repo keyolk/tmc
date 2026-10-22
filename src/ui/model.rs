@@ -342,6 +342,16 @@ pub struct Model {
     /// not depend on the developer's `NO_COLOR` or locale; the entry points
     /// replace it with `Theme::detect()`.
     pub theme: super::theme::Theme,
+    /// The mouse drag selection, drawn over the frame until the next press
+    /// or key.
+    pub selection: super::selection::Selection,
+    /// The size of the last frame, so a key can act on what was on screen
+    /// (`o` opens a link the preview showed, not one scrolled out of it).
+    pub screen: ratatui::layout::Rect,
+    /// Opens a URL in the browser; tests put a recorder here.
+    pub launcher: super::link::Launcher,
+    /// The tree | detail boundary, which `<` `>` `=` and a divider drag move.
+    pub split: super::split::Split,
 }
 
 impl Model {
@@ -371,7 +381,11 @@ impl Model {
             expanded: std::collections::HashSet::new(),
             preview: None,
             preview_scroll: 0,
+            selection: Default::default(),
             theme: super::theme::Theme::default(),
+            screen: ratatui::layout::Rect::default(),
+            launcher: super::link::DEFAULT,
+            split: super::render::tree_split(),
         }
     }
 
