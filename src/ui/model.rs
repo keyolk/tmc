@@ -153,6 +153,33 @@ impl PendingMove {
     }
 }
 
+/// Windows waiting for the user to choose the session they go to.
+///
+/// Only opened with three or more sessions running: with two the other one is
+/// the only answer, and `x s` stays a single keystroke.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PendingSend {
+    /// `session:index` of each window, resolved when `x s` was pressed.
+    pub windows: Vec<String>,
+    /// The sessions on offer, in tree order.
+    pub sessions: Vec<String>,
+    pub selected: usize,
+}
+
+impl PendingSend {
+    pub fn destination(&self) -> Option<&str> {
+        self.sessions.get(self.selected).map(String::as_str)
+    }
+
+    /// Move the choice, wrapping at both ends.
+    pub fn step(&mut self, delta: isize) {
+        let n = self.sessions.len() as isize;
+        if n > 0 {
+            self.selected = (self.selected as isize + delta).rem_euclid(n) as usize;
+        }
+    }
+}
+
 /// A window- or pane-level tmux command, reached through the `x` menu.
 ///
 /// The variants are what `app` matches on, so the menu and the dispatch come
@@ -243,15 +270,15 @@ pub fn actions(model: &Model) -> Vec<Action> {
                 merging >= 2,
             ),
             ActionKind::Send => (
-                if windows > 0 && model.live_sessions() != 2 {
-                    match model.live_sessions() {
-                        0 | 1 => "no other session".to_string(),
-                        n => format!("{n} sessions, ambiguous"),
-                    }
-                } else {
-                    windows_detail.clone()
+                match live_sessions {
+                    _ if windows == 0 => windows_detail.clone(),
+                    0 | 1 => "no other session".to_string(),
+                    2 => windows_detail.clone(),
+                    // More than one possible destination: the next step asks
+                    // which, and the detail says so before the key is pressed.
+                    _ => format!("{windows_detail}, pick session"),
                 },
-                windows > 0 && model.live_sessions() == 2,
+                windows > 0 && live_sessions >= 2,
             ),
             ActionKind::Kill => (windows_detail.clone(), windows > 0),
             ActionKind::NewSession => ("type a name".to_string(), true),
@@ -308,6 +335,8 @@ pub struct Model {
     pub menu: bool,
     /// The name being typed for a new session, while `x n` waits for Enter.
     pub naming: Option<String>,
+    /// Set after `x s` with three or more sessions, until one is chosen.
+    pub pending_send: Option<PendingSend>,
     /// True while the `?` overlay is up, and how far it is scrolled.
     pub help: bool,
     pub help_scroll: usize,
@@ -370,6 +399,7 @@ impl Model {
             pending_move: None,
             menu: false,
             naming: None,
+            pending_send: None,
             help: false,
             help_scroll: 0,
             busy: None,
@@ -930,6 +960,27 @@ impl Model {
             0 => usize::from(self.current_window().is_some_and(|w| !w.gone)),
             n => n,
         }
+    }
+
+    /// Whether a floating box is up that owns the keys and the mouse, and
+    /// names what it acts on. Polling waits while one is: a reload landing
+    /// between the prompt and the key would change what the key acts on.
+    pub fn overlay(&self) -> bool {
+        self.menu || self.pending_send.is_some()
+    }
+
+    /// Running sessions, once each, in tree order.
+    pub fn live_session_names(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for row in &self.rows {
+            if let Row::Window(w) = row
+                && !w.gone
+                && !out.contains(&w.session)
+            {
+                out.push(w.session.clone());
+            }
+        }
+        out
     }
 
     /// Sessions with at least one window still running.
