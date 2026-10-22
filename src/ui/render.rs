@@ -203,8 +203,11 @@ fn render_menu(frame: &mut Frame, body: Rect, model: &Model) {
 /// so the title has to as well or the box would name a window it will not
 /// touch.
 fn menu_target(model: &Model) -> String {
-    let (windows, panes) = model.mark_counts();
+    let (windows, panes, sessions) = model.mark_counts();
     let mut parts = Vec::new();
+    if sessions > 0 {
+        parts.push(format!("{sessions} session{}", plural(sessions)));
+    }
     if windows > 0 {
         parts.push(format!("{windows} window{}", plural(windows)));
     }
@@ -217,7 +220,10 @@ fn menu_target(model: &Model) -> String {
     match (model.current_pane(), model.current_window()) {
         (Some(p), _) => p.target().to_string(),
         (None, Some(w)) => format!("{}  {}", w.target(), w.name),
-        _ => "nothing selected".to_string(),
+        _ => match model.current_header() {
+            Some(name) => format!("session {name}"),
+            None => "nothing selected".to_string(),
+        },
     }
 }
 
@@ -284,7 +290,10 @@ fn render_header(frame: &mut Frame, area: Rect, model: &Model, now_secs: u64) {
     // Windows and panes are marked with the same key but act differently —
     // `M` merges the windows, `J` moves the panes — so the header counts them
     // apart rather than reporting one number for two selections.
-    let (windows_marked, panes_marked) = model.mark_counts();
+    let (windows_marked, panes_marked, sessions_marked) = model.mark_counts();
+    if sessions_marked > 0 {
+        summary.push(Span::raw(format!("  {sessions_marked} sessions marked")));
+    }
     if windows_marked > 0 {
         summary.push(Span::raw(format!("  {windows_marked} marked")));
     }
@@ -366,13 +375,36 @@ fn render_row<'a>(row: &'a Row, selected: bool, model: &Model, width: usize) -> 
     let t = &model.theme;
     let ell = t.glyphs.ellipsis;
     match row {
-        Row::Session { name, windows } => Line::from(vec![
-            Span::styled(
-                format!("{} {name}", t.glyphs.session),
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("  {windows}w"), t.subtle()),
-        ]),
+        Row::Session { name, windows } => {
+            // The same two leading columns as a window row: the header is
+            // selectable now, and a cursor or mark drawn anywhere else would
+            // read as a different convention.
+            let cursor = if selected { '>' } else { ' ' };
+            let mark = if model.marks.contains(&super::model::session_mark(name)) {
+                '#'
+            } else {
+                ' '
+            };
+            let style = Style::default().add_modifier(Modifier::BOLD);
+            let mut spans = vec![
+                Span::raw(format!("{cursor}{mark}")),
+                Span::styled(
+                    format!("{} {name}", t.glyphs.session),
+                    if selected {
+                        t.selected().patch(style)
+                    } else {
+                        style
+                    },
+                ),
+                Span::styled(format!("  {windows}w"), t.subtle()),
+            ];
+            // A session only the point has: every window in it is gone, and
+            // the header is what `r` restores it by.
+            if !model.session_is_live(name) {
+                spans.push(Span::styled("  not running", style_for(t, Change::Removed)));
+            }
+            Line::from(spans)
+        }
         Row::Pane(p) => {
             // Indented under its window, addressed by pane id — that is what
             // the pane commands take, and showing it makes the target of
@@ -478,6 +510,10 @@ pub(super) fn detail_preview_area(area: Rect, model: &Model) -> Rect {
 
 fn render_detail(frame: &mut Frame, area: Rect, model: &Model) {
     let t = &model.theme;
+    if let Some(name) = model.current_header() {
+        render_session_detail(frame, area, model, name);
+        return;
+    }
     let Some(w) = model.current_window() else {
         frame.render_widget(
             Paragraph::new(Line::styled("select a window", t.subtle())),
@@ -537,6 +573,56 @@ fn render_detail(frame: &mut Frame, area: Rect, model: &Model) {
     frame.render_widget(Paragraph::new(head), head_area);
 
     render_preview(frame, preview, model, w);
+}
+
+/// A session header's panel: what the session holds and what the session
+/// commands would do with it.
+fn render_session_detail(frame: &mut Frame, area: Rect, model: &Model, name: &str) {
+    let t = &model.theme;
+    let windows: Vec<&super::model::WindowRow> = model
+        .rows
+        .iter()
+        .filter_map(|r| match r {
+            Row::Window(w) if w.session == name => Some(w),
+            _ => None,
+        })
+        .collect();
+    let gone = windows.iter().filter(|w| w.gone).count();
+    let live = windows.len() - gone;
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            name.to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled("session", t.subtle()),
+    ])];
+    lines.push(Line::raw(format!("  {live} window(s) running")));
+    if gone > 0 {
+        lines.push(Line::styled(
+            format!("  {gone} only in the restore point"),
+            style_for(t, Change::Removed),
+        ));
+    }
+    lines.push(Line::raw(""));
+    // One command per line: the panel is narrow in a popup, and a hint cut
+    // mid-sentence is the part nobody reads.
+    let hints: &[&str] = if live == 0 {
+        &["space  mark it", "r      restore it"]
+    } else if gone > 0 {
+        &[
+            "space  mark it",
+            "r      restore what is missing",
+            "x d    close it",
+        ]
+    } else {
+        &["enter  switch to it", "x d    close it"]
+    };
+    for hint in hints {
+        lines.push(Line::styled(format!("  {hint}"), t.subtle()));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// What the window is showing right now.
@@ -627,6 +713,16 @@ fn render_keys(frame: &mut Frame, area: Rect, model: &Model) {
     // live: while the menu is up its letters mean the menu's commands, and
     // leaving the tree's hints on screen would advertise `j/k move` at the
     // moment `j` joins panes into a window.
+    if let Some(name) = &model.naming {
+        let what = format!("new session: {name}{}", t.glyphs.caret);
+        let room = width.saturating_sub(what.width() + 3);
+        let text = format!("{what}   {}", keys::footer(ctx, model, room));
+        frame.render_widget(
+            Paragraph::new(truncate(&text, width, ell)).style(t.accent()),
+            area,
+        );
+        return;
+    }
     if let Some(moving) = &model.pending_move {
         let what = match moving.panes.as_slice() {
             [(pane, from)] => format!("moving {pane} from {from}"),

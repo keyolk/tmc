@@ -100,6 +100,8 @@ pub enum Ctx {
     Move,
     /// Typing a filter while choosing that window: letters type.
     MoveSearch,
+    /// Typing the name of a new session: letters type.
+    Name,
     /// The `?` overlay.
     Help,
 }
@@ -107,7 +109,7 @@ pub enum Ctx {
 impl Ctx {
     /// Whether unbound printable keys are input rather than ignored.
     pub fn types(self) -> bool {
-        matches!(self, Ctx::Search | Ctx::MoveSearch)
+        matches!(self, Ctx::Search | Ctx::MoveSearch | Ctx::Name)
     }
 
     fn title(self) -> &'static str {
@@ -118,6 +120,7 @@ impl Ctx {
             Ctx::Menu => "x menu",
             Ctx::Move => "choosing a destination",
             Ctx::MoveSearch => "filtering destinations",
+            Ctx::Name => "naming a new session",
             Ctx::Help => "this help",
         }
     }
@@ -159,6 +162,9 @@ pub enum Cmd {
     Confirm,
     CancelMove,
     FilterOff,
+    NamePop,
+    CreateSession,
+    CancelName,
 }
 
 /// Where a binding sits in the hint row.
@@ -236,10 +242,10 @@ pub static BINDINGS: &[Binding] = &[
     // rearranges tmux, and the menu behind it is self-describing, so one
     // short word is enough. At 80 columns this group and `? help` are what
     // survive; the help names everything the row had to drop.
-    b(Ctx::Tree, C('x'), Cmd::Menu, Group(1), "menu", "window and pane commands"),
-    b(Ctx::Tree, C(' '), Cmd::Mark, Group(2), "mark", "mark the window or pane"),
+    b(Ctx::Tree, C('x'), Cmd::Menu, Group(1), "menu", "session, window and pane commands"),
+    b(Ctx::Tree, C(' '), Cmd::Mark, Group(2), "mark", "mark the session, window or pane"),
     b(Ctx::Tree, C('a'), Cmd::MarkAll, Group(2), "all", "mark every changed window"),
-    b(Ctx::Tree, C('r'), Cmd::Restore, Group(2), "restore", "restore the marked windows, or every missing one"),
+    b(Ctx::Tree, C('r'), Cmd::Restore, Group(2), "restore", "restore the marked sessions and windows, or every missing one"),
     // Expanding comes before the rarer commands: it is how you reach a pane
     // at all, and a hint that drops it first leaves the pane commands looking
     // like they act on nothing.
@@ -272,6 +278,9 @@ pub static BINDINGS: &[Binding] = &[
     // The prefix again is the old `x`, which alone used to close a window:
     // the muscle memory still works, in two keystrokes rather than one.
     b(Ctx::Menu, C('x'), Cmd::Run(ActionKind::Kill), Hidden, "", "close (x x)"),
+    // Sessions after windows: rarer, and closing one takes every window in it.
+    b(Ctx::Menu, C('n'), Cmd::Run(ActionKind::NewSession), Hidden, "", "new session"),
+    b(Ctx::Menu, C('d'), Cmd::Run(ActionKind::KillSession), Hidden, "", "close session"),
     b(Ctx::Menu, Key::Esc, Cmd::CloseMenu, Pinned, "cancel", "close the menu"),
     // --- choosing where a pane move lands.
     b(Ctx::Move, C('j'), Cmd::DestDown, Group(1), "window", "next window"),
@@ -291,6 +300,10 @@ pub static BINDINGS: &[Binding] = &[
     b(Ctx::MoveSearch, Key::Backspace, Cmd::SearchPop, Hidden, "", "delete a character"),
     b(Ctx::MoveSearch, Key::Tab, Cmd::FilterOff, Hidden, "", "stop filtering"),
     b(Ctx::MoveSearch, Key::Esc, Cmd::FilterOff, Pinned, "filter off", "stop filtering"),
+    // --- naming a new session.
+    b(Ctx::Name, Key::Enter, Cmd::CreateSession, Group(1), "create", "create the session"),
+    b(Ctx::Name, Key::Backspace, Cmd::NamePop, Hidden, "", "delete a character"),
+    b(Ctx::Name, Key::Esc, Cmd::CancelName, Pinned, "cancel", "cancel"),
     // --- help.
     b(Ctx::Help, C('?'), Cmd::CloseHelp, Hidden, "", "close"),
     b(Ctx::Help, C('q'), Cmd::CloseHelp, Hidden, "", "close"),
@@ -306,6 +319,8 @@ pub static BINDINGS: &[Binding] = &[
 pub fn context(model: &Model) -> Ctx {
     if model.help {
         Ctx::Help
+    } else if model.naming.is_some() {
+        Ctx::Name
     } else if model.pending_move.is_some() {
         if model.searching {
             Ctx::MoveSearch
@@ -410,6 +425,7 @@ pub fn help_lines(glyphs: bool) -> Vec<(String, Vec<(String, String)>)> {
         Ctx::Menu,
         Ctx::Move,
         Ctx::MoveSearch,
+        Ctx::Name,
         Ctx::Global,
     ]
     .into_iter()
@@ -450,13 +466,14 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    const ALL: [Ctx; 7] = [
+    const ALL: [Ctx; 8] = [
         Ctx::Global,
         Ctx::Search,
         Ctx::Tree,
         Ctx::Menu,
         Ctx::Move,
         Ctx::MoveSearch,
+        Ctx::Name,
         Ctx::Help,
     ];
 
@@ -507,7 +524,7 @@ mod tests {
     fn text_contexts_bind_no_printable_letters() {
         // Letters type there; a bound one would be a letter you cannot search
         // for.
-        for ctx in [Ctx::Search, Ctx::MoveSearch] {
+        for ctx in [Ctx::Search, Ctx::MoveSearch, Ctx::Name] {
             for b in rows(ctx) {
                 assert!(!matches!(b.key, Key::Char(_)), "{:?} in {ctx:?}", b.key);
             }
@@ -531,7 +548,7 @@ mod tests {
         let rows = menu_rows();
         let kinds: HashSet<_> = rows.iter().map(|(k, _, _)| format!("{k:?}")).collect();
         assert_eq!(kinds.len(), rows.len());
-        assert_eq!(rows.len(), 5);
+        assert_eq!(rows.len(), 7);
     }
 
     #[test]

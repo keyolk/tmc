@@ -18,7 +18,9 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use super::commands::{cancel_move, confirm_move, restore_marked, run_action, save_point};
+use super::commands::{
+    cancel_move, confirm_move, create_session, restore_marked, run_action, save_point,
+};
 use super::keys::{self, Cmd, Ctx, Key};
 use super::model::{Model, actions};
 use super::state;
@@ -505,6 +507,11 @@ pub(super) fn handle_key(model: &mut Model, code: KeyCode, mods: KeyModifiers) -
 fn unbound(model: &mut Model, ctx: Ctx, key: Key) {
     match (ctx, key) {
         (Ctx::Search, Key::Char(c)) => model.search_push(c),
+        (Ctx::Name, Key::Char(c)) => {
+            if let Some(name) = &mut model.naming {
+                name.push(c);
+            }
+        }
         (Ctx::MoveSearch, Key::Char(c)) => {
             model.search_push(c);
             // The filter moved the rows under the cursor; land it back on a
@@ -529,7 +536,10 @@ fn uses_worker(cmd: Cmd) -> bool {
         Cmd::Save
             | Cmd::Restore
             | Cmd::Confirm
-            | Cmd::Run(ActionKind::Break | ActionKind::Send | ActionKind::Kill)
+            | Cmd::CreateSession
+            | Cmd::Run(
+                ActionKind::Break | ActionKind::Send | ActionKind::Kill | ActionKind::KillSession
+            )
     )
 }
 
@@ -571,7 +581,17 @@ pub(super) fn run_cmd(model: &mut Model, cmd: Cmd) -> Effect {
         }
         Cmd::Switch => {
             model.searching = false;
-            if let Some(w) = model.current_window() {
+            if let Some(name) = model.current_header() {
+                if model.session_is_live(name) {
+                    // `name:` is the session's current window, which is what
+                    // switching to a session means.
+                    model.switch_to = Some(format!("{name}:"));
+                } else {
+                    model
+                        .status
+                        .warn("that session is not running — space marks it, r restores it");
+                }
+            } else if let Some(w) = model.current_window() {
                 if w.gone {
                     // Nothing to switch to; the window only exists in the point.
                     model
@@ -623,6 +643,13 @@ pub(super) fn run_cmd(model: &mut Model, cmd: Cmd) -> Effect {
         }
         Cmd::Confirm => return job(confirm_move(model)),
         Cmd::CancelMove => cancel_move(model),
+        Cmd::NamePop => {
+            if let Some(name) = &mut model.naming {
+                name.pop();
+            }
+        }
+        Cmd::CreateSession => return job(create_session(model)),
+        Cmd::CancelName => model.naming = None,
     }
     Effect::None
 }
@@ -1449,5 +1476,152 @@ mod tests {
         press(&mut m, 'j', KeyModifiers::NONE);
         assert!(m.search_selected);
         assert_eq!(m.search, "foo");
+    }
+
+    /// `alpha` running with one window gone, `beta` running, `gamma` only in
+    /// the point.
+    fn model_with_sessions() -> Model {
+        let win = |session: &str, index: u32, gone: bool| {
+            Row::Window(WindowRow {
+                session: session.into(),
+                index,
+                name: format!("{session}{index}"),
+                panes: 1,
+                state: String::new(),
+                cc_session: String::new(),
+                waiting: false,
+                running_claude: false,
+                change: if gone { Change::Removed } else { Change::Same },
+                reasons: Vec::new(),
+                gone,
+            })
+        };
+        let header = |name: &str, windows: usize| Row::Session {
+            name: name.into(),
+            windows,
+        };
+        let mut m = Model::new(Vec::new());
+        m.rows = vec![
+            header("alpha", 2),
+            win("alpha", 1, false),
+            win("alpha", 2, true),
+            header("beta", 1),
+            win("beta", 1, false),
+            header("gamma", 2),
+            win("gamma", 1, true),
+            win("gamma", 2, true),
+        ];
+        m
+    }
+
+    #[test]
+    fn r_restores_marked_sessions_and_windows_together() {
+        use crate::ui::commands::restore_targets;
+        let mut m = model_with_sessions();
+        m.marks.insert("=gamma".into());
+        m.marks.insert("alpha:2".into());
+        // Running: a point index names whatever is there now, so recreating
+        // it would double the window.
+        m.marks.insert("beta:1".into());
+
+        let (targets, running) = restore_targets(&m);
+        assert_eq!(targets, vec!["alpha:2", "gamma:1", "gamma:2"]);
+        assert_eq!(running, 1);
+    }
+
+    #[test]
+    fn r_with_nothing_marked_restores_every_missing_window() {
+        use crate::ui::commands::restore_targets;
+        let m = model_with_sessions();
+        let (targets, running) = restore_targets(&m);
+        assert_eq!(targets, vec!["alpha:2", "gamma:1", "gamma:2"]);
+        assert_eq!(running, 0);
+    }
+
+    #[test]
+    fn space_on_a_header_marks_the_whole_session() {
+        let mut m = model_with_sessions();
+        m.cursor = 5; // gamma's header
+        press(&mut m, ' ', KeyModifiers::NONE);
+        assert!(m.marks.contains("=gamma"), "marks: {:?}", m.marks);
+    }
+
+    #[test]
+    fn closing_a_session_is_refused_when_it_is_the_last_one() {
+        // tmux exits with its last session, and the popup goes with it.
+        let mut m = model_with_window();
+        press(&mut m, 'x', KeyModifiers::NONE);
+        press(&mut m, 'd', KeyModifiers::NONE);
+        assert!(m.busy.is_none());
+        assert!(m.status.contains("every session"), "status: {}", m.status);
+
+        let mut m = model_with_sessions();
+        m.cursor = 0;
+        let close = |m: &Model| {
+            actions(m)
+                .into_iter()
+                .find(|a| a.kind == ActionKind::KillSession)
+                .unwrap()
+        };
+        assert!(close(&m).enabled, "{}", close(&m).detail);
+        assert_eq!(close(&m).detail, "1 session");
+
+        m.marks.insert("=alpha".into());
+        m.marks.insert("=beta".into());
+        assert!(!close(&m).enabled);
+    }
+
+    #[test]
+    fn naming_a_session_takes_every_letter_and_esc_cancels() {
+        let mut m = model_with_sessions();
+        m.cursor = 1;
+        press(&mut m, 'x', KeyModifiers::NONE);
+        press(&mut m, 'n', KeyModifiers::NONE);
+        assert_eq!(m.naming.as_deref(), Some(""));
+
+        // Letters that are commands in the tree type here instead.
+        for c in "qjx?".chars() {
+            press(&mut m, c, KeyModifiers::NONE);
+        }
+        let _ = handle_key(&mut m, KeyCode::Backspace, KeyModifiers::NONE);
+        assert_eq!(m.naming.as_deref(), Some("qjx"));
+        assert!(!m.quit && !m.menu && !m.help);
+
+        let _ = handle_key(&mut m, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(m.naming.is_none());
+        assert!(!m.quit, "Esc cancels the name, not the program");
+    }
+
+    #[test]
+    fn a_session_name_tmux_would_rewrite_or_that_exists_is_refused() {
+        let mut m = model_with_sessions();
+        for (name, why) in [
+            ("a:b", "cannot contain"),
+            ("beta", "already exists"),
+            ("", "type a name"),
+        ] {
+            m.naming = Some(name.into());
+            assert!(create_session(&mut m).is_none(), "{name}");
+            assert!(m.status.contains(why), "{name}: {}", m.status);
+            assert!(m.naming.is_some(), "the prompt stays up to be corrected");
+        }
+        // A name only the point has is free: that session is not running.
+        m.naming = Some("gamma".into());
+        assert!(create_session(&mut m).is_some());
+        assert!(m.naming.is_none());
+    }
+
+    #[test]
+    fn enter_on_a_header_switches_to_the_session() {
+        let mut m = model_with_sessions();
+        m.cursor = 3; // beta
+        let _ = handle_key(&mut m, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(m.switch_to.as_deref(), Some("beta:"));
+
+        let mut m = model_with_sessions();
+        m.cursor = 5; // gamma, not running
+        let _ = handle_key(&mut m, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(m.switch_to, None);
+        assert!(m.status.contains("not running"), "{}", m.status);
     }
 }

@@ -13,7 +13,8 @@ use crate::layout::{Session, point};
 /// One line in the tree.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Row {
-    /// A session header. Not selectable for restore.
+    /// A session header. Selectable: it is what the session commands act
+    /// on, and marking it selects the whole session for `r`.
     Session {
         name: String,
         windows: usize,
@@ -165,6 +166,15 @@ pub enum ActionKind {
     Merge,
     Send,
     Kill,
+    NewSession,
+    KillSession,
+}
+
+/// The mark key for a whole session: tmux's exact-match target syntax, so it
+/// cannot collide with a window (`name:index`) or a pane (`%N`) and is the
+/// target `kill-session` takes as it is.
+pub fn session_mark(name: &str) -> String {
+    format!("={name}")
 }
 
 /// One row of the `x` menu.
@@ -196,6 +206,8 @@ pub fn actions(model: &Model) -> Vec<Action> {
         .filter(|r| matches!(r, Row::Window(w) if !w.gone))
         .count();
     let merging = model.marked_live_windows().len();
+    let sessions = model.selected_sessions().len();
+    let live_sessions = model.live_sessions();
 
     // The details are right-aligned against the menu's border, so they keep
     // to ASCII punctuation: `—` is East Asian Ambiguous and on a CJK terminal
@@ -242,6 +254,15 @@ pub fn actions(model: &Model) -> Vec<Action> {
                 windows > 0 && model.live_sessions() == 2,
             ),
             ActionKind::Kill => (windows_detail.clone(), windows > 0),
+            ActionKind::NewSession => ("type a name".to_string(), true),
+            // tmux exits with its last session, taking this popup with it;
+            // that is quitting tmux, not closing a session.
+            ActionKind::KillSession => match sessions {
+                0 => ("needs a running session".to_string(), false),
+                n if n >= live_sessions => ("would close every session".to_string(), false),
+                1 => ("1 session".to_string(), true),
+                n => (format!("{n} sessions"), true),
+            },
         }
     };
 
@@ -285,6 +306,8 @@ pub struct Model {
     pub pending_move: Option<PendingMove>,
     /// True while the `x` menu is open and waiting for the second key.
     pub menu: bool,
+    /// The name being typed for a new session, while `x n` waits for Enter.
+    pub naming: Option<String>,
     /// True while the `?` overlay is up, and how far it is scrolled.
     pub help: bool,
     pub help_scroll: usize,
@@ -336,6 +359,7 @@ impl Model {
             status: super::status::Status::default(),
             pending_move: None,
             menu: false,
+            naming: None,
             help: false,
             help_scroll: 0,
             busy: None,
@@ -474,7 +498,8 @@ impl Model {
             .iter()
             .filter_map(|r| match r {
                 Row::Window(w) => Some(w.target()),
-                _ => None,
+                Row::Session { name, .. } => Some(session_mark(name)),
+                Row::Pane(_) => None,
             })
             .collect();
         self.marks.retain(|mark| {
@@ -523,18 +548,12 @@ impl Model {
         }
         let next = self.cursor as isize + delta;
         self.cursor = next.clamp(0, visible.len() as isize - 1) as usize;
-        self.skip_header(delta.signum());
         self.preview_scroll = 0;
     }
 
-    /// Select one visible row by its on-screen position. Session headers are
-    /// labels and reject the click rather than moving to a neighbour.
+    /// Select one visible row by its on-screen position.
     pub fn select_visible(&mut self, position: usize) -> bool {
-        let visible = self.visible();
-        let Some(&row) = visible.get(position) else {
-            return false;
-        };
-        if matches!(self.rows.get(row), Some(Row::Session { .. })) {
+        if position >= self.visible().len() {
             return false;
         }
         self.cursor = position;
@@ -574,14 +593,12 @@ impl Model {
         self.search.push(c);
         self.cursor = 0;
         self.preview_scroll = 0;
-        self.skip_header(1);
     }
 
     pub fn search_pop(&mut self) {
         self.search.pop();
         self.cursor = 0;
         self.preview_scroll = 0;
-        self.skip_header(1);
     }
 
     /// Drop the whole query — the way out of a long one, and of a query
@@ -590,28 +607,6 @@ impl Model {
         self.search.clear();
         self.cursor = 0;
         self.preview_scroll = 0;
-        self.skip_header(1);
-    }
-
-    /// Session headers are labels, not destinations.
-    fn skip_header(&mut self, direction: isize) {
-        let visible = self.visible();
-        while matches!(
-            self.cursor_row().and_then(|i| self.rows.get(i)),
-            Some(Row::Session { .. })
-        ) {
-            let next = self.cursor as isize + if direction >= 0 { 1 } else { -1 };
-            if next < 0 || next >= visible.len() as isize {
-                // At an edge with a header under the cursor: turn around
-                // rather than sit on an unselectable row.
-                let back = self.cursor as isize - if direction >= 0 { 1 } else { -1 };
-                if back >= 0 && back < visible.len() as isize {
-                    self.cursor = back as usize;
-                }
-                return;
-            }
-            self.cursor = next as usize;
-        }
     }
 
     fn clamp_cursor(&mut self) {
@@ -623,7 +618,6 @@ impl Model {
         if self.cursor >= visible {
             self.cursor = visible - 1;
         }
-        self.skip_header(1);
     }
 
     /// Put the cursor on `target`, e.g. `projects:1`. Returns whether it was
@@ -698,6 +692,65 @@ impl Model {
             Some(Row::Pane(p)) => Some(p),
             _ => None,
         }
+    }
+
+    /// The session header under the cursor, by name.
+    pub fn current_header(&self) -> Option<&str> {
+        match self.cursor_row().and_then(|i| self.rows.get(i)) {
+            Some(Row::Session { name, .. }) => Some(name),
+            _ => None,
+        }
+    }
+
+    /// The session the cursor is in: its header, or the session of the
+    /// window or pane under it.
+    pub fn current_session(&self) -> Option<&str> {
+        match self.cursor_row().and_then(|i| self.rows.get(i))? {
+            Row::Session { name, .. } => Some(name),
+            Row::Window(w) => Some(&w.session),
+            Row::Pane(p) => Some(&p.session),
+        }
+    }
+
+    /// Whether a session has a window running, rather than only in the point.
+    pub fn session_is_live(&self, name: &str) -> bool {
+        self.rows
+            .iter()
+            .any(|r| matches!(r, Row::Window(w) if !w.gone && w.session == name))
+    }
+
+    /// Marked sessions, by name, in tree order.
+    pub fn marked_sessions(&self) -> Vec<String> {
+        self.rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Session { name, .. } if self.marks.contains(&session_mark(name)) => {
+                    Some(name.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The running sessions a session command acts on: the marked ones, or
+    /// the one the cursor is in.
+    ///
+    /// The cursor fallback reaches from a window or pane too, not only from
+    /// the header: "close the session I am looking at" should not first
+    /// require walking up to its label.
+    pub fn selected_sessions(&self) -> Vec<String> {
+        let marked = self.marked_sessions();
+        let chosen = if marked.is_empty() {
+            self.current_session()
+                .map(|s| vec![s.to_string()])
+                .unwrap_or_default()
+        } else {
+            marked
+        };
+        chosen
+            .into_iter()
+            .filter(|s| self.session_is_live(s))
+            .collect()
     }
 
     pub fn current_window(&self) -> Option<&WindowRow> {
@@ -805,6 +858,7 @@ impl Model {
     /// act on all of them at once.
     pub fn toggle_mark(&mut self) {
         let key = match self.cursor_row().and_then(|i| self.rows.get(i)) {
+            Some(Row::Session { name, .. }) => session_mark(name),
             Some(Row::Pane(p)) => p.target().to_string(),
             _ => match self.current_window() {
                 Some(w) => w.target(),
@@ -882,10 +936,11 @@ impl Model {
         seen.len()
     }
 
-    /// How many windows and panes are marked, for the header.
-    pub fn mark_counts(&self) -> (usize, usize) {
+    /// How many windows, panes and sessions are marked, for the header.
+    pub fn mark_counts(&self) -> (usize, usize, usize) {
         let panes = self.marks.iter().filter(|m| m.starts_with('%')).count();
-        (self.marks.len() - panes, panes)
+        let sessions = self.marks.iter().filter(|m| m.starts_with('=')).count();
+        (self.marks.len() - panes - sessions, panes, sessions)
     }
 
     /// Mark every window that differs from the point — the usual intent when
@@ -1283,7 +1338,7 @@ mod tests {
     }
 
     #[test]
-    fn the_cursor_never_rests_on_a_session_header() {
+    fn a_session_header_is_selectable_and_marks_the_session() {
         let mut m = model_with(vec![
             Row::Session {
                 name: "projects".into(),
@@ -1305,7 +1360,76 @@ mod tests {
         ]);
         m.cursor = 0;
         m.move_cursor(0);
-        assert_eq!(m.cursor, 1, "a header is a label, not a destination");
+        assert_eq!(m.cursor, 0, "the header is what session commands act on");
+        assert_eq!(m.current_header(), Some("projects"));
+        assert_eq!(m.current_session(), Some("projects"));
+
+        m.toggle_mark();
+        assert!(m.marks.contains("=projects"), "marks: {:?}", m.marks);
+        assert_eq!(m.mark_counts(), (0, 0, 1));
+        assert_eq!(m.marked_sessions(), vec!["projects".to_string()]);
+    }
+
+    fn session_rows() -> Vec<Row> {
+        let win = |session: &str, index: u32, gone: bool| {
+            Row::Window(WindowRow {
+                session: session.into(),
+                index,
+                name: format!("w{index}"),
+                panes: 1,
+                state: String::new(),
+                cc_session: String::new(),
+                waiting: false,
+                running_claude: false,
+                change: if gone { Change::Removed } else { Change::Same },
+                reasons: Vec::new(),
+                gone,
+            })
+        };
+        vec![
+            Row::Session {
+                name: "alpha".into(),
+                windows: 2,
+            },
+            win("alpha", 1, false),
+            win("alpha", 2, true),
+            Row::Session {
+                name: "beta".into(),
+                windows: 1,
+            },
+            win("beta", 1, false),
+            // Only in the point: the whole session is gone.
+            Row::Session {
+                name: "gamma".into(),
+                windows: 2,
+            },
+            win("gamma", 1, true),
+            win("gamma", 2, true),
+        ]
+    }
+
+    #[test]
+    fn session_commands_fall_back_to_the_cursors_session() {
+        let mut m = model_with(session_rows());
+        m.cursor = 4; // beta:1
+        assert_eq!(m.selected_sessions(), vec!["beta".to_string()]);
+
+        // Marks win over the cursor, and a session that is not running is
+        // nothing to close.
+        m.marks.insert(session_mark("alpha"));
+        m.marks.insert(session_mark("gamma"));
+        assert_eq!(m.selected_sessions(), vec!["alpha".to_string()]);
+        assert_eq!(m.live_sessions(), 2);
+    }
+
+    #[test]
+    fn a_session_mark_survives_a_refresh_while_its_header_is_listed() {
+        let mut m = model_with(session_rows());
+        m.marks.insert(session_mark("gamma"));
+        m.marks.insert(session_mark("vanished"));
+        m.prune_marks(&[]);
+        assert!(m.marks.contains("=gamma"));
+        assert!(!m.marks.contains("=vanished"));
     }
 
     #[test]
@@ -1884,7 +2008,7 @@ mod tests {
             m.marked_live_windows().is_empty(),
             "the window it lives in was not marked"
         );
-        assert_eq!(m.mark_counts(), (0, 1));
+        assert_eq!(m.mark_counts(), (0, 1, 0));
 
         m.toggle_mark();
         assert!(m.marks.is_empty(), "the same key unmarks it");

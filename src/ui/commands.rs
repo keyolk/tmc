@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
-use super::model::{ActionKind, Model, MoveKind, Row, WindowRow};
+use super::model::{ActionKind, Model, MoveKind, Row, WindowRow, session_mark};
 use super::status::{Level, Status};
 use super::worker::{Done, Job};
 use crate::collect::{cmd, proc, tmux};
@@ -36,6 +36,11 @@ pub(super) fn run_action(model: &mut Model, kind: ActionKind) -> Option<Job> {
         }
         ActionKind::Send => move_windows(model),
         ActionKind::Kill => kill_windows(model),
+        ActionKind::NewSession => {
+            model.naming = Some(String::new());
+            None
+        }
+        ActionKind::KillSession => kill_sessions(model),
     }
 }
 
@@ -118,6 +123,47 @@ pub(super) fn save_point() -> Job {
     })
 }
 
+/// The windows `r` would bring back, as `session:index` of the point, and
+/// how many marked windows it leaves alone because they are running.
+///
+/// Only windows that exist solely in the point: the point's index of a live
+/// window names whatever sits there now, and recreating a window that is open
+/// would double it. A marked session stands for every one of its windows the
+/// point has and the server does not — which, for a session that is not
+/// running at all, is the whole session.
+pub(super) fn restore_targets(model: &Model) -> (Vec<String>, usize) {
+    let gone = |w: &WindowRow| w.gone;
+    if model.marks.is_empty() {
+        let all = model
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Window(w) if gone(w) => Some(w.target()),
+                _ => None,
+            })
+            .collect();
+        return (all, 0);
+    }
+    let sessions = model.marked_sessions();
+    let mut targets = Vec::new();
+    let mut running = 0;
+    for row in &model.rows {
+        let Row::Window(w) = row else { continue };
+        let marked = model.marks.contains(&w.target()) || sessions.contains(&w.session);
+        if !marked {
+            continue;
+        }
+        if gone(w) {
+            targets.push(w.target());
+        } else if model.marks.contains(&w.target()) {
+            // A window under a marked session is not counted: marking the
+            // session did not ask for it specifically.
+            running += 1;
+        }
+    }
+    (targets, running)
+}
+
 pub(super) fn restore_marked(model: &mut Model) -> Option<Job> {
     let Some(p) = model.current_point() else {
         model.status.warn("no restore point selected");
@@ -128,24 +174,21 @@ pub(super) fn restore_marked(model: &mut Model) -> Option<Job> {
     // With nothing marked, restore what is missing — the windows the point has
     // and the live server does not. Restoring everything would mean recreating
     // windows that are already open.
-    let targets: Vec<String> = if model.marks.is_empty() {
-        model
-            .rows
-            .iter()
-            .filter_map(|r| match r {
-                Row::Window(w) if w.gone => Some(w.target()),
-                _ => None,
-            })
-            .collect()
-    } else {
-        model.marks.iter().cloned().collect()
-    };
+    let (targets, running) = restore_targets(model);
     if targets.is_empty() {
-        model
-            .status
-            .warn("nothing to restore — mark a window with space");
+        model.status.warn(if running > 0 {
+            "the marked windows are running — r brings back only what is gone"
+        } else if model.marks.is_empty() {
+            "nothing is missing — mark a session or window with space"
+        } else {
+            "nothing marked is missing from the server"
+        });
         return None;
     }
+    // Consumed on success: the windows restored, and the session marks that
+    // selected them. Window marks on running windows were not used and stay.
+    let mut consumed = targets.clone();
+    consumed.extend(model.marked_sessions().iter().map(|s| session_mark(s)));
 
     Some(Job::new("restoring", move || {
         let saved = point::read(&reference)?;
@@ -163,6 +206,7 @@ pub(super) fn restore_marked(model: &mut Model) -> Option<Job> {
         };
         let mut server = restore::Server;
         let mut windows = 0;
+        let mut sessions = 0;
         let mut ran = 0;
         let mut notes = Vec::new();
         for session in &saved {
@@ -174,20 +218,34 @@ pub(super) fn restore_marked(model: &mut Model) -> Option<Job> {
             if indices.is_empty() {
                 continue;
             }
-            let report = restore::session(
+            // One session failing — a path that no longer exists, a name tmux
+            // refuses — must not strand the others behind it: several are
+            // restored in one press now.
+            let report = match restore::session(
                 &mut server,
                 session,
                 restore::Selection {
                     windows: Some(&indices),
+                    // Only windows the server does not have are targeted, so
+                    // adding them to a running session doubles nothing.
+                    append: true,
                 },
                 &autorun,
                 false,
-                // Never forced from the TUI: `r` here restores windows the
-                // point has and the server does not, so there is nothing live
-                // to displace. Closing a running session is a CLI decision,
-                // with the diff and confirmation that come with it.
+                // Never forced from the TUI: closing a running session is a
+                // CLI decision, with the diff and confirmation that come
+                // with it.
                 false,
-            )?;
+            ) {
+                Ok(report) => report,
+                Err(e) => {
+                    notes.push(format!("{}: {e:#}", session.session));
+                    continue;
+                }
+            };
+            if report.windows > 0 {
+                sessions += 1;
+            }
             windows += report.windows;
             ran += report.commands_run;
             notes.extend(report.notes);
@@ -196,19 +254,192 @@ pub(super) fn restore_marked(model: &mut Model) -> Option<Job> {
         Ok(Done::then(move |m: &mut Model| {
             // Only what this restore used: a mark placed while it ran is a
             // new selection, not part of this one.
-            m.unmark(&targets);
+            m.unmark(&consumed);
+            let mut line = format!("restored {windows} window(s)");
+            if sessions > 1 {
+                line.push_str(&format!(" in {sessions} sessions"));
+            }
+            // Worth a word even in a one-line status: the panes that
+            // started on their own are the ones the user did not press a
+            // key for.
+            if ran > 0 {
+                line.push_str(&format!(", ran {ran} command(s)"));
+            }
+            if running > 0 {
+                line.push_str(&format!(", {running} marked already running"));
+            }
             if notes.is_empty() {
-                let mut line = format!("restored {windows} window(s)");
-                // Worth a word even in a one-line status: the panes that
-                // started on their own are the ones the user did not press a
-                // key for.
-                if ran > 0 {
-                    line.push_str(&format!(", ran {ran} command(s)"));
-                }
                 m.status.success(line);
             } else {
-                m.status.warn(notes.join("; "));
+                m.status.warn(format!("{line}; {}", notes.join("; ")));
             }
+        }))
+    }))
+}
+
+/// Create the session whose name was typed after `x n`.
+///
+/// Started in the directory of what the cursor is on, which is usually the
+/// project the new session is for; tmux's own default is wherever the server
+/// was started. Not switched to: the new session appears in the tree with
+/// the cursor on it, and Enter is one key away.
+pub(super) fn create_session(model: &mut Model) -> Option<Job> {
+    let name = model
+        .naming
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        model.status.warn("type a name for the session, or esc");
+        return None;
+    }
+    // tmux rewrites both to `_` and the session would not have the name
+    // that was typed — and `:` and `.` are what target syntax splits on.
+    if name.contains([':', '.']) {
+        model
+            .status
+            .warn("a session name cannot contain ':' or '.'");
+        return None;
+    }
+    if model.session_is_live(&name) {
+        model
+            .status
+            .warn(format!("session '{name}' already exists"));
+        return None;
+    }
+    model.naming = None;
+
+    let path = match (model.current_pane(), model.current_window()) {
+        (Some(p), _) => Some(p.path.clone()),
+        (None, Some(w)) => model
+            .live
+            .iter()
+            .find(|p| p.session == w.session && p.window_index == w.index && p.active)
+            .map(|p| p.path.clone()),
+        _ => None,
+    };
+
+    Some(Job::new("creating session", move || {
+        let mut args = vec![
+            "new-session",
+            "-d",
+            "-s",
+            &name,
+            "-P",
+            "-F",
+            "#{session_name}:#{window_index}",
+        ];
+        if let Some(path) = &path {
+            args.extend(["-c", path.as_str()]);
+        }
+        let target = match cmd::run("tmux", &args, cmd::FAST) {
+            Ok(out) => out.trim().to_string(),
+            Err(e) => {
+                return Ok(Done::status(
+                    Level::Error,
+                    format!("new session {name}: {e:#}"),
+                ));
+            }
+        };
+        Ok(Done::then(move |m: &mut Model| {
+            m.focus(&target);
+            m.status
+                .success(format!("created session {name} — enter switches to it"));
+        }))
+    }))
+}
+
+/// Close the selected sessions, every window in them included.
+///
+/// No confirmation, for the reason `kill_windows` has none: a session the
+/// point holds comes back with `r`, and the status says whether that is so.
+/// Closing every session is refused upstream, in the menu — tmux exits with
+/// its last one, and this popup with it.
+fn kill_sessions(model: &mut Model) -> Option<Job> {
+    let targets = model.selected_sessions();
+    if targets.is_empty() {
+        model.status.warn("select a running session first");
+        return None;
+    }
+
+    Some(Job::new("closing sessions", move || {
+        // The session this popup was opened from goes last, after the client
+        // is moved off it. Killing it first would detach the client — and
+        // close the popup — with the rest of the list still to do.
+        let own = super::app::summoning_window()
+            .and_then(|t| t.split_once(':').map(|(s, _)| s.to_string()));
+        let mut order: Vec<&String> = targets
+            .iter()
+            .filter(|s| Some(*s) != own.as_ref())
+            .collect();
+        let closing_own = targets.iter().find(|s| Some(*s) == own.as_ref());
+
+        let mut killed = 0;
+        let mut failed = Vec::new();
+        if let Some(own) = closing_own {
+            let survivor = sessions()?.into_iter().find(|s| !targets.contains(s));
+            match survivor {
+                Some(next) => {
+                    if let Err(e) = cmd::run(
+                        "tmux",
+                        &["switch-client", "-t", &format!("={next}")],
+                        cmd::FAST,
+                    ) {
+                        failed.push(format!("switch to {next}: {e}"));
+                    }
+                    order.push(own);
+                }
+                None => failed.push(format!("{own}: it is the last session")),
+            }
+        }
+        for name in order {
+            match cmd::run(
+                "tmux",
+                &["kill-session", "-t", &session_mark(name)],
+                cmd::FAST,
+            ) {
+                Ok(_) => killed += 1,
+                Err(e) => failed.push(format!("{name}: {e}")),
+            }
+        }
+
+        let consumed: Vec<String> = targets.iter().map(|s| session_mark(s)).collect();
+        Ok(Done::then(move |m: &mut Model| {
+            // Runs after the re-read: a closed session the point holds is
+            // still listed, with every window gone.
+            let recoverable = targets
+                .iter()
+                .filter(|s| {
+                    !m.session_is_live(s)
+                        && m.rows
+                            .iter()
+                            .any(|r| matches!(r, Row::Window(w) if w.gone && &w.session == *s))
+                })
+                .count();
+            // Session marks stay on what can be restored, so `r` right after
+            // brings exactly these back.
+            let keep: Vec<String> = targets
+                .iter()
+                .filter(|s| {
+                    m.rows
+                        .iter()
+                        .any(|r| matches!(r, Row::Session { name, .. } if name == *s))
+                })
+                .map(|s| session_mark(s))
+                .collect();
+            let drop: Vec<String> = consumed.into_iter().filter(|k| !keep.contains(k)).collect();
+            m.unmark(&drop);
+            let recovery = match recoverable {
+                0 => " — not in the restore point, so r cannot bring them back".to_string(),
+                n if n == killed => " — r brings them back".to_string(),
+                n => format!(" — r brings back {n} of them"),
+            };
+            report(
+                &mut m.status,
+                format!("closed {killed} session(s){recovery}"),
+                failed,
+            );
         }))
     }))
 }

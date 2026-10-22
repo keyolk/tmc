@@ -241,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn right_click_on_a_session_header_does_not_mark_the_old_cursor() {
+    fn right_click_on_a_session_header_marks_the_session() {
         let mut m = model();
         m.rows.insert(
             0,
@@ -258,8 +258,9 @@ mod tests {
             event(MouseEventKind::Down(MouseButton::Right), 2, tree.y),
             area,
         );
-        assert!(m.marks.is_empty());
-        assert_eq!(m.cursor, 1);
+        // The header, not the window the cursor was on before.
+        assert_eq!(m.marks.iter().collect::<Vec<_>>(), vec!["=s"]);
+        assert_eq!(m.cursor, 0);
     }
 
     #[test]
