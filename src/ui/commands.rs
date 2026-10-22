@@ -20,6 +20,7 @@ use super::worker::{Done, Job};
 use crate::collect::{cmd, proc, tmux};
 use crate::config;
 use crate::layout::{point, restore, save};
+use crate::rearrange;
 
 /// Run a menu command. Exhaustive over `ActionKind`, which is what keeps the
 /// menu and the commands from drifting apart.
@@ -471,37 +472,26 @@ fn move_windows(model: &mut Model) -> Option<Job> {
             ));
         }
 
-        let mut moved = 0;
-        let mut failed = Vec::new();
-        let mut emptied: Vec<String> = Vec::new();
+        // With two sessions each window goes to the one it is not in. Grouped
+        // by where they are so each group is one `send_windows`, which
+        // renumbers only after its whole group has moved.
+        let mut by_here: Vec<(String, Vec<String>)> = Vec::new();
         for target in &targets {
             let here = target.split(':').next().unwrap_or_default().to_string();
-            let Some(dest) = all.iter().find(|s| **s != here) else {
-                continue;
-            };
-            match cmd::run(
-                "tmux",
-                &["move-window", "-s", target, "-t", &format!("{dest}:")],
-                cmd::FAST,
-            ) {
-                Ok(_) => {
-                    moved += 1;
-                    if !emptied.contains(&here) {
-                        emptied.push(here);
-                    }
-                }
-                Err(e) => failed.push(format!("{target}: {e}")),
+            match by_here.iter_mut().find(|(h, _)| *h == here) {
+                Some((_, v)) => v.push(target.clone()),
+                None => by_here.push((here, vec![target.clone()])),
             }
         }
-
-        // move-window leaves a hole; tmux only renumbers on close. Deferred
-        // until every window has moved, because renumbering mid-loop would
-        // invalidate the `session:index` targets still waiting their turn.
-        // A failed renumber leaves a gap in the numbering, nothing worse.
-        for session in &emptied {
-            if let Err(e) = cmd::run("tmux", &["move-window", "-r", "-t", session], cmd::FAST) {
-                failed.push(format!("renumber {session}: {e}"));
-            }
+        let mut moved = 0;
+        let mut failed = Vec::new();
+        for (here, group) in &by_here {
+            let Some(dest) = all.iter().find(|s| *s != here) else {
+                continue;
+            };
+            let out = rearrange::send_windows(group, dest);
+            moved += out.moved;
+            failed.extend(out.failed);
         }
 
         Ok(Done::then(move |m: &mut Model| {
@@ -566,38 +556,6 @@ fn break_panes(model: &mut Model) -> Option<Job> {
             report(&mut m.status, done, failed);
         }))
     }))
-}
-
-/// Arguments that move one exact pane into one exact window.
-///
-/// `join-pane` calls its target a dst-pane, but tmux accepts a window target and
-/// resolves that to the window's active pane. That gives the requested window
-/// without relying on whichever pane launched the popup.
-pub(super) fn join_pane_args<'a>(pane: &'a str, destination: &'a str) -> [&'a str; 6] {
-    ["join-pane", "-d", "-s", pane, "-t", destination]
-}
-
-/// Move one pane, making room first if the destination has none.
-///
-/// `join-pane` splits the destination's *active* pane, and `-d` keeps that the
-/// same pane throughout — so each join halves what the last one halved, and a
-/// merge fails partway with "no space for new pane". Tiling and retrying costs
-/// an extra exec only when that actually happens, which leaves a hand-made
-/// layout alone in the ordinary single-pane case.
-fn join_one(pane: &str, destination: &str) -> Result<()> {
-    match cmd::run("tmux", &join_pane_args(pane, destination), cmd::FAST) {
-        Ok(_) => Ok(()),
-        Err(_) => {
-            // The retry below reports the failure that matters; a tiling
-            // that did not take shows up there as "no space" again.
-            let _ = cmd::run(
-                "tmux",
-                &["select-layout", "-t", destination, "tiled"],
-                cmd::FAST,
-            );
-            cmd::run("tmux", &join_pane_args(pane, destination), cmd::FAST).map(|_| ())
-        }
-    }
 }
 
 /// Pick panes, then move them into an explicitly selected window.
@@ -679,33 +637,8 @@ pub(super) fn confirm_move(model: &mut Model) -> Option<Job> {
     model.searching = false;
 
     Some(Job::new("moving panes", move || {
-        let mut moved = 0;
-        let mut failed = Vec::new();
-        for (pane, from) in &pending.panes {
-            // The destination may be one of the merged windows; its own panes
-            // are already home.
-            if *from == destination {
-                continue;
-            }
-            match join_one(pane, &destination) {
-                Ok(()) => moved += 1,
-                Err(e) => failed.push(format!("{pane}: {e}")),
-            }
-        }
-
-        // Several panes arriving one at a time stack into ever-thinner slices
-        // of whatever pane was active. Tiling once at the end is the only
-        // arrangement that is readable without guessing what was wanted; a
-        // single pane leaves a hand-made layout alone.
-        if moved > 1
-            && let Err(e) = cmd::run(
-                "tmux",
-                &["select-layout", "-t", &destination, "tiled"],
-                cmd::FAST,
-            )
-        {
-            failed.push(format!("tile {destination}: {e}"));
-        }
+        let out = rearrange::join_panes(&pending.panes, &destination);
+        let (moved, failed) = (out.moved, out.failed);
 
         let sources = pending.sources();
         let consumed: Vec<String> = pending

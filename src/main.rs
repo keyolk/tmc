@@ -4,6 +4,7 @@ mod config;
 mod fuzzy;
 mod keymap;
 mod layout;
+mod rearrange;
 mod ui;
 
 use anyhow::{Context, Result};
@@ -32,6 +33,29 @@ struct Cli {
     /// this when the intent is to look at what changed rather than to jump.
     #[arg(long, global = true)]
     browse: bool,
+}
+
+#[derive(Subcommand)]
+enum WindowCmd {
+    /// Move WINDOWS to session TO, renumbering the sessions they left.
+    Send {
+        /// Windows to move: `@id` or `session:index`.
+        #[arg(required = true)]
+        windows: Vec<String>,
+        /// The session to move them into.
+        #[arg(long)]
+        to: String,
+    },
+    /// Merge WINDOWS into INTO: every pane of them joins INTO, which may be
+    /// one of them; the windows left empty close. Several panes are tiled.
+    Merge {
+        /// Windows whose panes move: `@id` or `session:index`.
+        #[arg(required = true)]
+        windows: Vec<String>,
+        /// The window that keeps them all.
+        #[arg(long)]
+        into: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -95,6 +119,14 @@ enum Command {
     },
     /// Show the restore points on disk, newest first.
     List,
+    /// Move windows to another session, or merge windows into one.
+    ///
+    /// The same moves as the TUI's `x s` and `x m`, for scripts and other
+    /// front ends (the cc-mods office drags windows with these).
+    Window {
+        #[command(subcommand)]
+        action: WindowCmd,
+    },
     /// Bring a restore point back.
     Load {
         /// Restore point name, e.g. `auto:20260829T204041Z` or `saved:mypoint`.
@@ -168,7 +200,38 @@ fn main() -> Result<()> {
             load(name, &sessions, dry_run, force, yes, over)
         }
         Command::Config => show_config(),
+        Command::Window { action } => window(action),
     }
+}
+
+/// `tmc window send|merge`: one line for what moved, one per failure on
+/// stderr, and a failing exit status if anything did not move.
+fn window(action: WindowCmd) -> Result<()> {
+    let out = match action {
+        WindowCmd::Send { windows, to } => {
+            let out = rearrange::send_windows(&windows, &to);
+            println!("moved {} window(s) to {to}", out.moved);
+            out
+        }
+        WindowCmd::Merge { windows, into } => {
+            let into = rearrange::window_id(&into)?;
+            let panes = rearrange::panes_of(&windows)?;
+            let out = rearrange::join_panes(&panes, &into);
+            println!(
+                "merged {} window(s) — {} pane(s) into {into}",
+                windows.len(),
+                out.moved
+            );
+            out
+        }
+    };
+    for f in &out.failed {
+        eprintln!("failed: {f}");
+    }
+    if !out.failed.is_empty() {
+        anyhow::bail!("{} move(s) failed", out.failed.len());
+    }
+    Ok(())
 }
 
 /// Print the effective config, so `autorun` can be checked without restoring.

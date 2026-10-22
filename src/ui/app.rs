@@ -769,7 +769,7 @@ fn now_secs() -> u64 {
 mod tests {
     use super::*;
     use crate::layout::diff::Change;
-    use crate::ui::commands::{join_pane_args, selected_windows};
+    use crate::ui::commands::selected_windows;
     use crate::ui::model::{ActionKind, MoveKind, Row, WindowRow};
     use crate::ui::worker::Done;
 
@@ -975,14 +975,6 @@ mod tests {
         assert_eq!(
             m.current_window().map(|w| w.name.clone()),
             Some("alpha".into())
-        );
-    }
-
-    #[test]
-    fn pane_move_names_the_exact_source_and_destination() {
-        assert_eq!(
-            join_pane_args("%1084", "tooling:3"),
-            ["join-pane", "-d", "-s", "%1084", "-t", "tooling:3"],
         );
     }
 
