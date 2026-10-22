@@ -31,6 +31,10 @@ pub(super) fn panes(area: Rect, model: &Model) -> Vec<Pane> {
         let b = render::menu_area(regions.body, model);
         return vec![Pane::new("menu", inset(b, 2, 1), Kind::List)];
     }
+    if model.pending_send.is_some() {
+        let b = render::send_area(regions.body, model);
+        return vec![Pane::new("send", inset(b, 2, 1), Kind::List)];
+    }
 
     // The divider between tree and detail is in neither rect, so a drag
     // from the tree never copies it.
@@ -131,7 +135,7 @@ pub(super) fn dispatch(
     now: Instant,
 ) -> Dispatched {
     // Only the base screen has a divider: an overlay owns every press.
-    if !model.help && !model.menu {
+    if !model.help && !model.overlay() {
         let body = render::regions(area, &model.split).body;
         let split = model.split.mouse(&event, body, now);
         if split.consumed {

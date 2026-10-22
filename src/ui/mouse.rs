@@ -31,6 +31,9 @@ pub fn handle(model: &mut Model, event: MouseEvent, area: Rect) -> Effect {
     if model.menu {
         return menu(model, event.kind, point, area);
     }
+    if model.pending_send.is_some() {
+        return send(model, event.kind, point, area);
+    }
 
     let regions = render::regions(area, &model.split);
     if regions.header.contains(point.into()) {
@@ -164,6 +167,31 @@ fn menu(model: &mut Model, kind: MouseEventKind, point: (u16, u16), area: Rect) 
     };
     model.menu = false;
     run_cmd(model, Cmd::Run(action.kind))
+}
+
+/// The `x s` picker: a click on a session sends there, the wheel moves the
+/// choice, a click outside cancels -- the same as the menu it came from.
+fn send(model: &mut Model, kind: MouseEventKind, point: (u16, u16), area: Rect) -> Effect {
+    let body = render::regions(area, &model.split).body;
+    let box_area = render::send_area(body, model);
+    let inside = box_area.contains(point.into());
+    match kind {
+        MouseEventKind::Down(MouseButton::Left) if !inside => run_cmd(model, Cmd::CancelSend),
+        MouseEventKind::Down(MouseButton::Left) => {
+            let row = point.1.saturating_sub(box_area.y + 1) as usize;
+            let Some(pending) = model.pending_send.as_mut() else {
+                return Effect::None;
+            };
+            if row >= pending.sessions.len() {
+                return Effect::None;
+            }
+            pending.selected = row;
+            run_cmd(model, Cmd::ConfirmSend)
+        }
+        MouseEventKind::ScrollDown if inside => run_cmd(model, Cmd::SendDown),
+        MouseEventKind::ScrollUp if inside => run_cmd(model, Cmd::SendUp),
+        _ => Effect::None,
+    }
 }
 
 #[cfg(test)]

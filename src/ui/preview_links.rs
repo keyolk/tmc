@@ -32,7 +32,7 @@ pub(super) struct Region {
 pub(super) fn regions(area: Rect, model: &Model) -> Vec<Region> {
     // An overlay covers the panel; a link under it would be clickable
     // through the box.
-    if model.help || model.menu {
+    if model.help || model.overlay() {
         return Vec::new();
     }
     let detail = render::regions(area, &model.split).detail;
