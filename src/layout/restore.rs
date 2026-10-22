@@ -321,11 +321,19 @@ pub struct Report {
 pub struct Selection<'a> {
     /// Restore only these window indices; `None` restores all of them.
     pub windows: Option<&'a [u32]>,
+    /// Add the windows to the session when it is already running, rather
+    /// than refusing it. For bringing back windows the point has and the
+    /// server does not: there is nothing live to double, and refusing made
+    /// the TUI's `r` a no-op on every session that was still open.
+    pub append: bool,
 }
 
 impl Selection<'_> {
     pub fn all() -> Self {
-        Self { windows: None }
+        Self {
+            windows: None,
+            append: false,
+        }
     }
 
     fn includes(&self, index: u32) -> bool {
@@ -354,7 +362,8 @@ pub fn session<T: Tmux>(
     // common case — the user is usually looking at a point for a session that
     // is still open, deciding whether to close it.
     let clash = tmux.session_exists(&saved.session);
-    if clash {
+    let into_live = clash && select.append && !force;
+    if clash && !into_live {
         if force {
             report
                 .notes
@@ -396,7 +405,7 @@ pub fn session<T: Tmux>(
             report.windows += 1;
             report.panes += window.panes.len();
             continue;
-        } else if i == 0 {
+        } else if i == 0 && !into_live {
             tmux.new_session(&saved.session, &window.name, first_path)?
         } else {
             tmux.new_window(&saved.session, &window.name, first_path)?
@@ -989,6 +998,7 @@ mod tests {
             &saved,
             Selection {
                 windows: Some(&[2]),
+                append: false,
             },
             &no_autorun(),
             false,
@@ -1259,8 +1269,69 @@ mod tests {
 
         let some = Selection {
             windows: Some(&[2, 4]),
+            append: false,
         };
         assert!(some.includes(2));
         assert!(!some.includes(3));
+    }
+
+    #[test]
+    fn append_adds_missing_windows_to_a_running_session() {
+        // The TUI's `r` on a window closed inside a session that is still
+        // open. Refusing the session here is what made it silently do nothing.
+        let mut tmux = Fake::new();
+        tmux.live_sessions.push("projects".into());
+        let saved = saved_session(vec![
+            window(1, "alpha", vec![pane("", None)]),
+            window(2, "beta", vec![pane("", None)]),
+        ]);
+
+        let report = session(
+            &mut tmux,
+            &saved,
+            Selection {
+                windows: Some(&[2]),
+                append: true,
+            },
+            &no_autorun(),
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(report.windows, 1);
+        assert!(report.notes.is_empty(), "notes: {:?}", report.notes);
+        assert!(
+            !tmux.calls.iter().any(|c| c.starts_with("new-session")),
+            "the running session is added to, not recreated: {:?}",
+            tmux.calls
+        );
+        assert!(tmux.calls[0].starts_with("new-window projects beta"));
+        assert!(!tmux.calls.iter().any(|c| c.starts_with("kill-session")));
+    }
+
+    #[test]
+    fn append_to_a_session_that_is_not_running_creates_it() {
+        let mut tmux = Fake::new();
+        let saved = saved_session(vec![
+            window(1, "alpha", vec![pane("", None)]),
+            window(2, "beta", vec![pane("", None)]),
+        ]);
+
+        let report = session(
+            &mut tmux,
+            &saved,
+            Selection {
+                windows: None,
+                append: true,
+            },
+            &no_autorun(),
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(report.windows, 2);
+        assert!(tmux.calls[0].starts_with("new-session projects alpha"));
     }
 }

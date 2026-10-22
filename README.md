@@ -122,13 +122,13 @@ from where the TUI opens leaves.
 | `g`/`G` | first / last |
 | `Enter` | switch to the window and exit |
 | `n` | next window waiting on you |
-| `space` | mark the window — or, on a pane row, the pane |
+| `space` | mark the window — or, on a pane row, the pane; on a session header, the session |
 | `a` / `c` | mark everything changed / clear |
-| `r` | restore marked (or, with none marked, the missing windows) |
+| `r` | restore marked sessions and windows (or, with none marked, the missing windows) |
 | `s` | save a point now |
 | `p` / `P` | next / previous restore point |
 | `l` / `h` | expand a window to its panes / collapse |
-| `x` | the window and pane menu, below |
+| `x` | the session, window and pane menu, below |
 | `R` | re-read tmux now |
 | `o` | open the first link in the output on screen |
 | `?` | every key, in every mode |
@@ -143,7 +143,7 @@ answer and not be listed.
 | gesture | where | action |
 |---|---|---|
 | left click | header | focus search |
-| left click | tree | select a window or pane |
+| left click | tree | select a session, window or pane |
 | right / middle click | tree | select and toggle its mark |
 | wheel | tree | move three rows; in destination mode, visit valid windows |
 | wheel | detail | scroll captured output |
@@ -184,16 +184,18 @@ one-line notice and the rest keeps working; the panic goes to `tmc.log` next to
 
 **`x` — rearranging tmux**
 
-Everything that moves a window or a pane lives behind `x`, and pressing it
-shows what is on offer:
+Everything that creates, moves or closes a session, window or pane lives
+behind `x`, and pressing it shows what is on offer:
 
 ```
 ╭ x  local:14  tmc ──────────────────────────────────╮
-│ b:break out               needs a pane — l expands │
-│ j:join into a window      needs a pane — l expands │
+│ b:break out                needs a pane; l expands │
+│ j:join into a window       needs a pane; l expands │
 │ m:merge windows           needs two or more marked │
 │ s:send to other session           no other session │
 │ k:close                                   1 window │
+│ n:new session                          type a name │
+│ d:close session                          1 session │
 │                                                    │
 │ esc cancel                                         │
 ╰────────────────────────────────────────────────────╯
@@ -206,6 +208,8 @@ shows what is on offer:
 | `x m` | merge the marked windows into one |
 | `x s` | send the selected windows to the other session |
 | `x k`, `x x` | close the selected windows |
+| `x n` | create a session: type its name, `Enter` creates it, `Esc` cancels |
+| `x d` | close the selected sessions — the marked ones, or the cursor's |
 
 The title names what the commands would act on — the marked windows and panes,
 or the row under the cursor when nothing is marked. The right column says what
@@ -227,16 +231,43 @@ the menu is up, so what it says it will act on is still true when the key lands.
 | `Enter` | confirm |
 | `Esc` | cancel the move |
 
+**Sessions**
+
+Session headers are rows like any other. `Enter` on one switches to the
+session, `space` marks it, and the panel says what it holds — how many
+windows are running and how many exist only in the restore point.
+
+`x n` starts the new session in the directory of the row under the cursor,
+which is usually the project it is for, and puts the cursor on it rather
+than switching: `Enter` is one key away. A name with `:` or `.` is refused,
+since tmux would rewrite it and those are what target syntax splits on.
+
+`x d` acts on the marked sessions, or the one the cursor is in — from its
+header, a window or a pane. It does not ask, for the reason `x k` does not:
+a session the point holds comes back with `r`, and the status says whether
+that is so. Its mark stays on a closed session that the point holds, so `r`
+straight after brings exactly that back. Closing every session is refused:
+tmux exits with its last one, and the popup with it. The session the popup
+was opened from goes last, after the client is switched off it.
+
 ## Marks are a selection, not a queue
 
 `space` marks whatever is under the cursor, and the next command decides what
-that meant: `r` restores the marked windows, `x m` merges them, `x s` sends
+that meant: `r` restores the marked sessions and windows, `x m` merges them, `x s` sends
 them to the other session, `x k` closes them, and with panes marked instead,
 `x b` breaks them out and `x j` moves them. Only the marks a command consumed
 are dropped, so windows staged for `r` survive a pane move made on the way.
 
 With nothing marked, the pane and window commands act on the cursor — the
 one-window case stays one keystroke.
+
+`r` brings back only what the server does not have. A marked session stands
+for every one of its windows that exists only in the point — the whole
+session, when it is not running — so several sessions come back in one
+press. The windows go into a running session alongside what is already
+there; a marked window that is still running is left alone and counted in
+the status, since recreating it would double it. One session failing does
+not stop the others.
 
 Marking a pane requires expanding its window (`l`), which is also what makes
 the selection honest: `break-pane` and `join-pane` take a pane, and a window
