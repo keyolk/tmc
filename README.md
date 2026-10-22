@@ -48,8 +48,17 @@ running, and `r` restores only what you marked.
 | `tmc copy-mode` | send a copy-mode command |
 | `tmc snapshot` | render one frame as text |
 | `tmc config` | the effective configuration |
+| `tmc window send <w>… --to <session>` | move windows to a session (`x s`) |
+| `tmc window merge <w>… --into <w>` | merge windows into one (`x m`) |
 
 `--dry-run` on `save` and `load` shows what would happen and touches nothing.
+
+`window send` and `window merge` are the TUI's `x s` and `x m` for scripts and
+other front ends, with the targets given instead of marked: windows as `@id` or
+`session:index`. `send` renumbers the sessions the windows left; `merge` joins
+every pane of the windows into `--into` (which may be one of them), tiles when
+more than one arrives, and the emptied windows close. Each prints what moved,
+names every failure on stderr and exits non-zero if anything did not move.
 
 `load` skips a session that is already running, since appending its windows to
 a live one would silently double the workspace. `--force` closes it and
