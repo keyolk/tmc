@@ -291,8 +291,22 @@ fn save(name: Option<String>, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
+/// How long one autosave may take before it gives up.
+///
+/// launchd does not start a `StartInterval` job while the previous run is
+/// still alive, so one wedged run silently ends every later one: autosave
+/// wrote nothing from 2026-10-22 to 2026-11-01 with no error in its log.
+/// Exiting lets the next hourly run start, and leaves a line saying why.
+const AUTOSAVE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
 fn autosave(if_drifted: bool) -> Result<()> {
     let now = clock::now();
+    let started = now.timestamp.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(AUTOSAVE_DEADLINE);
+        eprintln!("{started} autosave: still running after {AUTOSAVE_DEADLINE:?}; gave up");
+        std::process::exit(1);
+    });
     let root = layout::save::layout_dir().join("autosave");
 
     let panes = collect::tmux::panes().context("list tmux panes")?;
@@ -427,11 +441,28 @@ fn load(
         );
     }
 
-    println!("restore point: {}", chosen.name);
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    println!(
+        "restore point: {}  ({})",
+        chosen.name,
+        clock::age_of(&chosen.sort_key, now_secs)
+    );
     for s in &wanted {
         println!("  {}", describe(s));
     }
     println!();
+    // Without a name the newest point is restored. Say so when that point is
+    // stale or partial: on 2026-11-01 autosave had been silent for 10 days and
+    // `tmc load` quietly brought back two of four sessions.
+    if name.is_none() {
+        warn_if_stale(chosen, now_secs);
+    }
+    if only.is_empty() {
+        name_left_out(&sessions, now_secs);
+    }
 
     // With --force the live sessions are about to be destroyed. Show what that
     // costs first — the same comparison `tmc diff` prints — because "restore
@@ -513,6 +544,52 @@ fn load(
         println!("{} pane(s) did not fit the display", total.missing_panes);
     }
     Ok(())
+}
+
+/// Autosave runs hourly; a newest autosave older than this means it stopped.
+const AUTOSAVE_STALE_SECS: u64 = 3 * 3600;
+
+fn warn_if_stale(chosen: &point::Point, now_secs: u64) {
+    if !chosen.is_auto {
+        return;
+    }
+    let Some(age) = clock::secs_since(&chosen.sort_key, now_secs) else {
+        return;
+    };
+    if age > AUTOSAVE_STALE_SECS {
+        println!(
+            "warning: the newest autosave is from {} — autosave has not written since,\n\
+             \x20        so sessions started after it were never saved. \
+             See ~/Library/Logs/tmux-autosave.log.\n",
+            clock::age_of(&chosen.sort_key, now_secs),
+        );
+    }
+}
+
+/// Name autosaved sessions the point does not hold and how to restore each.
+fn name_left_out(restoring: &[layout::Session], now_secs: u64) {
+    let root = layout::save::layout_dir().join("autosave");
+    let left_out: Vec<(String, String)> = point::newest_per_session(&root)
+        .into_iter()
+        // Autosave directories are session names with `/` made safe.
+        .filter(|(dir, _)| {
+            !restoring
+                .iter()
+                .any(|s| s.session.replace('/', "_") == *dir)
+        })
+        .filter(|(dir, _)| !layout::autosave::session_is_live(dir))
+        .collect();
+    if left_out.is_empty() {
+        return;
+    }
+    println!("not in this point (restore one with the command shown):");
+    for (session, stamp) in &left_out {
+        println!(
+            "  {session:<12} last saved {:>9}   tmc load auto:{stamp} -s {session}",
+            clock::age_of(stamp, now_secs),
+        );
+    }
+    println!();
 }
 
 /// Snapshot every live session, or `None` when there is no tmux server.
