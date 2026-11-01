@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
-use super::model::{ActionKind, Model, MoveKind, Row, WindowRow, session_mark};
+use super::model::{ActionKind, Model, MoveKind, PendingSend, Row, WindowRow, session_mark};
 use super::status::{Level, Status};
 use super::worker::{Done, Job};
 use crate::collect::{cmd, proc, tmux};
@@ -445,36 +445,80 @@ fn kill_sessions(model: &mut Model) -> Option<Job> {
     }))
 }
 
-/// Move the selected windows to the other session.
+/// Send the selected windows to another session.
 ///
-/// With two sessions the destination is unambiguous, which is the whole reason
-/// this is one keystroke here and a prompt in tmux.sh. With more, the status
-/// line says what to do instead of guessing.
+/// With two sessions the destination is the other one, which is the whole
+/// reason this is one keystroke here and a prompt in tmux. With more, the
+/// sessions are offered in a box and Enter picks one; the windows are
+/// resolved now, so the choice acts on what was selected when `x s` landed.
 fn move_windows(model: &mut Model) -> Option<Job> {
     let targets = selected_windows(model);
     if targets.is_empty() {
         model.status.warn("that window is not running");
         return None;
     }
-
-    Some(Job::new("moving", move || {
-        let all = sessions()?;
-        if all.len() < 2 {
-            return Ok(Done::status(Level::Warn, "no other session to move to"));
+    let live = model.live_session_names();
+    match live.len() {
+        0 | 1 => {
+            model.status.warn("no other session to move to");
+            None
         }
-        if all.len() > 2 {
-            return Ok(Done::status(
-                Level::Warn,
-                format!(
-                    "several destinations ({}); use tmux directly",
-                    all.len() - 1
-                ),
+        2 => Some(send_job(targets, None)),
+        _ => {
+            // The windows' own session is no destination when they all share
+            // one. Windows from several sessions can go to any of them: each
+            // window already there simply stays.
+            let sources: Vec<&str> = targets
+                .iter()
+                .map(|t| t.split(':').next().unwrap_or_default())
+                .collect();
+            let sole = sources
+                .iter()
+                .all(|s| *s == sources[0])
+                .then(|| sources[0].to_string());
+            let sessions: Vec<String> = live
+                .into_iter()
+                .filter(|s| Some(s) != sole.as_ref())
+                .collect();
+            let n = targets.len();
+            model.pending_send = Some(PendingSend {
+                windows: targets,
+                sessions,
+                selected: 0,
+            });
+            model.status.info(format!(
+                "sending {n} window(s): choose a session, then Enter"
             ));
+            None
         }
+    }
+}
 
-        // With two sessions each window goes to the one it is not in. Grouped
-        // by where they are so each group is one `send_windows`, which
-        // renumbers only after its whole group has moved.
+/// Send the windows the picker holds to the session it has selected.
+pub(super) fn confirm_send(model: &mut Model) -> Option<Job> {
+    let pending = model.pending_send.take()?;
+    let dest = pending.destination()?.to_string();
+    Some(send_job(pending.windows, Some(dest)))
+}
+
+/// `dest` of `None` means "the other session", resolved on the worker
+/// against a fresh list: a session created or closed since the menu was drawn
+/// changes which one that is, or whether there is one.
+fn send_job(targets: Vec<String>, dest: Option<String>) -> Job {
+    Job::new("moving", move || {
+        let dest_for = |here: &str| -> Result<Option<String>> {
+            if let Some(d) = &dest {
+                return Ok(Some(d.clone()));
+            }
+            let all = sessions()?;
+            if all.len() != 2 {
+                return Ok(None);
+            }
+            Ok(all.into_iter().find(|s| s != here))
+        };
+
+        // Grouped by where they are so each group is one `send_windows`,
+        // which renumbers only after its whole group has moved.
         let mut by_here: Vec<(String, Vec<String>)> = Vec::new();
         for target in &targets {
             let here = target.split(':').next().unwrap_or_default().to_string();
@@ -486,19 +530,25 @@ fn move_windows(model: &mut Model) -> Option<Job> {
         let mut moved = 0;
         let mut failed = Vec::new();
         for (here, group) in &by_here {
-            let Some(dest) = all.iter().find(|s| *s != here) else {
+            let Some(to) = dest_for(here)? else {
+                failed.push(format!("{here}: the sessions changed; press x s again"));
                 continue;
             };
-            let out = rearrange::send_windows(group, dest);
+            let out = rearrange::send_windows(group, &to);
             moved += out.moved;
             failed.extend(out.failed);
         }
 
+        let into = dest.map(|d| format!(" to {d}")).unwrap_or_default();
         Ok(Done::then(move |m: &mut Model| {
             m.unmark(&targets);
-            report(&mut m.status, format!("moved {moved} window(s)"), failed);
+            report(
+                &mut m.status,
+                format!("moved {moved} window(s){into}"),
+                failed,
+            );
         }))
-    }))
+    })
 }
 
 /// Break the selected panes out, each into a window of its own.

@@ -119,6 +119,11 @@ pub fn draw(frame: &mut Frame, model: &Model, now_secs: u64) {
             render_menu(f, regions.body, model)
         });
     }
+    if model.pending_send.is_some() {
+        guard::pane(frame, regions.body, "send", t, true, |f| {
+            render_send(f, regions.body, model)
+        });
+    }
     if model.help {
         guard::pane(frame, regions.body, "help", t, true, |f| {
             render_help(f, regions.body, t, model.help_scroll)
@@ -212,6 +217,78 @@ fn render_menu(frame: &mut Frame, body: Rect, model: &Model) {
                 .border_style(t.border_focus())
                 .title(Span::styled(
                     truncate(&title, area.width.saturating_sub(4) as usize, ell),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ))
+                .padding(ratatui::widgets::Padding::horizontal(1)),
+        ),
+        area,
+    );
+}
+
+fn send_title(send: &super::model::PendingSend) -> String {
+    match send.windows.as_slice() {
+        [one] => format!(" send {one} to "),
+        many => format!(" send {} windows to ", many.len()),
+    }
+}
+
+/// The `x s` session picker, sized to its rows. One row per session, in the
+/// box's first rows after the border, which is what mouse hit testing counts.
+pub(super) fn send_area(body: Rect, model: &Model) -> Rect {
+    let Some(send) = &model.pending_send else {
+        return Rect::default();
+    };
+    let footer = keys::footer(Ctx::SendTo, model, usize::MAX);
+    let inner = send
+        .sessions
+        .iter()
+        .map(|s| s.width() + 2)
+        .max()
+        .unwrap_or(0)
+        .max(send_title(send).width())
+        .max(footer.width());
+    let width = (inner as u16 + 4).min(body.width);
+    let height = (send.sessions.len() as u16 + 4).min(body.height);
+    centred(body, width, height)
+}
+
+fn render_send(frame: &mut Frame, body: Rect, model: &Model) {
+    let Some(send) = &model.pending_send else {
+        return;
+    };
+    let t = &model.theme;
+    let area = send_area(body, model);
+    let usable = area.width.saturating_sub(4) as usize;
+    let mut lines: Vec<Line> = send
+        .sessions
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let selected = i == send.selected;
+            Line::from(vec![
+                Span::raw(if selected { "> " } else { "  " }),
+                Span::styled(
+                    truncate(name, usable.saturating_sub(2), t.glyphs.ellipsis),
+                    if selected { t.selected() } else { t.text() },
+                ),
+            ])
+        })
+        .collect();
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        keys::footer(Ctx::SendTo, model, usable),
+        t.subtle(),
+    ));
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_set(t.glyphs.border)
+                .border_style(t.border_focus())
+                .title(Span::styled(
+                    truncate(&send_title(send), usable, t.glyphs.ellipsis),
                     Style::default().add_modifier(Modifier::BOLD),
                 ))
                 .padding(ratatui::widgets::Padding::horizontal(1)),

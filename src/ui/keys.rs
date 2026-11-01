@@ -103,6 +103,8 @@ pub enum Ctx {
     MoveSearch,
     /// Typing the name of a new session: letters type.
     Name,
+    /// Choosing the session `x s` sends windows to.
+    SendTo,
     /// The `?` overlay.
     Help,
 }
@@ -122,6 +124,7 @@ impl Ctx {
             Ctx::Move => "choosing a destination",
             Ctx::MoveSearch => "filtering destinations",
             Ctx::Name => "naming a new session",
+            Ctx::SendTo => "choosing a session to send to",
             Ctx::Help => "this help",
         }
     }
@@ -169,6 +172,10 @@ pub enum Cmd {
     NamePop,
     CreateSession,
     CancelName,
+    SendDown,
+    SendUp,
+    ConfirmSend,
+    CancelSend,
 }
 
 /// Where a binding sits in the hint row.
@@ -284,7 +291,7 @@ pub static BINDINGS: &[Binding] = &[
     b(Ctx::Menu, C('b'), Cmd::Run(ActionKind::Break), Hidden, "", "break out"),
     b(Ctx::Menu, C('j'), Cmd::Run(ActionKind::Join), Hidden, "", "join into a window"),
     b(Ctx::Menu, C('m'), Cmd::Run(ActionKind::Merge), Hidden, "", "merge windows"),
-    b(Ctx::Menu, C('s'), Cmd::Run(ActionKind::Send), Hidden, "", "send to other session"),
+    b(Ctx::Menu, C('s'), Cmd::Run(ActionKind::Send), Hidden, "", "send to a session"),
     b(Ctx::Menu, C('k'), Cmd::Run(ActionKind::Kill), Hidden, "", "close"),
     // The prefix again is the old `x`, which alone used to close a window:
     // the muscle memory still works, in two keystrokes rather than one.
@@ -315,6 +322,14 @@ pub static BINDINGS: &[Binding] = &[
     b(Ctx::Name, Key::Enter, Cmd::CreateSession, Group(1), "create", "create the session"),
     b(Ctx::Name, Key::Backspace, Cmd::NamePop, Hidden, "", "delete a character"),
     b(Ctx::Name, Key::Esc, Cmd::CancelName, Pinned, "cancel", "cancel"),
+    // --- choosing the session `x s` sends to.
+    b(Ctx::SendTo, C('j'), Cmd::SendDown, Group(1), "session", "next session"),
+    b(Ctx::SendTo, C('k'), Cmd::SendUp, Group(1), "session", "previous session"),
+    b(Ctx::SendTo, Key::Down, Cmd::SendDown, Hidden, "", "next session"),
+    b(Ctx::SendTo, Key::Up, Cmd::SendUp, Hidden, "", "previous session"),
+    b(Ctx::SendTo, Key::Enter, Cmd::ConfirmSend, Group(1), "send", "send the windows there"),
+    b(Ctx::SendTo, C('q'), Cmd::CancelSend, Hidden, "", "cancel"),
+    b(Ctx::SendTo, Key::Esc, Cmd::CancelSend, Pinned, "cancel", "cancel"),
     // --- help.
     b(Ctx::Help, C('?'), Cmd::CloseHelp, Hidden, "", "close"),
     b(Ctx::Help, C('q'), Cmd::CloseHelp, Hidden, "", "close"),
@@ -332,6 +347,8 @@ pub fn context(model: &Model) -> Ctx {
         Ctx::Help
     } else if model.naming.is_some() {
         Ctx::Name
+    } else if model.pending_send.is_some() {
+        Ctx::SendTo
     } else if model.pending_move.is_some() {
         if model.searching {
             Ctx::MoveSearch
@@ -437,6 +454,7 @@ pub fn help_lines(glyphs: bool) -> Vec<(String, Vec<(String, String)>)> {
         Ctx::Move,
         Ctx::MoveSearch,
         Ctx::Name,
+        Ctx::SendTo,
         Ctx::Global,
     ]
     .into_iter()
@@ -477,7 +495,7 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
 
-    const ALL: [Ctx; 8] = [
+    const ALL: [Ctx; 9] = [
         Ctx::Global,
         Ctx::Search,
         Ctx::Tree,
@@ -485,6 +503,7 @@ mod tests {
         Ctx::Move,
         Ctx::MoveSearch,
         Ctx::Name,
+        Ctx::SendTo,
         Ctx::Help,
     ];
 

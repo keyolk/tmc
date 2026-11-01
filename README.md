@@ -201,7 +201,7 @@ behind `x`, and pressing it shows what is on offer:
 │ b:break out                needs a pane; l expands │
 │ j:join into a window       needs a pane; l expands │
 │ m:merge windows           needs two or more marked │
-│ s:send to other session           no other session │
+│ s:send to a session               no other session │
 │ k:close                                   1 window │
 │ n:new session                          type a name │
 │ d:close session                          1 session │
@@ -215,7 +215,7 @@ behind `x`, and pressing it shows what is on offer:
 | `x b` | break the selected panes out, each into its own window |
 | `x j` | join the selected panes into a window you pick |
 | `x m` | merge the marked windows into one |
-| `x s` | send the selected windows to the other session |
+| `x s` | send the selected windows to another session — with three or more, pick which with `j`/`k` and `Enter` |
 | `x k`, `x x` | close the selected windows |
 | `x n` | create a session: type its name, `Enter` creates it, `Esc` cancels |
 | `x d` | close the selected sessions — the marked ones, or the cursor's |

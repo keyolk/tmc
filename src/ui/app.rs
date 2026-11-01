@@ -19,7 +19,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use super::commands::{
-    cancel_move, confirm_move, create_session, restore_marked, run_action, save_point,
+    cancel_move, confirm_move, confirm_send, create_session, restore_marked, run_action, save_point,
 };
 use super::keys::{self, Cmd, Ctx, Key};
 use super::model::{Model, actions};
@@ -295,7 +295,7 @@ impl Io {
                 // the prompt and the keypress would move the cursor or drop a
                 // mark, so the command would act on something other than what
                 // was on screen. The next tick reads again.
-                if model.menu {
+                if model.overlay() {
                     return false;
                 }
                 let before = (model.fingerprint(), model.status.clone());
@@ -444,7 +444,7 @@ fn event_loop(terminal: &mut Term, model: &mut Model, focus: Option<String>) -> 
         // would differ, so an idle workspace stays at 0 fps.
         if Instant::now() >= next_tick {
             next_tick = Instant::now() + TICK;
-            if io.reloads == 0 && !model.menu {
+            if io.reloads == 0 && !model.overlay() {
                 io.reload(model);
             }
         }
@@ -577,6 +577,7 @@ fn uses_worker(cmd: Cmd) -> bool {
             | Cmd::Restore
             | Cmd::Confirm
             | Cmd::CreateSession
+            | Cmd::ConfirmSend
             | Cmd::Run(
                 ActionKind::Break | ActionKind::Send | ActionKind::Kill | ActionKind::KillSession
             )
@@ -697,6 +698,16 @@ pub(super) fn run_cmd(model: &mut Model, cmd: Cmd) -> Effect {
         }
         Cmd::CreateSession => return job(create_session(model)),
         Cmd::CancelName => model.naming = None,
+        Cmd::SendDown | Cmd::SendUp => {
+            if let Some(send) = &mut model.pending_send {
+                send.step(if cmd == Cmd::SendDown { 1 } else { -1 });
+            }
+        }
+        Cmd::ConfirmSend => return job(confirm_send(model)),
+        Cmd::CancelSend => {
+            model.pending_send = None;
+            model.status.info("send cancelled");
+        }
     }
     Effect::None
 }
@@ -1679,5 +1690,154 @@ mod tests {
         let _ = handle_key(&mut m, KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(m.switch_to, None);
         assert!(m.status.contains("not running"), "{}", m.status);
+    }
+
+    /// Three running sessions, one window each, and one only in the point.
+    fn model_with_three_sessions() -> Model {
+        let mut m = model_with_sessions();
+        // gamma's windows come back to life; delta exists only in the point.
+        for row in &mut m.rows {
+            if let Row::Window(w) = row
+                && w.session == "gamma"
+            {
+                w.gone = false;
+                w.change = Change::Same;
+            }
+        }
+        m.rows.push(Row::Session {
+            name: "delta".into(),
+            windows: 1,
+        });
+        m.rows.push(Row::Window(WindowRow {
+            session: "delta".into(),
+            index: 1,
+            name: "delta1".into(),
+            panes: 1,
+            state: String::new(),
+            cc_session: String::new(),
+            waiting: false,
+            running_claude: false,
+            change: Change::Removed,
+            reasons: Vec::new(),
+            gone: true,
+        }));
+        m
+    }
+
+    fn send_action(m: &Model) -> crate::ui::model::Action {
+        actions(m)
+            .into_iter()
+            .find(|a| a.kind == ActionKind::Send)
+            .unwrap()
+    }
+
+    #[test]
+    fn send_with_three_sessions_asks_which_one() {
+        // The bug: three sessions greyed `x s` out as "ambiguous", so a
+        // window could not be moved at all once a third session existed.
+        let mut m = model_with_three_sessions();
+        m.cursor = 4; // beta:1
+        assert!(send_action(&m).enabled, "{}", send_action(&m).detail);
+        assert!(send_action(&m).detail.contains("pick"));
+
+        press(&mut m, 'x', KeyModifiers::NONE);
+        let effect = handle_key(&mut m, KeyCode::Char('s'), KeyModifiers::NONE);
+        assert!(
+            matches!(effect, Effect::None),
+            "nothing runs before a choice"
+        );
+        let send = m.pending_send.clone().expect("the picker is open");
+        assert_eq!(send.windows, vec!["beta:1"]);
+        // Not its own session, not one that is only in the point.
+        assert_eq!(send.sessions, vec!["alpha", "gamma"]);
+        assert_eq!(keys::context(&m), Ctx::SendTo);
+        assert!(m.overlay(), "polling waits while the choice is open");
+
+        press(&mut m, 'j', KeyModifiers::NONE);
+        assert_eq!(
+            m.pending_send.as_ref().unwrap().destination(),
+            Some("gamma")
+        );
+        press(&mut m, 'j', KeyModifiers::NONE);
+        assert_eq!(
+            m.pending_send.as_ref().unwrap().destination(),
+            Some("alpha"),
+            "wraps"
+        );
+        assert_eq!(m.cursor, 4, "j moves the choice, not the tree");
+
+        let effect = handle_key(&mut m, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(effect, Effect::Job(_)));
+        assert!(m.pending_send.is_none());
+    }
+
+    #[test]
+    fn esc_cancels_the_send_without_quitting() {
+        let mut m = model_with_three_sessions();
+        m.cursor = 4;
+        press(&mut m, 'x', KeyModifiers::NONE);
+        press(&mut m, 's', KeyModifiers::NONE);
+        let _ = handle_key(&mut m, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(m.pending_send.is_none());
+        assert!(!m.quit);
+        assert_eq!(m.status, "send cancelled");
+    }
+
+    #[test]
+    fn windows_from_several_sessions_can_go_to_any_of_them() {
+        let mut m = model_with_three_sessions();
+        m.marks.insert("alpha:1".into());
+        m.marks.insert("beta:1".into());
+        press(&mut m, 'x', KeyModifiers::NONE);
+        press(&mut m, 's', KeyModifiers::NONE);
+        let send = m.pending_send.clone().expect("the picker is open");
+        assert_eq!(send.sessions, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn send_with_two_sessions_stays_one_keystroke() {
+        let mut m = model_with_sessions(); // alpha and beta running
+        m.cursor = 4; // beta:1
+        assert_eq!(send_action(&m).detail, "1 window");
+        press(&mut m, 'x', KeyModifiers::NONE);
+        let effect = handle_key(&mut m, KeyCode::Char('s'), KeyModifiers::NONE);
+        assert!(matches!(effect, Effect::Job(_)));
+        assert!(m.pending_send.is_none());
+    }
+
+    #[test]
+    fn clicking_a_session_in_the_picker_sends_there() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::layout::Rect;
+        let mut m = model_with_three_sessions();
+        m.cursor = 4;
+        press(&mut m, 'x', KeyModifiers::NONE);
+        press(&mut m, 's', KeyModifiers::NONE);
+
+        let area = Rect::new(0, 0, 100, 30);
+        let body = crate::ui::render::regions(area, &m.split).body;
+        let b = crate::ui::render::send_area(body, &m);
+        let click = |row: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: b.x + 3,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        // Second row: gamma.
+        let effect = crate::ui::mouse::handle(&mut m, click(b.y + 2), area);
+        assert!(matches!(effect, Effect::Job(_)));
+        assert!(m.pending_send.is_none());
+
+        // Outside the box cancels.
+        press(&mut m, 'x', KeyModifiers::NONE);
+        press(&mut m, 's', KeyModifiers::NONE);
+        let outside = MouseEvent {
+            column: 0,
+            row: body.y,
+            ..click(0)
+        };
+        let effect = crate::ui::mouse::handle(&mut m, outside, area);
+        assert!(matches!(effect, Effect::None));
+        assert!(m.pending_send.is_none());
     }
 }
