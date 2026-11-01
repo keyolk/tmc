@@ -109,6 +109,29 @@ fn autosave_points(root: &Path) -> Vec<Point> {
         .collect()
 }
 
+/// Every autosaved session with the newest timestamp it was saved at, sorted
+/// by session.
+///
+/// An autosave point holds only the sessions alive at that instant, so a
+/// session that ended earlier, or one started after autosave stopped running,
+/// is silently absent from the newest point. `tmc load` uses this to name
+/// what the chosen point leaves out instead of restoring a subset unannounced.
+pub fn newest_per_session(autosave_root: &Path) -> Vec<(String, String)> {
+    let Ok(sessions) = std::fs::read_dir(autosave_root) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = sessions
+        .flatten()
+        .filter_map(|dir| {
+            let newest = json_files(&dir.path()).into_iter().next_back()?;
+            let stamp = newest.file_stem()?.to_string_lossy().into_owned();
+            Some((dir.file_name().to_string_lossy().into_owned(), stamp))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 /// The layout files belonging to one restore point, sorted by session name.
 pub fn files(reference: &Ref) -> Vec<PathBuf> {
     let mut out = match reference {
@@ -272,6 +295,24 @@ mod tests {
         let dir = fixture();
         std::fs::create_dir_all(dir.path().join("empty")).unwrap();
         assert!(list(dir.path()).iter().all(|p| p.name != "saved:empty"));
+    }
+
+    #[test]
+    fn finds_each_sessions_newest_autosave() {
+        let dir = fixture();
+        // A session that stopped being saved before the others.
+        write(
+            &dir.path().join("autosave/old/20260828T000000Z.json"),
+            &session_json("old"),
+        );
+        assert_eq!(
+            newest_per_session(&dir.path().join("autosave")),
+            vec![
+                ("dashboard".to_string(), "20260829T214041Z".to_string()),
+                ("old".to_string(), "20260828T000000Z".to_string()),
+                ("projects".to_string(), "20260829T214041Z".to_string()),
+            ],
+        );
     }
 
     #[test]

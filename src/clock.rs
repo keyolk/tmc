@@ -58,16 +58,21 @@ pub fn civil_from_unix(secs: u64) -> (i64, u32, u32, u32, u32, u32) {
 /// reader is deciding is how much work a point predates, and an absolute UTC
 /// string makes them do that subtraction in their head.
 pub fn age_of(stamp: &str, now_secs: u64) -> String {
-    let Some(then) = unix_from_compact(stamp) else {
+    let Some(secs) = secs_since(stamp, now_secs) else {
         return String::new();
     };
-    let secs = now_secs.saturating_sub(then);
     match secs {
         0..=90 => "just now".into(),
         s if s < 3600 => format!("{}m ago", s / 60),
         s if s < 86_400 => format!("{}h ago", s / 3600),
         s => format!("{}d ago", s / 86_400),
     }
+}
+
+/// Seconds between `stamp` (in `compact` form) and `now_secs`, or `None` when
+/// the stamp does not parse.
+pub fn secs_since(stamp: &str, now_secs: u64) -> Option<u64> {
+    Some(now_secs.saturating_sub(unix_from_compact(stamp)?))
 }
 
 /// Parse `20260830T000000Z` back to epoch seconds.
