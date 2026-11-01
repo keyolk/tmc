@@ -291,22 +291,8 @@ fn save(name: Option<String>, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-/// How long one autosave may take before it gives up.
-///
-/// launchd does not start a `StartInterval` job while the previous run is
-/// still alive, so one wedged run silently ends every later one: autosave
-/// wrote nothing from 2026-10-22 to 2026-11-01 with no error in its log.
-/// Exiting lets the next hourly run start, and leaves a line saying why.
-const AUTOSAVE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
-
 fn autosave(if_drifted: bool) -> Result<()> {
     let now = clock::now();
-    let started = now.timestamp.clone();
-    std::thread::spawn(move || {
-        std::thread::sleep(AUTOSAVE_DEADLINE);
-        eprintln!("{started} autosave: still running after {AUTOSAVE_DEADLINE:?}; gave up");
-        std::process::exit(1);
-    });
     let root = layout::save::layout_dir().join("autosave");
 
     let panes = collect::tmux::panes().context("list tmux panes")?;
@@ -456,7 +442,9 @@ fn load(
     println!();
     // Without a name the newest point is restored. Say so when that point is
     // stale or partial: on 2026-11-01 autosave had been silent for 10 days and
-    // `tmc load` quietly brought back two of four sessions.
+    // `tmc load` quietly brought back two of four sessions. The silence left
+    // no trace in the autosave log — launchd refused to spawn a rebuilt tmc
+    // (OS_REASON_CODESIGNING) — so the age of the point is the only signal.
     if name.is_none() {
         warn_if_stale(chosen, now_secs);
     }
@@ -559,8 +547,9 @@ fn warn_if_stale(chosen: &point::Point, now_secs: u64) {
     if age > AUTOSAVE_STALE_SECS {
         println!(
             "warning: the newest autosave is from {} — autosave has not written since,\n\
-             \x20        so sessions started after it were never saved. \
-             See ~/Library/Logs/tmux-autosave.log.\n",
+             \x20        so sessions started after it were never saved. Check its log;\n\
+             \x20        if the log is silent too, launchd may be refusing to start tmc\n\
+             \x20        (`launchctl print gui/$UID/<label>` shows the last exit reason).\n",
             clock::age_of(&chosen.sort_key, now_secs),
         );
     }
