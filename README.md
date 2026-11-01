@@ -214,7 +214,7 @@ behind `x`, and pressing it shows what is on offer:
 |---|---|
 | `x b` | break the selected panes out, each into its own window |
 | `x j` | join the selected panes into a window you pick |
-| `x m` | merge the marked windows into one |
+| `x m` | merge the marked windows into the one under the cursor (else the first marked) |
 | `x s` | send the selected windows to another session — with three or more, pick which with `j`/`k` and `Enter` |
 | `x k`, `x x` | close the selected windows |
 | `x n` | create a session: type its name, `Enter` creates it, `Esc` cancels |
@@ -283,11 +283,11 @@ the selection honest: `break-pane` and `join-pane` take a pane, and a window
 target makes tmux use whichever pane it considers active rather than the one
 you were looking at.
 
-`M` is the one command tmux has no verb for. Merging is every pane of the
+`x m` is the one command tmux has no verb for. Merging is every pane of the
 marked windows joined into the one you keep, which the sources then close
-themselves over, having nothing left. The window that receives them is picked
-in the same step — and it can be one of the marked ones, since "fold `alpha`
-into `beta`" is the usual reason to ask.
+themselves over, having nothing left. The window kept is the marked one under
+the cursor, or the first marked one when the cursor is elsewhere — there is no
+second step to pick it.
 
 Panes arriving one at a time each split whatever pane was active, so a merge
 of more than one is tiled at the end. A single pane leaves a hand-made layout

@@ -454,7 +454,7 @@ mod tests {
                 ("%11".into(), "projects:1".into()),
                 ("%22".into(), "projects:12".into()),
             ],
-            kind: crate::ui::model::MoveKind::Merge,
+            kind: crate::ui::model::MoveKind::Panes,
             destination: Some("projects:8".into()),
         });
 
