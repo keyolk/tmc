@@ -825,9 +825,9 @@ impl Model {
     ///
     /// The tree filter is dropped, because a query typed to find the *source*
     /// has no business narrowing the destinations. The cursor stays where it
-    /// is when that is already a candidate: after marking windows to merge
-    /// you are standing on the one you mean to keep, and snapping to the top
-    /// of the tree would make you walk all the way back.
+    /// is when that is already a candidate: you are often standing on the
+    /// window you mean, and snapping to the top of the tree would make you
+    /// walk all the way back.
     pub fn begin_move(&mut self, panes: Vec<(String, String)>, kind: MoveKind) -> bool {
         if panes.is_empty() {
             return false;
@@ -2105,32 +2105,9 @@ mod tests {
     }
 
     #[test]
-    fn merging_can_keep_one_of_the_marked_windows() {
-        // The usual intent: "fold alpha into beta". Excluding every source —
-        // right for a single pane, where its own window is a no-op — would
-        // put the only useful destination out of reach.
-        let mut m = two_windows_with_panes();
-        let panes = vec![
-            ("%11".to_string(), "projects:1".to_string()),
-            ("%22".to_string(), "projects:2".to_string()),
-        ];
-        assert!(m.begin_move(panes, MoveKind::Merge));
-
-        let mut offered = vec![m.destination_window().map(WindowRow::target)];
-        m.move_destination(1);
-        offered.push(m.destination_window().map(WindowRow::target));
-
-        assert_eq!(
-            offered,
-            vec![Some("projects:1".into()), Some("projects:2".into())],
-            "both sources are on offer as the window to keep",
-        );
-    }
-
-    #[test]
     fn a_move_starts_on_the_window_the_cursor_is_already_on() {
-        // You mark the windows, walk to the one you want to keep, then press
-        // M. Snapping back to the top of the tree would undo that walk.
+        // You mark the panes, walk to the window they should go to, then
+        // press x j. Snapping back to the top of the tree would undo that walk.
         let mut m = two_windows_with_panes();
         m.cursor = 3; // projects:2
 
@@ -2139,7 +2116,7 @@ mod tests {
                 ("%11".into(), "projects:1".into()),
                 ("%22".into(), "projects:2".into()),
             ],
-            MoveKind::Merge
+            MoveKind::Panes
         ));
         assert_eq!(
             m.destination_window().map(WindowRow::target),

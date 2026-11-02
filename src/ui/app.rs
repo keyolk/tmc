@@ -1034,6 +1034,65 @@ mod tests {
         assert!(m.status.contains("two or more"), "status: {}", m.status);
     }
 
+    fn live(win: u32) -> crate::collect::tmux::Pane {
+        crate::collect::tmux::Pane {
+            session: "projects".into(),
+            session_attached: true,
+            window_index: win,
+            window_id: format!("@{win}"),
+            window_name: String::new(),
+            window_layout: String::new(),
+            window_active: false,
+            pane_index: 1,
+            pane_id: format!("%{win}"),
+            pid: 100,
+            path: "/tmp".into(),
+            current_command: "fish".into(),
+            active: false,
+            pane_cc_session: String::new(),
+            cc_session: String::new(),
+            cc_state: String::new(),
+            pane_cc_state: String::new(),
+        }
+    }
+
+    #[test]
+    fn merge_runs_at_once_without_asking_which_window_stays() {
+        let mut m = model_with_two_windows();
+        m.live = vec![live(1), live(2)];
+        m.marks.insert("projects:1".into());
+        m.marks.insert("projects:2".into());
+
+        press(&mut m, 'x', KeyModifiers::NONE);
+        let effect = handle_key(&mut m, KeyCode::Char('m'), KeyModifiers::NONE);
+
+        assert!(matches!(effect, Effect::Job(_)), "the merge starts");
+        assert!(m.pending_move.is_none(), "no window picker opened");
+    }
+
+    #[test]
+    fn merge_keeps_the_marked_window_under_the_cursor() {
+        let mut m = model_with_two_windows();
+        let sources = vec!["projects:1".to_string(), "projects:2".to_string()];
+        m.cursor = m
+            .visible()
+            .iter()
+            .position(|&i| matches!(&m.rows[i], Row::Window(w) if w.target() == "projects:2"))
+            .unwrap();
+        assert_eq!(
+            crate::ui::commands::merge_target(&m, &sources),
+            "projects:2"
+        );
+
+        // Off the marked windows (here on the session row), the first marked
+        // one in the tree stays.
+        m.cursor = 0;
+        assert_eq!(
+            crate::ui::commands::merge_target(&m, &sources),
+            "projects:1"
+        );
+    }
+
     #[test]
     fn the_menu_opens_on_x_and_closes_on_the_key_it_ran() {
         let mut m = model_with_two_windows();

@@ -14,7 +14,9 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
-use super::model::{ActionKind, Model, MoveKind, PendingSend, Row, WindowRow, session_mark};
+use super::model::{
+    ActionKind, Model, MoveKind, PendingMove, PendingSend, Row, WindowRow, session_mark,
+};
 use super::status::{Level, Status};
 use super::worker::{Done, Job};
 use crate::collect::{cmd, proc, tmux};
@@ -31,10 +33,7 @@ pub(super) fn run_action(model: &mut Model, kind: ActionKind) -> Option<Job> {
             move_panes(model);
             None
         }
-        ActionKind::Merge => {
-            merge_windows(model);
-            None
-        }
+        ActionKind::Merge => merge_windows(model),
         ActionKind::Send => move_windows(model),
         ActionKind::Kill => kill_windows(model),
         ActionKind::NewSession => {
@@ -634,21 +633,23 @@ fn move_panes(model: &mut Model) {
     }
 }
 
-/// Merge the marked windows into one.
+/// Merge the marked windows into one, without asking which one stays.
 ///
 /// tmux has no merge: it is every pane of the sources joined into the window
-/// that is being kept, which the sources then close themselves over, having
-/// nothing left. Which window survives is chosen the same way a pane move
-/// chooses a destination — including one of the marked ones, which is the
-/// usual intent — so the answer is never "whichever tmux considered active".
-fn merge_windows(model: &mut Model) {
+/// that is kept, which the sources then close themselves over, having nothing
+/// left. The kept window is the marked one under the cursor, else the first
+/// marked one in the tree. An earlier version made the user pick it every
+/// time, a second choice that rarely changed anything; the panes all end up
+/// in one window either way, and its name is the only difference.
+fn merge_windows(model: &mut Model) -> Option<Job> {
     let sources = model.marked_live_windows();
     if sources.len() < 2 {
         model
             .status
             .warn("mark two or more windows with space, then x m");
-        return;
+        return None;
     }
+    let keep = merge_target(model, &sources);
 
     let panes: Vec<(String, String)> = model
         .live
@@ -656,14 +657,28 @@ fn merge_windows(model: &mut Model) {
         .filter(|p| sources.contains(&window_of(p)))
         .map(|p| (p.pane_id.clone(), window_of(p)))
         .collect();
-    if model.begin_move(panes, MoveKind::Merge) {
-        model.status.info(format!(
-            "merging {} windows: choose the one to keep, then Enter",
-            sources.len()
-        ));
-    } else {
+    if panes.iter().all(|(_, w)| *w == keep) {
         model.status.warn("those windows have no panes to merge");
+        return None;
     }
+    Some(join_job(
+        PendingMove {
+            panes,
+            kind: MoveKind::Merge,
+            destination: None,
+        },
+        keep,
+    ))
+}
+
+/// The window a merge keeps: the marked one under the cursor, else the first
+/// marked one in tree order.
+pub(super) fn merge_target(model: &Model, sources: &[String]) -> String {
+    model
+        .current_window()
+        .map(WindowRow::target)
+        .filter(|w| sources.contains(w))
+        .unwrap_or_else(|| sources[0].clone())
 }
 
 pub(super) fn cancel_move(model: &mut Model) {
@@ -686,8 +701,24 @@ pub(super) fn confirm_move(model: &mut Model) -> Option<Job> {
     model.search.clear();
     model.searching = false;
 
-    Some(Job::new("moving panes", move || {
-        let out = rearrange::join_panes(&pending.panes, &destination);
+    Some(join_job(pending, destination))
+}
+
+/// Join `pending`'s panes into `destination` (a `session:index` target).
+fn join_job(pending: PendingMove, destination: String) -> Job {
+    Job::new("moving panes", move || {
+        // Join into the window id, not `session:index`: with
+        // renumber-windows on, a source window that empties and closes
+        // shifts every later index, and the next join would land in
+        // whichever window slid into the destination's slot.
+        let id = rearrange::window_id(&destination)?;
+        let incoming: Vec<(String, String)> = pending
+            .panes
+            .iter()
+            .filter(|(_, from)| *from != destination)
+            .cloned()
+            .collect();
+        let out = rearrange::join_panes(&incoming, &id);
         let (moved, failed) = (out.moved, out.failed);
 
         let sources = pending.sources();
@@ -712,7 +743,7 @@ pub(super) fn confirm_move(model: &mut Model) -> Option<Job> {
                 failed,
             );
         }))
-    }))
+    })
 }
 
 /// Close the selected windows.
