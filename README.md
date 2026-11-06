@@ -44,6 +44,7 @@ running, and `r` restores only what you marked.
 | `tmc list` | the points on disk |
 | `tmc doctor [point]` | check a point before you need it |
 | `tmc autosave [--if-drifted]` | the periodic snapshot |
+| `tmc layout [preset]` | lay the window out by what its panes are (prefix-Enter) |
 | `tmc clipboard` | paste-buffer picker |
 | `tmc copy-mode` | send a copy-mode command |
 | `tmc snapshot` | render one frame as text |
@@ -64,6 +65,40 @@ names every failure on stderr and exits non-zero if anything did not move.
 a live one would silently double the workspace. `--force` closes it and
 rebuilds instead — it prints what would be lost first and asks, so the answer
 is informed; `--yes` skips the asking for scripts.
+
+## Layouts
+
+`next-layout` cycles tmux's five layouts in a fixed order and knows nothing
+of the panes, so two claude sessions and a browser land wherever their
+indexes put them. `tmc layout` gives each pane a kind — `claude`, `web`
+(tweb), `editor`, `shell`, or its program — keeps panes of a kind together,
+and lets the pane that is the only one of its kind take the big cell.
+
+| preset | |
+|---|---|
+| `spotlight` | the one-of-a-kind pane big on the right, the rest grouped left |
+| `focus` | the active pane big on the left, the rest grouped right |
+| `grid` | every pane in an even grid, kinds kept together |
+| `columns` | a column per kind, its panes stacked |
+| `rows` | a row per kind, its panes side by side |
+| `side-by-side` | all panes in one row, kinds kept together |
+
+With no preset it opens a picker: type to narrow (fuzzy, on the name and the
+blurb), and the right side draws the window as the highlighted preset would
+leave it, each box titled by its pane's kind. `Enter` applies, `Esc` leaves
+the window alone. `--window` names another window, `--list` prints the
+presets, and `--dry-run` prints each pane's kind and the layout instead of
+applying it.
+
+The kind comes from the pane's command line, as restore reads it: a token
+`claude` (so `ccproxy claude …` counts), a program starting `tweb`, an editor.
+A pane's own `@cc_pane_session` marks claude only when its command says
+nothing; the window's `@cc_session` is shared by every pane, the browser
+included, so it is not used.
+
+A lone shell is never the spotlight; with nothing one of a kind, the active
+pane is. Needs tmux 3.8: the layout goes over as JSON whose leaves name a
+`pane_index`, which puts every pane in its cell in one `select-layout`.
 
 ## Autorun
 
