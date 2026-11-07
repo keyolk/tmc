@@ -5,6 +5,7 @@
 //! behaviour testable without a terminal.
 
 pub mod app;
+pub mod arrange;
 pub mod clipboard;
 mod commands;
 mod drag;

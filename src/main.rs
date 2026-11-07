@@ -1,3 +1,4 @@
+mod arrange;
 mod clock;
 mod collect;
 mod config;
@@ -80,6 +81,22 @@ enum Command {
     Doctor {
         /// Restore point to check. Defaults to checking every one.
         name: Option<String>,
+    },
+    /// Lay a window out by what its panes are: pick a preset with a preview,
+    /// or name one to apply it.
+    Layout {
+        /// Preset to apply without the picker (`--list` names them).
+        preset: Option<String>,
+        /// Window to arrange (`@id`, `session:index`, or a pane in it).
+        /// Defaults to the window of $TMUX_PANE.
+        #[arg(long)]
+        window: Option<String>,
+        /// Print the presets and what each does.
+        #[arg(long)]
+        list: bool,
+        /// Print the layout tmux would get instead of applying it.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Pick a tmux paste buffer and paste it.
     Clipboard {
@@ -179,6 +196,12 @@ fn main() -> Result<()> {
             menu,
         } => snapshot(width, height, !tree, expand, menu),
         Command::Doctor { name } => doctor(name),
+        Command::Layout {
+            preset,
+            window,
+            list,
+            dry_run,
+        } => layout(preset, window, list, dry_run),
         Command::Clipboard { target } => ui::clipboard::run(&target.unwrap_or_else(current_pane)),
         Command::CopyMode { target } => copy_mode(&target.unwrap_or_else(current_pane)),
         Command::Load {
@@ -750,6 +773,35 @@ fn snapshot(
 /// `$TMUX_PANE` rather than asking tmux for the active pane: a popup runs in
 /// its own pane, so `display-message -p` would name the popup, not the pane
 /// the user was looking at.
+fn layout(preset: Option<String>, window: Option<String>, list: bool, dry_run: bool) -> Result<()> {
+    if list {
+        for p in arrange::PRESETS {
+            println!("{:<14}{}", p.name, p.about);
+        }
+        return Ok(());
+    }
+    let target = window.unwrap_or_else(current_pane);
+    let Some(name) = preset else {
+        return ui::arrange::run(&target);
+    };
+    let Some(preset) = arrange::preset(&name) else {
+        let names: Vec<&str> = arrange::PRESETS.iter().map(|p| p.name).collect();
+        anyhow::bail!("no preset {name:?}; one of: {}", names.join(", "));
+    };
+    let win = arrange::window(&target)?;
+    if dry_run {
+        // The kinds first, on stderr: they decide the layout, and a pane
+        // read as the wrong kind is the usual reason it lands oddly.
+        for c in &win.cells {
+            eprintln!("{:<5}{:<6}{:<8}{}", c.id, c.index, c.kind, c.label);
+        }
+        println!("{}", arrange::to_json(&preset.tree(&win.cells), &win)?);
+    } else {
+        arrange::apply(&win, preset)?;
+    }
+    Ok(())
+}
+
 fn current_pane() -> String {
     std::env::var("TMUX_PANE").unwrap_or_default()
 }
