@@ -1,0 +1,185 @@
+name: release
+
+# Every merge to main publishes the next patch release (latest vX.Y.Z tag + 1,
+# v0.1.0 when there is none), so what an installer fetches is never older than
+# main. Push a v* tag yourself for a minor/major bump; later merges count up
+# from it. Docs-only merges do not release. pull_request and workflow_dispatch
+# build every platform in snapshot mode, publish nothing, and keep the
+# archives on the run as the `dist` artifact.
+#
+# Asset contract (an installer depends on it): tmc_<version>_<os>_<arch>.tar.gz
+# with the binary at the archive root, plus checksums.txt.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore: ["**.md", "docs/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Releases run one at a time and are never cancelled mid-upload, so two quick
+# merges cannot both pick the same next patch number. GitHub keeps only the
+# newest pending run per group; snapshot builds get their own group per ref so
+# a queued PR build can never displace a pending release.
+concurrency:
+  group: ${{ github.event_name == 'push' && 'release' || format('snapshot-{0}', github.ref) }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+      publish: ${{ steps.v.outputs.publish }}
+      skip: ${{ steps.v.outputs.skip }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Decide version
+        id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_TYPE" = tag ]; then
+            tag="$GITHUB_REF_NAME"
+            if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-+].*)?$ ]]; then
+              echo "::error::tag $tag is not vX.Y.Z"
+              exit 1
+            fi
+            publish=true
+          else
+            if [ "$GITHUB_EVENT_NAME" = push ] && [ -n "$(git tag --points-at HEAD 'v*')" ]; then
+              echo "HEAD is already released as $(git tag --points-at HEAD 'v*')"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            # Only plain vX.Y.Z tags count; a prerelease must not become the
+            # base the next patch is counted from.
+            last=$(git tag -l 'v[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1 || true)
+            if [ -z "$last" ]; then
+              tag=v0.1.0
+            else
+              IFS=. read -r ma mi pa <<<"${last#v}"
+              tag="v$ma.$mi.$((pa + 1))"
+            fi
+            if [ "$GITHUB_EVENT_NAME" = push ]; then
+              publish=true
+            else
+              tag="$tag-SNAPSHOT-$(git rev-parse --short=7 HEAD)"
+              publish=false
+            fi
+          fi
+          {
+            echo "tag=$tag"
+            echo "version=${tag#v}"
+            echo "publish=$publish"
+            echo "skip=false"
+          } >> "$GITHUB_OUTPUT"
+          echo "building $tag (publish=$publish)"
+
+  build:
+    needs: version
+    if: needs.version.outputs.skip != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux builds run on ubuntu-22.04 so the binary needs glibc <= 2.35
+          # and runs on every Ubuntu 22.04+ workspace.
+          - { target: x86_64-unknown-linux-gnu, runner: ubuntu-22.04, os: linux, arch: amd64, native: true }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-22.04-arm, os: linux, arch: arm64, native: true }
+          - { target: aarch64-apple-darwin, runner: macos-latest, os: darwin, arch: arm64, native: true }
+          # macos-latest is Apple silicon; the Xcode SDK cross-compiles x86_64.
+          - { target: x86_64-apple-darwin, runner: macos-latest, os: darwin, arch: amd64, native: false }
+    runs-on: ${{ matrix.runner }}
+    env:
+      # build.rs stamps this into `tmc --version`.
+      TMC_VERSION: ${{ needs.version.outputs.tag }}
+      ARCHIVE: tmc_${{ needs.version.outputs.version }}_${{ matrix.os }}_${{ matrix.arch }}.tar.gz
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Smoke test
+        if: matrix.native
+        run: target/${{ matrix.target }}/release/tmc --version
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p stage dist
+          cp target/${{ matrix.target }}/release/tmc README.md stage/
+          # Name the entries, not ".", so the archive holds `tmc` at its root
+          # rather than `./tmc`.
+          tar -C stage -czf "dist/$ARCHIVE" tmc README.md
+          tar -tzf "dist/$ARCHIVE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/${{ env.ARCHIVE }}
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: build-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum -- *.tar.gz > checksums.txt
+          cat checksums.txt
+
+      - name: Publish
+        if: needs.version.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.version.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A merge's tag does not exist yet: --target creates it on the built
+          # commit, only after every platform built. A tag made with this token
+          # starts no workflow, so it does not trigger a second run.
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber -R "$GITHUB_REPOSITORY"
+          else
+            pre=()
+            [[ "$TAG" == *-* ]] && pre=(--prerelease)
+            gh release create "$TAG" dist/* -R "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --title "$TAG" --generate-notes "${pre[@]}"
+          fi
+
+      - if: needs.version.outputs.publish != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
