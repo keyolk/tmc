@@ -332,7 +332,7 @@ fn group_live<'a>(panes: &'a [tmux::Pane], tree: &proc::Tree) -> Vec<(&'a str, V
         // Read through the same path `save` uses, so the two sides are
         // directly comparable. `pane_current_command` would not be: it names
         // the shell, while the saved side holds a full command line.
-        let live_command = command::for_pane(p.pid, tree, |pid| tree.args(pid).map(str::to_string));
+        let live_command = command::for_pane(p.pid, tree, |pid| tree.args(pid));
 
         window.panes.push(Pane {
             index: p.pane_index,

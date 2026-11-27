@@ -441,7 +441,7 @@ pub fn window(target: &str) -> Result<Window> {
                 return None;
             }
             let pid: u32 = p[2].parse().ok()?;
-            let line = command::for_pane(pid, &tree, |pid| tree.args(pid).map(str::to_string));
+            let line = command::for_pane(pid, &tree, |pid| tree.args(pid));
             // Only the pane's own id: the window's `@cc_session` is shared by
             // every pane in the window, the browser beside claude included.
             let kind = kind_of(line.as_deref(), !p[4].is_empty());
