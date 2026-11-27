@@ -1136,7 +1136,7 @@ fn build_rows(
                         // name a pane reports says nothing about what is
                         // running in it.
                         command: crate::collect::command::for_pane(p.pid, tree, |pid| {
-                            tree.args(pid).map(str::to_string)
+                            tree.args(pid)
                         })
                         .unwrap_or_default(),
                         path: p.path.clone(),

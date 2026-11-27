@@ -5,6 +5,7 @@
 //! carries no arguments. The full command line has to come from the process
 //! tree.
 
+use super::argv::split_words;
 use super::proc::Tree;
 
 /// Shells to walk *through* when looking for the real foreground process.
@@ -70,7 +71,10 @@ pub fn normalize(raw: &str) -> String {
 /// Only a bare `--` goes. `--flag` and `--` inside a quoted argument are not
 /// separators and are left alone.
 fn strip_bare_separator(cmd: &str) -> String {
-    let kept: Vec<&str> = cmd.split(' ').filter(|t| *t != "--").collect();
+    let kept: Vec<&str> = split_words(cmd)
+        .into_iter()
+        .filter(|t| *t != "--")
+        .collect();
     kept.join(" ")
 }
 
@@ -81,7 +85,7 @@ fn strip_bare_separator(cmd: &str) -> String {
 /// artifact of how the shell resolved it. Arguments are left alone — a path
 /// there is the user's own.
 fn collapse_leading_path(raw: &str) -> String {
-    let Some(first) = raw.split(' ').next() else {
+    let Some(first) = split_words(raw).into_iter().next() else {
         return raw.to_string();
     };
     if !first.starts_with('/') {
@@ -104,7 +108,7 @@ fn collapse_leading_path(raw: &str) -> String {
 fn strip_stale_resume(cmd: &str) -> String {
     let mut out: Vec<&str> = Vec::new();
     let mut skip_next = false;
-    for tok in cmd.split(' ') {
+    for tok in split_words(cmd) {
         if skip_next {
             skip_next = false;
             continue;
@@ -129,6 +133,17 @@ mod tests {
         Tree::parse_for_test(
             "1 0 launchd\n100 1 fish\n200 100 ccproxy\n300 200 claude\n400 1 fish\n",
         )
+    }
+
+    /// A quoted argument is one word: a `--` or `--resume` inside it is text,
+    /// not a flag, and the quotes survive so restore can type the line back.
+    #[test]
+    fn quoted_arguments_survive_normalizing() {
+        let line = r#"claude --settings '{"enabledPlugins":{"cco@claude-code-plugin":true}}' --append-system-prompt 'say -- --resume x' --resume abc"#;
+        assert_eq!(
+            normalize(line),
+            r#"claude --settings '{"enabledPlugins":{"cco@claude-code-plugin":true}}' --append-system-prompt 'say -- --resume x'"#
+        );
     }
 
     #[test]
