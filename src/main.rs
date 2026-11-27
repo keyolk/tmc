@@ -155,11 +155,13 @@ enum Command {
         /// Print what would be created without touching tmux.
         #[arg(long)]
         dry_run: bool,
-        /// Close a session that is already running and rebuild it.
+        /// Replace a session that is already running with the point's.
         ///
         /// Irreversible: every window and pane in the live session goes. What
         /// would be lost is printed first, and the run stops for confirmation
-        /// unless --yes is also given.
+        /// unless --yes is also given. Safe to run inside the session being
+        /// replaced: the old one is closed last, and its clients move to the
+        /// rebuilt one.
         #[arg(long)]
         force: bool,
         /// Skip the confirmation prompt that --force asks for.
@@ -489,11 +491,18 @@ fn load(
         if !clashing.is_empty() {
             let tree = collect::proc::Tree::capture_with_args()?;
             let owned: Vec<layout::Session> = clashing.iter().map(|s| (**s).clone()).collect();
-            let d = layout::diff::compare(&live, &owned, &tree);
+            // Only the sessions being replaced: every other live window would
+            // otherwise show up as "created since the point, would be lost".
+            let replaced: Vec<_> = live
+                .iter()
+                .filter(|p| owned.iter().any(|s| s.session == p.session))
+                .cloned()
+                .collect();
+            let d = layout::diff::compare(&replaced, &owned, &tree);
             let (modified, added, removed) = d.counts();
 
             println!(
-                "--force closes the running session(s) and rebuilds them.\n\
+                "--force replaces the running session(s) with the point.\n\
                  {added} window(s) created since the point would be lost, \
                  {modified} changed, {removed} brought back.\n"
             );
@@ -521,15 +530,28 @@ fn load(
     };
     let mut total = layout::restore::Report::default();
     let mut server = layout::restore::Server;
+    // Sessions a forced restore replaced. Closed only at the very end: one of
+    // them may hold the pane this process runs in.
+    let mut retired: Vec<String> = Vec::new();
     for s in &wanted {
-        let report = layout::restore::session(
+        let report = match layout::restore::session(
             &mut server,
             s,
             layout::restore::Selection::all(),
             &autorun,
             dry_run,
             force,
-        )?;
+        ) {
+            Ok(report) => report,
+            Err(e) => {
+                // Said before closing anything, since closing tmc's own
+                // session ends this process before the error would print.
+                eprintln!("{}: {e:#}", s.session);
+                layout::restore::retire(&mut server, &retired)?;
+                return Err(e);
+            }
+        };
+        retired.extend(report.retired.clone());
         for note in &report.notes {
             println!("  {}: {note}", s.session);
         }
@@ -553,6 +575,12 @@ fn load(
     }
     if total.missing_panes > 0 {
         println!("{} pane(s) did not fit the display", total.missing_panes);
+    }
+    if !retired.is_empty() {
+        // Flushed now: closing the session this runs in ends the process.
+        use std::io::Write as _;
+        std::io::stdout().flush()?;
+        layout::restore::retire(&mut server, &retired)?;
     }
     Ok(())
 }

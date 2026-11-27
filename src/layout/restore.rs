@@ -51,6 +51,15 @@ pub trait Tmux {
     fn wait_for_shell(&self, target: &str);
     /// Close a session and everything in it.
     fn kill_session(&mut self, name: &str) -> Result<()>;
+    fn rename_session(&mut self, from: &str, to: &str) -> Result<()>;
+    /// The pane tmc itself runs in, when that pane belongs to `session`.
+    fn own_pane_in(&self, session: &str) -> Option<String>;
+    /// Stop everything in `session` but one pane, which is left holding a
+    /// shell: `keep` when given (tmc's own pane), otherwise the active pane,
+    /// respawned. Attached clients stay attached to it.
+    fn clear_session(&mut self, session: &str, keep: Option<&str>) -> Result<()>;
+    /// Point every client attached to `from` at `to`.
+    fn move_clients(&mut self, from: &str, to: &str);
 }
 
 /// The real thing.
@@ -166,6 +175,75 @@ impl Tmux for Server {
             cmd::FAST,
         )?;
         Ok(())
+    }
+
+    fn rename_session(&mut self, from: &str, to: &str) -> Result<()> {
+        cmd::run(
+            "tmux",
+            &["rename-session", "-t", &format!("={from}"), to],
+            cmd::FAST,
+        )?;
+        Ok(())
+    }
+
+    fn own_pane_in(&self, session: &str) -> Option<String> {
+        let pane = std::env::var("TMUX_PANE").ok().filter(|p| !p.is_empty())?;
+        let owner = cmd::run(
+            "tmux",
+            &["display-message", "-p", "-t", &pane, "#{session_name}"],
+            cmd::FAST,
+        )
+        .ok()?;
+        (owner.trim() == session).then_some(pane)
+    }
+
+    fn clear_session(&mut self, session: &str, keep: Option<&str>) -> Result<()> {
+        let keep = match keep {
+            Some(pane) => pane.to_string(),
+            None => {
+                let target = format!("={session}:");
+                let pane = cmd::run(
+                    "tmux",
+                    &["display-message", "-p", "-t", &target, "#{pane_id}"],
+                    cmd::FAST,
+                )?
+                .trim()
+                .to_string();
+                // `-k` kills whatever runs there and starts the default shell.
+                cmd::run("tmux", &["respawn-pane", "-k", "-t", &pane], cmd::FAST)?;
+                pane
+            }
+        };
+        // `-a`: every window of the session but the one holding `keep`, then
+        // every pane of that window but `keep`.
+        cmd::run("tmux", &["kill-window", "-a", "-t", &keep], cmd::FAST)?;
+        cmd::run("tmux", &["kill-pane", "-a", "-t", &keep], cmd::FAST)?;
+        Ok(())
+    }
+
+    fn move_clients(&mut self, from: &str, to: &str) {
+        let Ok(clients) = cmd::run(
+            "tmux",
+            &[
+                "list-clients",
+                "-t",
+                &format!("={from}"),
+                "-F",
+                "#{client_name}",
+            ],
+            cmd::FAST,
+        ) else {
+            return;
+        };
+        let to = format!("={to}");
+        for client in clients.lines().filter(|c| !c.is_empty()) {
+            // Best effort: a client that detached meanwhile has nothing to move.
+            let _ = cmd::run(
+                "tmux",
+                &["switch-client", "-c", client, "-t", &to],
+                cmd::FAST,
+            );
+        }
     }
 
     fn wait_for_shell(&self, target: &str) {
@@ -314,6 +392,10 @@ pub struct Report {
     /// Typed and submitted, because a pattern in `autorun` matched.
     pub commands_run: usize,
     pub notes: Vec<String>,
+    /// The running session a forced restore replaced, under the name it was
+    /// moved to. Still open: the caller closes it with `retire` once every
+    /// session is rebuilt, because it may hold the pane tmc is running in.
+    pub retired: Option<String>,
 }
 
 /// Which parts of a saved session to bring back.
@@ -345,8 +427,17 @@ impl Selection<'_> {
 ///
 /// A session that is already running is skipped: appending its windows to a
 /// live one silently doubles the workspace, and for a recovery tool that is
-/// the safe default. `force` closes it first instead — irreversible, so the
+/// the safe default. `force` replaces it instead — irreversible, so the
 /// caller shows what would be lost before offering it.
+///
+/// Replacing does not kill the running session first. `tmc load --force` is
+/// usually typed inside the very session it replaces, and killing that
+/// session killed tmc with it: the session was gone and never rebuilt. The
+/// running session is renamed out of the way and emptied down to one pane
+/// (tmc's own, when it is in there) so its processes — a claude about to be
+/// resumed in the rebuild, say — stop before their replacements start. Its
+/// clients then move to the rebuilt session, and the emptied one is left in
+/// `Report::retired` for the caller to close last.
 pub fn session<T: Tmux>(
     tmux: &mut T,
     saved: &Session,
@@ -363,15 +454,26 @@ pub fn session<T: Tmux>(
     // is still open, deciding whether to close it.
     let clash = tmux.session_exists(&saved.session);
     let into_live = clash && select.append && !force;
+    let mut parked = None;
     if clash && !into_live {
         if force {
             report
                 .notes
-                .push(format!("closed the running '{}'", saved.session));
+                .push(format!("replaced the running '{}'", saved.session));
             if !dry_run {
                 // Everything in it goes. The caller is expected to have shown
                 // the user what that costs — see `main::load`.
-                tmux.kill_session(&saved.session)?;
+                let aside = parking_name(tmux, &saved.session);
+                tmux.rename_session(&saved.session, &aside)?;
+                let own = tmux.own_pane_in(&aside);
+                if let Err(e) = tmux.clear_session(&aside, own.as_deref()) {
+                    tmux.rename_session(&aside, &saved.session)?;
+                    return Err(e.context(format!(
+                        "could not empty the running '{}'; left it as it was",
+                        saved.session
+                    )));
+                }
+                parked = Some(aside);
             }
         } else {
             report.notes.push(format!(
@@ -385,6 +487,74 @@ pub fn session<T: Tmux>(
         }
     }
 
+    let built = rebuild(
+        tmux,
+        saved,
+        select,
+        autorun,
+        dry_run,
+        into_live,
+        &mut report,
+    );
+    let Some(aside) = parked else {
+        built?;
+        return Ok(report);
+    };
+    match built {
+        Ok(()) if tmux.session_exists(&saved.session) => {
+            tmux.move_clients(&aside, &saved.session);
+            report.retired = Some(aside);
+            Ok(report)
+        }
+        // Nothing was rebuilt (an error, or no window selected). The old
+        // session's processes are already gone, but its name — and the
+        // clients on it — are put back rather than left on a `-old` husk.
+        outcome => {
+            if tmux.session_exists(&saved.session) {
+                tmux.kill_session(&saved.session)?;
+            }
+            tmux.rename_session(&aside, &saved.session)?;
+            outcome?;
+            Ok(report)
+        }
+    }
+}
+
+/// A free name to move a replaced session to: `<name>-old`, then `-old2`, …
+fn parking_name<T: Tmux>(tmux: &T, session: &str) -> String {
+    let base = format!("{session}-old");
+    let mut name = base.clone();
+    let mut n = 2;
+    while tmux.session_exists(&name) {
+        name = format!("{base}{n}");
+        n += 1;
+    }
+    name
+}
+
+/// Close the sessions a forced restore replaced.
+///
+/// The one holding tmc's own pane goes last: closing it ends this process,
+/// so anything after it would never run. Call this after everything else —
+/// including printing the summary — is done.
+pub fn retire<T: Tmux>(tmux: &mut T, sessions: &[String]) -> Result<()> {
+    let (own, others): (Vec<&String>, Vec<&String>) =
+        sessions.iter().partition(|s| tmux.own_pane_in(s).is_some());
+    for s in others.into_iter().chain(own) {
+        tmux.kill_session(s)?;
+    }
+    Ok(())
+}
+
+fn rebuild<T: Tmux>(
+    tmux: &mut T,
+    saved: &Session,
+    select: Selection,
+    autorun: &config::Restore,
+    dry_run: bool,
+    into_live: bool,
+    report: &mut Report,
+) -> Result<()> {
     let windows: Vec<&Window> = saved
         .windows
         .iter()
@@ -392,7 +562,7 @@ pub fn session<T: Tmux>(
         .collect();
     if windows.is_empty() {
         report.notes.push("nothing selected".into());
-        return Ok(report);
+        return Ok(());
     }
 
     // What to type where, deferred until every window exists so the shells
@@ -416,7 +586,7 @@ pub fn session<T: Tmux>(
         report.panes += created;
         report.missing_panes += window.panes.len() - created;
 
-        apply_layout(tmux, &saved.session, &target, window, created, &mut report);
+        apply_layout(tmux, &saved.session, &target, window, created, report);
 
         // Map saved position -> live pane index. They differ under
         // `pane-base-index 1`, and guessing wrong types into nothing.
@@ -450,7 +620,7 @@ pub fn session<T: Tmux>(
                 report.commands_prefilled += 1;
             }
         }
-        return Ok(report);
+        return Ok(());
     }
 
     for p in &pending {
@@ -477,7 +647,7 @@ pub fn session<T: Tmux>(
             .extend(tmux.recover_claude_ttys(&claude_targets));
     }
 
-    Ok(report)
+    Ok(())
 }
 
 /// One command waiting on its pane's shell.
@@ -632,6 +802,9 @@ mod tests {
         pane_capacity: usize,
         panes: std::collections::BTreeMap<String, usize>,
         pub calls: Vec<String>,
+        /// The pane tmc runs in, as (session, pane id). Follows a rename.
+        own: Option<(String, String)>,
+        fail_new_session: bool,
     }
 
     impl Fake {
@@ -642,6 +815,8 @@ mod tests {
                 pane_capacity: usize::MAX,
                 panes: Default::default(),
                 calls: Vec::new(),
+                own: None,
+                fail_new_session: false,
             }
         }
     }
@@ -651,6 +826,11 @@ mod tests {
             self.live_sessions.iter().any(|s| s == name)
         }
         fn new_session(&mut self, session: &str, window: &str, path: &str) -> Result<String> {
+            if self.fail_new_session {
+                self.calls.push(format!("new-session {session} REFUSED"));
+                anyhow::bail!("tmux refused the session");
+            }
+            self.live_sessions.push(session.to_string());
             self.calls
                 .push(format!("new-session {session} {window} {path}"));
             self.panes.insert(format!("{session}:0"), 1);
@@ -700,6 +880,36 @@ mod tests {
             self.calls.push(format!("kill-session {name}"));
             self.live_sessions.retain(|s| s != name);
             Ok(())
+        }
+        fn rename_session(&mut self, from: &str, to: &str) -> Result<()> {
+            self.calls.push(format!("rename-session {from} {to}"));
+            for s in &mut self.live_sessions {
+                if s == from {
+                    *s = to.to_string();
+                }
+            }
+            if let Some((s, _)) = &mut self.own
+                && s == from
+            {
+                *s = to.to_string();
+            }
+            Ok(())
+        }
+        fn own_pane_in(&self, session: &str) -> Option<String> {
+            self.own
+                .as_ref()
+                .filter(|(s, _)| s == session)
+                .map(|(_, p)| p.clone())
+        }
+        fn clear_session(&mut self, session: &str, keep: Option<&str>) -> Result<()> {
+            self.calls.push(format!(
+                "clear-session {session} keep={}",
+                keep.unwrap_or("-")
+            ));
+            Ok(())
+        }
+        fn move_clients(&mut self, from: &str, to: &str) {
+            self.calls.push(format!("move-clients {from} {to}"));
         }
     }
 
@@ -861,35 +1071,103 @@ mod tests {
         assert!(report.notes[0].contains("already running"));
     }
 
+    fn forced(tmux: &mut Fake, saved: &Session) -> Result<Report> {
+        session(tmux, saved, Selection::all(), &no_autorun(), false, true)
+    }
+
     #[test]
-    fn force_closes_the_running_session_before_rebuilding() {
+    fn force_parks_and_empties_the_running_session_before_rebuilding() {
         let mut tmux = Fake::new();
         tmux.live_sessions.push("projects".into());
         let saved = saved_session(vec![window(1, "alpha", vec![pane("ghx", None)])]);
 
-        let report = session(
-            &mut tmux,
-            &saved,
-            Selection::all(),
-            &no_autorun(),
-            false,
-            true,
-        )
-        .unwrap();
+        let report = forced(&mut tmux, &saved).unwrap();
 
         assert_eq!(report.windows, 1, "the rebuild happened");
         assert_eq!(
-            tmux.calls.first().map(String::as_str),
-            Some("kill-session projects"),
-            "and the close came first; calls: {:?}",
+            &tmux.calls[..3],
+            [
+                "rename-session projects projects-old",
+                "clear-session projects-old keep=-",
+                "new-session projects alpha /tmp",
+            ],
+            "the old processes stop before the new ones start; calls: {:?}",
             tmux.calls,
         );
+        assert!(
+            tmux.calls
+                .contains(&"move-clients projects-old projects".to_string())
+        );
+        assert!(
+            !tmux.calls.iter().any(|c| c.starts_with("kill-session")),
+            "closing is the caller's, after every session: {:?}",
+            tmux.calls,
+        );
+        assert_eq!(report.retired.as_deref(), Some("projects-old"));
         assert!(
             report
                 .notes
                 .iter()
-                .any(|n| n.contains("closed the running"))
+                .any(|n| n.contains("replaced the running"))
         );
+    }
+
+    /// The bug: `tmc load --force` typed inside the session it replaces killed
+    /// that session first, tmc with it, and nothing was rebuilt.
+    #[test]
+    fn force_from_inside_the_session_keeps_tmcs_own_pane_alive() {
+        let mut tmux = Fake::new();
+        tmux.live_sessions.push("projects".into());
+        tmux.own = Some(("projects".into(), "%7".into()));
+        let saved = saved_session(vec![window(1, "alpha", vec![pane("ghx", None)])]);
+
+        let report = forced(&mut tmux, &saved).unwrap();
+
+        assert!(
+            tmux.calls
+                .contains(&"clear-session projects-old keep=%7".to_string())
+        );
+        assert_eq!(report.retired.as_deref(), Some("projects-old"));
+
+        // Another replaced session closes first; tmc's own goes last.
+        tmux.live_sessions.push("work-old".into());
+        tmux.calls.clear();
+        retire(&mut tmux, &["projects-old".into(), "work-old".into()]).unwrap();
+        assert_eq!(
+            tmux.calls,
+            ["kill-session work-old", "kill-session projects-old"]
+        );
+    }
+
+    #[test]
+    fn force_picks_a_free_parking_name() {
+        let mut tmux = Fake::new();
+        tmux.live_sessions
+            .extend(["projects".into(), "projects-old".into()]);
+        let saved = saved_session(vec![window(1, "alpha", vec![pane("ghx", None)])]);
+
+        let report = forced(&mut tmux, &saved).unwrap();
+
+        assert_eq!(tmux.calls[0], "rename-session projects projects-old2");
+        assert_eq!(report.retired.as_deref(), Some("projects-old2"));
+    }
+
+    #[test]
+    fn a_failed_rebuild_gives_the_name_back() {
+        let mut tmux = Fake::new();
+        tmux.live_sessions.push("projects".into());
+        tmux.fail_new_session = true;
+        let saved = saved_session(vec![window(1, "alpha", vec![pane("ghx", None)])]);
+
+        assert!(forced(&mut tmux, &saved).is_err());
+
+        assert_eq!(
+            tmux.calls.last().map(String::as_str),
+            Some("rename-session projects-old projects"),
+            "calls: {:?}",
+            tmux.calls,
+        );
+        assert_eq!(tmux.live_sessions, ["projects"]);
     }
 
     #[test]
