@@ -59,7 +59,7 @@ pub fn snapshot(panes: &[tmux::Pane], tree: &Tree, now: &str) -> Vec<Session> {
 }
 
 fn build_pane(p: &tmux::Pane, conf: tmux::SessionConfidence, tree: &Tree) -> Pane {
-    let command = command::for_pane(p.pid, tree, |pid| tree.args(pid).map(str::to_string));
+    let command = command::for_pane(p.pid, tree, |pid| tree.args(pid));
     let shell_only = command.is_none();
 
     // Pane-scoped ids are exact even when a window contains several Claude

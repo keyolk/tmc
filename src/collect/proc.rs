@@ -24,6 +24,10 @@ pub struct Tree {
     children: HashMap<u32, Vec<u32>>,
     /// pid -> full command line, populated only by `capture_with_args`.
     args: HashMap<u32, String>,
+    /// Whether the pids name processes on this machine right now, so their
+    /// real argv can be asked of the kernel. False for test trees, whose pids
+    /// are made up and may collide with real processes.
+    live: bool,
 }
 
 impl Tree {
@@ -63,12 +67,25 @@ impl Tree {
             };
             tree.args.insert(pid, rest.trim().to_string());
         }
+        tree.live = true;
         Ok(tree)
     }
 
-    /// Full command line for a pid, when this tree was captured with args.
-    pub fn args(&self, pid: u32) -> Option<&str> {
-        self.args.get(&pid).map(String::as_str)
+    /// Full command line for a pid, when this tree was captured with args,
+    /// spelled so a shell types it back into the same argv.
+    ///
+    /// The `ps` text is only the fallback: it joins argv with spaces, so an
+    /// argument holding a space, a brace or a quote comes back as something
+    /// else (see `collect::argv`). The pid is looked up only when `ps` listed
+    /// it, so a process that started after the snapshot is not picked up.
+    pub fn args(&self, pid: u32) -> Option<String> {
+        let listed = self.args.get(&pid)?;
+        if self.live
+            && let Some(argv) = super::argv::read(pid)
+        {
+            return Some(super::argv::join(&argv));
+        }
+        Some(listed.clone())
     }
 
     /// Build a tree from raw `ps` text. Exposed for tests in sibling modules
@@ -114,6 +131,7 @@ impl Tree {
             comm,
             children,
             args: HashMap::new(),
+            live: false,
         }
     }
 
